@@ -7,11 +7,11 @@ homepage: https://github.com/saju01/instacognito-archive-skill
 
 # InstaCognito Archive
 
-Use this skill when the user wants a standalone free archive or periodic sync of public Instagram media through InstaCognito without logins, cookies, paid APIs, proxy rotation, signature reversal, or anti-bot bypass.
+Use this skill when the user wants a standalone free archive or periodic sync of public Instagram media through InstaCognito for personal or explicitly authorized public-profile archiving. InstaCognito advertises free public-profile viewing/download with no login at `https://instacognito.com/en/photo`; its terms at `https://instacognito.com/terms-and-conditions` prohibit commercial-scale scraping/archiving without authorization, copyright infringement, privacy abuse, private-access circumvention, and overburdening. Do not use this skill for logins, cookies, paid APIs, proxy rotation, signature reversal, anti-bot bypass, commercial scrape platforms, or unlimited/guaranteed-complete claims.
 
 ## Full archive branch
 
-1. Confirm the target is public content the owner is allowed to archive and choose a dedicated output directory. Completion: handle passes the normal Instagram handle check and the output path is not a symlink or traversal target.
+1. Confirm the target is public content the owner is allowed to archive, that the intended use is personal or explicitly authorized, and choose a dedicated output directory. Completion: handle passes the normal Instagram handle check and the output path is not a symlink or traversal target.
 2. Run a bounded full pass:
 
    ```bash

@@ -2,7 +2,7 @@
 
 A small public OpenClaw skill plus Node CLI for archiving public Instagram media through https://instacognito.com/en/photo with bounded scans, durable receipts, and honest status reporting.
 
-This is conservative: no login, cookies, paid APIs, reverse-engineered signatures, proxy rotation, paywall bypass, or false unlimited claims.
+This is conservative: no login, cookies, paid APIs, reverse-engineered signatures, proxy rotation, paywall bypass, or false unlimited claims. Use it for personal or explicitly authorized archives of public profiles only. InstaCognito publicly advertises free public-profile viewing/download with no login at `https://instacognito.com/en/photo`; its terms at `https://instacognito.com/terms-and-conditions` prohibit commercial-scale scraping/archiving without authorization, copyright infringement, privacy abuse, private-access circumvention, and overburdening the service.
 
 ## Install from GitHub
 
@@ -68,4 +68,4 @@ Run `doctor`. If Playwright has no browser, run `npx playwright install chromium
 
 ## Rights and privacy
 
-Archive only public content you have rights or permission to keep. The provider can change selectors, rate-limit, remove media, or return incomplete results. Carousels can produce more files than displayed post counts.
+Archive only public content you have rights or permission to keep, and stay within InstaCognito's terms: https://instacognito.com/terms-and-conditions. This is not a commercial scraping platform and does not promise guaranteed completeness, no account risk, or unlimited use. The provider can change selectors, rate-limit, remove media, or return incomplete results. Carousels can produce more files than displayed post counts.
