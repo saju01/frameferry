@@ -188,3 +188,26 @@ test('actual Playwright DOM fixture models real carousel cards and profile-secti
     assert.equal(total,2); assert.equal(got.uniquePostCount,2); assert.deepEqual(got.items.map(i=>i.stableId), ['CAR-0','CAR-1','OTHER-0']);
   } finally { await browser.close(); }
 });
+
+
+test('partial dates without explicit year preserve raw text', () => {
+  assert.equal(lib.parseDateText('views\n23 August'), '23 August');
+  assert.match(lib.parseDateText('views\n23 August 2024'), /^2024-/);
+});
+
+test('foreign-host and EPERM locks fail closed', async () => {
+  const d=await tmp(); const root=await lib.safeOutputRoot(path.join(d,'out')); const paths=lib.profilePaths(root,'example'); await fsp.mkdir(paths.stateDir,{recursive:true});
+  await fsp.writeFile(paths.lock, JSON.stringify({pid:99999999,host:'other-host',runId:'foreign'}));
+  await assert.rejects(()=>lib.withLock(paths,'r',async()=>{}), /another or unknown host/);
+  await fsp.writeFile(paths.lock, JSON.stringify({pid:12345,host:os.hostname(),runId:'eperm'}));
+  const originalKill = process.kill;
+  process.kill = () => { const e = new Error('no permission'); e.code = 'EPERM'; throw e; };
+  try { await assert.rejects(()=>lib.withLock(paths,'r2',async()=>{}), /locked by alive pid/); }
+  finally { process.kill = originalKill; }
+});
+
+test('internal state/media/receipt symlink components are rejected', async () => {
+  const d=await tmp(); const out=path.join(d,'out'); await fsp.mkdir(out,{recursive:true}); await fsp.mkdir(path.join(d,'elsewhere'));
+  await fsp.symlink(path.join(d,'elsewhere'), path.join(out,'media'));
+  await assert.rejects(()=>lib.archiveProfile({handle:'example',output:out,reportedTotal:1,items:[{shortcode:'A',href:'https://instacognito.com/media?id=x'}],dnsLookup:publicDns,fetchImpl:async()=>res(),delayMs:0}), /internal directory path contains symlink/);
+});

@@ -6,3 +6,9 @@ coverage/
 .instascrap/
 *.part
 reports/
+.env
+.env.*
+media/
+receipts/
+archives/
+profiles/

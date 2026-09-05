@@ -52,6 +52,30 @@ async function safeOutputRoot(output) {
   if (st.isSymbolicLink() || !st.isDirectory()) throw new ArchiveError('BAD_OUTPUT', 'output must be a real directory');
   return await fsp.realpath(resolved);
 }
+async function ensureSafeDir(dir, root) {
+  const resolved = path.resolve(dir);
+  const base = path.resolve(root);
+  if (resolved !== base && !resolved.startsWith(base + path.sep)) throw new ArchiveError('BAD_OUTPUT', 'internal path escapes output root');
+  const rel = path.relative(base, resolved);
+  let probe = base;
+  if (rel && rel !== '.') {
+    for (const part of rel.split(path.sep)) {
+      probe = path.join(probe, part);
+      try {
+        const st = await fsp.lstat(probe);
+        if (st.isSymbolicLink()) throw new ArchiveError('BAD_OUTPUT', 'internal directory path contains symlink: ' + probe);
+        if (!st.isDirectory()) throw new ArchiveError('BAD_OUTPUT', 'internal path is not a directory: ' + probe);
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        break;
+      }
+    }
+  }
+  await fsp.mkdir(resolved, { recursive: true, mode: 0o700 });
+  const st = await fsp.lstat(resolved);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new ArchiveError('BAD_OUTPUT', 'internal directory must be a real directory');
+  return resolved;
+}
 function profilePaths(root, handle) {
   validateHandle(handle);
   return {
@@ -76,9 +100,9 @@ async function readJson(file, fallback = null) {
   try { return JSON.parse(await fsp.readFile(file, 'utf8')); }
   catch (err) { if (err.code === 'ENOENT') return fallback; throw err; }
 }
-function isPidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+function isPidAlive(pid) { try { process.kill(pid, 0); return true; } catch (err) { if (err && err.code === 'EPERM') return true; return false; } }
 async function withLock(paths, runId, fn) {
-  await fsp.mkdir(paths.stateDir, { recursive: true, mode: 0o700 });
+  await ensureSafeDir(paths.stateDir, paths.root);
   try {
     const fd = await fsp.open(paths.lock, 'wx', 0o600);
     await fd.writeFile(JSON.stringify({ runId, pid: process.pid, host: os.hostname(), startedAt: new Date().toISOString() }) + '\n');
@@ -86,7 +110,8 @@ async function withLock(paths, runId, fn) {
   } catch (err) {
     if (err.code !== 'EEXIST') throw err;
     const lock = await readJson(paths.lock, {});
-    if (lock.host === os.hostname() && lock.pid && isPidAlive(lock.pid)) throw new ArchiveError('LOCKED', 'profile is locked by alive pid ' + lock.pid, { lock });
+    if (!lock.host || lock.host !== os.hostname()) throw new ArchiveError('LOCKED_FOREIGN', 'profile lock belongs to another or unknown host; failing closed', { lock });
+    if (lock.pid && isPidAlive(lock.pid)) throw new ArchiveError('LOCKED', 'profile is locked by alive pid ' + lock.pid, { lock });
     await fsp.rename(paths.lock, paths.lock + '.stale-' + Date.now()).catch(() => {});
     return withLock(paths, runId, fn);
   }
@@ -108,6 +133,7 @@ function stableMediaId(item) {
 function parseDateText(value) {
   if (!value) return null;
   const clean = String(value).split('\n').map(s => s.trim()).filter(Boolean).at(-1) || String(value).trim();
+  if (!/\b(?:19|20)\d{2}\b/.test(clean)) return clean;
   const t = Date.parse(clean);
   return Number.isFinite(t) ? new Date(t).toISOString() : clean;
 }
@@ -288,8 +314,8 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
     const declared = Number(headerGet(res, 'content-length') || '0');
     if (declared > maxBytes) throw new ArchiveError('TOO_LARGE', 'content-length exceeds max bytes');
     const stableId = item.stableId || stableMediaId(item);
-    await fsp.mkdir(paths.mediaDir, { recursive: true, mode: 0o700 });
-    await fsp.mkdir(paths.receiptDir, { recursive: true, mode: 0o700 });
+    await ensureSafeDir(paths.mediaDir, paths.root);
+    await ensureSafeDir(paths.receiptDir, paths.root);
     const partBase = path.join(paths.mediaDir, stableId + '.part');
     const got = await streamResponseToPart(res, partBase, { maxBytes, signal: ac.signal });
     if (declared && declared !== got.bytes) throw new ArchiveError('BAD_LENGTH', 'content-length mismatch');
@@ -323,6 +349,9 @@ async function archiveProfile(opts = {}) {
   const runId = Date.now() + '-' + crypto.randomUUID();
   const started = Date.now();
   const maxTimeMs = opts.maxTimeMs || DEFAULT_MAX_TIME_MS;
+  await ensureSafeDir(paths.stateDir, paths.root);
+  await ensureSafeDir(paths.mediaDir, paths.root);
+  await ensureSafeDir(paths.receiptDir, paths.root);
   return withLock(paths, runId, async () => {
     const prior = await readJson(paths.manifest, { version: 1, handle, completed: {}, failed: {}, runs: [] });
     await writeStatus(paths, { status: 'RUNNING', reason: 'scan started', runId, handle, mode, startedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length });
@@ -417,11 +446,11 @@ async function extractItemsFromPage(page, reportedTotal = null, flags = {}) {
   const norm = normalizeItems(raw);
   return { items: norm.items, reportedTotal, uniquePostCount: norm.uniquePostCount, noGrowth: !!flags.noGrowth, hitLimit: !!flags.hitLimit };
 }
-async function statusProfile({ handle, output }) { validateHandle(handle); const root = await safeOutputRoot(output); return await readJson(profilePaths(root, handle).status, { status: 'ACTION_REQUIRED', reason: 'no status exists yet', handle }); }
+async function statusProfile({ handle, output }) { validateHandle(handle); const root = await safeOutputRoot(output); const paths = profilePaths(root, handle); await ensureSafeDir(paths.stateDir, paths.root); return await readJson(paths.status, { status: 'ACTION_REQUIRED', reason: 'no status exists yet', handle }); }
 async function doctor({ attachCdp } = {}) {
   const checks = { node: process.versions.node, nodeOk: Number(process.versions.node.split('.')[0]) >= 20, playwright: false, cdpOk: true };
   try { require('playwright'); checks.playwright = true; } catch (err) { checks.playwrightError = err.message; }
   if (attachCdp) { try { const u = new URL(attachCdp); checks.cdpOk = u.protocol === 'http:' && ['127.0.0.1','localhost','::1','[::1]'].includes(u.hostname); } catch { checks.cdpOk = false; } }
   checks.ok = checks.nodeOk && checks.playwright && checks.cdpOk; return checks;
 }
-module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, scrapeWithPlaywright, extractReportedTotalFromPage, extractItemsFromPage, statusProfile, doctor };
+module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, scrapeWithPlaywright, extractReportedTotalFromPage, extractItemsFromPage, statusProfile, doctor };

@@ -36,7 +36,11 @@ if [ -n "$chromium_real" ] && [ -x "$chromium_real" ]; then
 fi
 echo "sandbox: bwrap isolated copied tree, no network namespace, clearenv, cap-drop, cgroup MemoryMax=1G, node heap cap 512MiB" >&2
 if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet -p MemoryMax=1G -p TasksMax=512 true 2>/dev/null; then
-  exec systemd-run --user --scope --quiet -p MemoryMax=1G -p TasksMax=512 bwrap "${args[@]}" "$node_path" --test
+  systemd-run --user --scope --quiet -p MemoryMax=1G -p TasksMax=512 bwrap "${args[@]}" "$node_path" --test
+  exit_code=$?
+  exit "$exit_code"
 fi
 echo "warning: systemd-run user scope unavailable; using bwrap namespace plus Node heap cap only" >&2
-exec bwrap "${args[@]}" "$node_path" --test
+bwrap "${args[@]}" "$node_path" --test
+exit_code=$?
+exit "$exit_code"
