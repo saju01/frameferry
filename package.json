@@ -1,6 +1,6 @@
 {
   "name": "frameferry",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenClaw skill and CLI for bounded, verifiable FrameFerry archives using the InstaCognito public provider.",
   "bin": {
     "frameferry": "./bin/frameferry.js"
@@ -25,6 +25,11 @@
     "bin/",
     "src/",
     "scripts/",
-    "test/"
-  ]
+    "test/",
+    "references/"
+  ],
+  "author": {
+    "name": "Saju",
+    "url": "https://github.com/saju01"
+  }
 }

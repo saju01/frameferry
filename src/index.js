@@ -6,19 +6,36 @@ const crypto = require('node:crypto');
 const dns = require('node:dns/promises');
 const net = require('node:net');
 const { setTimeout: delay } = require('node:timers/promises');
+const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MAX_TIME_MS = 600000;
 const DEFAULT_DELAY_MS = 500;
+const DEFAULT_NETWORK_TIMEOUT_MS = 60000;
+const VALID_CATEGORIES = ['posts', 'reels', 'stories', 'highlights'];
+const VALID_MEDIA_TYPES = ['image', 'video'];
+const DEFAULT_CATEGORIES = ['posts'];
+const DEFAULT_MEDIA_TYPES = ['image', 'video'];
+const ZIP32_HARD_MAX_BYTES = Math.min(ZIP32_MAX - 4096, 2 * 1024 * 1024 * 1024);
+const ZIP32_HARD_MAX_ENTRIES = 5000;
+const ZIP32_HARD_MAX_FILES = 3000;
 
 class ArchiveError extends Error {
-  constructor(code, message, details = {}) { super(message); this.name = 'ArchiveError'; this.code = code; this.details = details; }
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'ArchiveError';
+    this.code = code;
+    this.details = details;
+  }
 }
 class DeferredError extends ArchiveError {
-  constructor(retryAt, message = 'provider requested retry later') { super('DEFERRED', message, { retryAt }); this.retryAt = retryAt; }
+  constructor(retryAt, message = 'provider requested retry later') {
+    super('DEFERRED', message, { retryAt });
+    this.retryAt = retryAt;
+  }
 }
 
 function validateHandle(handle) {
@@ -30,7 +47,56 @@ function validateHandle(handle) {
 }
 function redactSignedUrls(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return text.replace(/https:\/\/instacognito\.com\/media\?id=[A-Za-z0-9._~!$&'()*+,;=:@%\/-]+/g, 'https://instacognito.com/media?id=[REDACTED]');
+  return text.replace(/https:\/\/instacognito\.com\/media\?id=[A-Za-z0-9._~!$&'()*+,;=:@%\/-]+/g, '[REDACTED instacognito media URL]');
+}
+function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
+function jsonText(data) { return JSON.stringify(data, null, 2) + '\n'; }
+function unique(list) { return [...new Set(list)]; }
+function asPositiveIntOrDefault(value, fallback, label) {
+  if (value == null) return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) throw new ArchiveError('BAD_ARGS', label + ' must be a positive number');
+  return Math.floor(n);
+}
+function normalizeMediaType(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (v === 'image' || v === 'photo' || v === 'jpg' || v === 'png' || v === 'webp') return 'image';
+  if (v === 'video' || v === 'reel' || v === 'mp4') return 'video';
+  return 'unknown';
+}
+function optionListText(list) { return list.join(', '); }
+function parseChoiceList(raw, valid, label, defaults) {
+  if (raw == null || raw === '') return [...defaults];
+  const parts = String(raw).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (!parts.length) throw new ArchiveError('BAD_ARGS', label + ' requires at least one value');
+  let expanded = parts;
+  if (parts.includes('all')) {
+    if (valid.includes('all')) expanded = [...valid].filter(v => v !== 'all');
+    else expanded = [...valid];
+  }
+  const out = unique(expanded);
+  for (const item of out) if (!valid.includes(item) && item !== 'all') throw new ArchiveError('BAD_ARGS', label + ' must be one of: ' + optionListText(valid));
+  return out.filter(item => item !== 'all');
+}
+function parseCategories(raw) { return parseChoiceList(raw, VALID_CATEGORIES, '--categories', DEFAULT_CATEGORIES); }
+function parseMediaTypes(raw) { return parseChoiceList(raw, VALID_MEDIA_TYPES, '--media-types', DEFAULT_MEDIA_TYPES); }
+
+async function ensureNoSymlinkAncestors(target, { allowMissingLeaf = true } = {}) {
+  const resolved = path.resolve(target);
+  const parts = resolved.split(path.sep).filter(Boolean);
+  let probe = path.isAbsolute(resolved) ? path.sep : '';
+  for (let i = 0; i < parts.length; i++) {
+    probe = path.join(probe, parts[i]);
+    try {
+      const st = await fsp.lstat(probe);
+      if (st.isSymbolicLink()) throw new ArchiveError('BAD_OUTPUT', 'path contains symlink: ' + probe);
+    } catch (err) {
+      if (err.code === 'ENOENT' && allowMissingLeaf && i === parts.length - 1) return resolved;
+      if (err.code === 'ENOENT') throw new ArchiveError('BAD_OUTPUT', 'path ancestor missing: ' + probe);
+      throw err;
+    }
+  }
+  return resolved;
 }
 async function safeOutputRoot(output) {
   if (!output) throw new ArchiveError('BAD_OUTPUT', '--output is required');
@@ -76,6 +142,28 @@ async function ensureSafeDir(dir, root) {
   if (st.isSymbolicLink() || !st.isDirectory()) throw new ArchiveError('BAD_OUTPUT', 'internal directory must be a real directory');
   return resolved;
 }
+async function ensureSafeFileInsideRoot(root, relativePath) {
+  const abs = path.resolve(root, relativePath);
+  const base = path.resolve(root);
+  if (!abs.startsWith(base + path.sep)) throw new ArchiveError('BAD_OUTPUT', 'file escapes output root');
+  await ensureNoSymlinkAncestors(abs, { allowMissingLeaf: false });
+  const st = await fsp.lstat(abs);
+  if (st.isSymbolicLink() || !st.isFile()) throw new ArchiveError('BAD_OUTPUT', 'zip source must be a real file: ' + abs);
+  return abs;
+}
+async function atomicWriteJson(file, data, mode = 0o600) {
+  await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = file + '.' + process.pid + '.' + Date.now() + '.tmp';
+  await fsp.writeFile(tmp, jsonText(data), { mode });
+  await fsp.chmod(tmp, mode);
+  await fsp.rename(tmp, file);
+  await fsp.chmod(file, mode);
+}
+async function readJson(file, fallback = null) {
+  try { return JSON.parse(await fsp.readFile(file, 'utf8')); }
+  catch (err) { if (err.code === 'ENOENT') return fallback; throw err; }
+}
+function isPidAlive(pid) { try { process.kill(pid, 0); return true; } catch (err) { if (err && err.code === 'EPERM') return true; return false; } }
 function profilePaths(root, handle) {
   validateHandle(handle);
   return {
@@ -88,19 +176,6 @@ function profilePaths(root, handle) {
     status: path.join(root, '.frameferry', handle, 'status.json')
   };
 }
-async function atomicWriteJson(file, data, mode = 0o600) {
-  await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = file + '.' + process.pid + '.' + Date.now() + '.tmp';
-  await fsp.writeFile(tmp, JSON.stringify(data, null, 2) + '\n', { mode });
-  await fsp.chmod(tmp, mode);
-  await fsp.rename(tmp, file);
-  await fsp.chmod(file, mode);
-}
-async function readJson(file, fallback = null) {
-  try { return JSON.parse(await fsp.readFile(file, 'utf8')); }
-  catch (err) { if (err.code === 'ENOENT') return fallback; throw err; }
-}
-function isPidAlive(pid) { try { process.kill(pid, 0); return true; } catch (err) { if (err && err.code === 'EPERM') return true; return false; } }
 async function withLock(paths, runId, fn) {
   await ensureSafeDir(paths.stateDir, paths.root);
   try {
@@ -117,18 +192,13 @@ async function withLock(paths, runId, fn) {
   }
   try { return await fn(); } finally { await fsp.unlink(paths.lock).catch(() => {}); }
 }
+
 function parseRetryAfter(value, now = Date.now()) {
   if (!value) return null;
   const sec = Number(value);
   if (Number.isFinite(sec)) return new Date(now + Math.max(0, sec) * 1000).toISOString();
   const t = Date.parse(value);
   return Number.isFinite(t) ? new Date(t).toISOString() : null;
-}
-function stableMediaId(item) {
-  const shortcode = String(item.shortcode || '').trim();
-  const index = Number.isInteger(item.carouselIndex) ? item.carouselIndex : 0;
-  if (!shortcode) throw new ArchiveError('BAD_ITEM', 'media item missing shortcode');
-  return (shortcode + '-' + index).replace(/[^A-Za-z0-9._-]/g, '_');
 }
 function parseDateText(value) {
   if (!value) return null;
@@ -137,49 +207,100 @@ function parseDateText(value) {
   const t = Date.parse(clean);
   return Number.isFinite(t) ? new Date(t).toISOString() : clean;
 }
-function normalizeItems(rawItems) {
-  const seenStable = new Set();
-  const seenPost = new Set();
-  const nextIndex = new Map();
-  const rawSeen = new Set();
-  const items = [];
-  for (const raw of rawItems || []) {
-    const shortcode = String(raw.shortcode || raw.dataId || '').trim();
-    if (!shortcode) continue;
-    const rawKey = shortcode + '|' + (raw.href || '') + '|' + (raw.type || '') + '|' + (raw.dateText || '');
-    if (rawSeen.has(rawKey)) continue;
-    rawSeen.add(rawKey);
-    let carouselIndex;
-    if (Number.isInteger(raw.carouselIndex)) carouselIndex = raw.carouselIndex;
-    else { carouselIndex = nextIndex.get(shortcode) || 0; nextIndex.set(shortcode, carouselIndex + 1); }
-    const item = { shortcode, carouselIndex, type: raw.type || 'unknown', href: raw.href || null, dateText: parseDateText(raw.dateText) };
-    item.stableId = stableMediaId(item);
-    if (seenStable.has(item.stableId)) continue;
-    seenStable.add(item.stableId); seenPost.add(shortcode); items.push(item);
-  }
-  return { items, uniquePostCount: seenPost.size };
-}
 function parseReportedTotal(text) {
   if (!text) return null;
   const s = String(text);
-  const num = '(?<![\\d.])(\\d+(?:[,. ]\\d{3})*)(?![\\d.])';
+  const patterns = [
+    /(\d+(?:[,. ]\d{3})*)\s*(?:posts?|post)\b/gi,
+    /(?:posts?|post)\D{0,20}(\d+(?:[,. ]\d{3})*)/gi
+  ];
   const candidates = [];
-  for (const m of s.matchAll(new RegExp(num + '\\s*(?:posts?|post)\\b', 'gi'))) {
-    const prefix = s.slice(Math.max(0, m.index - 16), m.index).toLowerCase();
-    if (/following\s*$/.test(prefix)) continue;
-    candidates.push({ value: m[1], score: 0, index: m.index });
-  }
-  for (const m of s.matchAll(new RegExp('(?:posts?|post)\\D{0,20}' + num, 'gi'))) {
-    const suffix = s.slice(m.index + m[0].length, m.index + m[0].length + 16).toLowerCase();
-    if (/^\s*follow(?:ing|ers?)/.test(suffix)) continue;
-    candidates.push({ value: m[1], score: 1, index: m.index });
+  for (const [score, re] of patterns.entries()) {
+    for (const m of s.matchAll(re)) {
+      const before = s.slice(Math.max(0, (m.index || 0) - 16), m.index || 0).toLowerCase();
+      const after = s.slice((m.index || 0) + m[0].length, (m.index || 0) + m[0].length + 16).toLowerCase();
+      if (/following\s*$/.test(before) || /^\s*follow(?:ing|ers?)/.test(after)) continue;
+      candidates.push({ value: m[1], score, index: m.index || 0 });
+    }
   }
   if (!candidates.length) return null;
   candidates.sort((a, b) => a.score - b.score || a.index - b.index);
-  return Number(candidates[0].value.replace(/[^0-9]/g, ''));
+  return Number(String(candidates[0].value).replace(/[^0-9]/g, ''));
+}
+function legacyStableMediaId(item) {
+  const shortcode = String(item.shortcode || '').trim();
+  const index = Number.isInteger(item.carouselIndex) ? item.carouselIndex : 0;
+  if (!shortcode) throw new ArchiveError('BAD_ITEM', 'media item missing shortcode');
+  return (shortcode + '-' + index).replace(/[^A-Za-z0-9._-]/g, '_');
+}
+function stableMediaId(item, contentSha = null) {
+  const shortcode = String(item.shortcode || '').trim();
+  const index = Number.isInteger(item.carouselIndex) ? item.carouselIndex : 0;
+  const category = VALID_CATEGORIES.includes(item.category) ? item.category : 'posts';
+  if (shortcode) {
+    const base = (shortcode + '-' + index).replace(/[^A-Za-z0-9._-]/g, '_');
+    return category === 'posts' ? base : (category + '__' + base);
+  }
+  if (!contentSha) throw new ArchiveError('BAD_ITEM', 'content-hash identity required when shortcode is unavailable');
+  return (category + '__sha256-' + contentSha).replace(/[^A-Za-z0-9._-]/g, '_');
+}
+function fallbackFailureKey(item, index) {
+  const category = VALID_CATEGORIES.includes(item?.category) ? item.category : 'posts';
+  const shortcode = String(item?.shortcode || '').trim();
+  return shortcode ? category + '__' + shortcode + '-' + (Number.isInteger(item.carouselIndex) ? item.carouselIndex : 0) : category + '__pending-' + index;
+}
+function normalizeItems(rawItems, opts = {}) {
+  const options = (opts && typeof opts === 'object' && !Array.isArray(opts)) ? opts : {};
+  const category = VALID_CATEGORIES.includes(options.category) ? options.category : 'posts';
+  const mediaTypes = options.mediaTypes || DEFAULT_MEDIA_TYPES;
+  const allowedKnown = new Set(mediaTypes.map(normalizeMediaType));
+  const seenRaw = new Set();
+  const seenStable = new Set();
+  const seenPosts = new Set();
+  const nextIndex = new Map();
+  const items = [];
+  for (const raw of rawItems || []) {
+    const mediaType = normalizeMediaType(raw.mediaType ?? raw.type);
+    if (mediaType !== 'unknown' && allowedKnown.size && !allowedKnown.has(mediaType)) continue;
+    const shortcode = String(raw.shortcode || raw.dataId || '').trim();
+    const href = raw.href || null;
+    const rawKey = [category, shortcode || '-', href || '-', mediaType, raw.dateRaw || raw.dateText || '-', raw.captionTruncated || raw.caption || '-', raw.highlightGroup || options.highlightGroup || '-'].join('|');
+    if (seenRaw.has(rawKey)) continue;
+    seenRaw.add(rawKey);
+    let carouselIndex;
+    if (Number.isInteger(raw.carouselIndex)) carouselIndex = raw.carouselIndex;
+    else {
+      const key = shortcode ? shortcode : '__missing-shortcode__';
+      carouselIndex = nextIndex.get(key) || 0;
+      nextIndex.set(key, carouselIndex + 1);
+    }
+    const dateRaw = raw.dateRaw ?? raw.dateText ?? null;
+    const item = {
+      category,
+      shortcode: shortcode || null,
+      carouselIndex,
+      mediaType,
+      href,
+      dateRaw: dateRaw ? String(dateRaw).trim() : null,
+      dateParsed: raw.dateParsed || parseDateText(dateRaw),
+      captionTruncated: raw.captionTruncated ?? raw.caption ?? null,
+      likes: raw.likes != null ? String(raw.likes) : null,
+      comments: raw.comments != null ? String(raw.comments) : null,
+      permalink: raw.permalink ?? null,
+      highlightGroup: raw.highlightGroup ?? options.highlightGroup ?? null,
+      identityBasis: shortcode ? 'provider-shortcode' : 'content-sha256'
+    };
+    item.stableId = shortcode ? stableMediaId(item) : null;
+    if (item.stableId && seenStable.has(item.stableId)) continue;
+    if (item.stableId) seenStable.add(item.stableId);
+    if (shortcode) seenPosts.add(shortcode);
+    items.push(item);
+  }
+  return { items, uniquePostCount: seenPosts.size };
 }
 function validateProviderMediaUrl(raw) {
-  let u; try { u = new URL(raw); } catch { throw new ArchiveError('BAD_URL', 'invalid media URL'); }
+  let u;
+  try { u = new URL(raw, PROVIDER_ORIGIN); } catch { throw new ArchiveError('BAD_URL', 'invalid media URL'); }
   if (u.protocol !== 'https:' || u.hostname !== 'instacognito.com' || u.pathname !== '/media' || !u.searchParams.has('id')) throw new ArchiveError('BAD_URL', 'media URL must be https://instacognito.com/media?id=...');
   return u;
 }
@@ -276,7 +397,8 @@ async function streamResponseToPart(res, part, { maxBytes, signal }) {
         bytes += chunk.length;
         if (bytes > maxBytes) throw new ArchiveError('TOO_LARGE', 'download exceeds max bytes');
         if (Buffer.concat(head).length < 16) head.push(chunk.subarray(0, 16));
-        hash.update(chunk); await fh.write(chunk);
+        hash.update(chunk);
+        await fh.write(chunk);
       }
     } else {
       for await (const chunkRaw of body) {
@@ -285,10 +407,13 @@ async function streamResponseToPart(res, part, { maxBytes, signal }) {
         bytes += chunk.length;
         if (bytes > maxBytes) throw new ArchiveError('TOO_LARGE', 'download exceeds max bytes');
         if (Buffer.concat(head).length < 16) head.push(chunk.subarray(0, 16));
-        hash.update(chunk); await fh.write(chunk);
+        hash.update(chunk);
+        await fh.write(chunk);
       }
     }
-  } finally { await fh.close(); }
+  } finally {
+    await fh.close();
+  }
   const first = Buffer.concat(head).subarray(0, 16);
   const kind = mediaKindFromMagic(first);
   if (!kind) throw new ArchiveError('BAD_SIGNATURE', 'download signature is not recognized media');
@@ -303,9 +428,10 @@ async function verifyReceipt(paths, receipt) {
   const data = await fsp.readFile(file);
   return crypto.createHash('sha256').update(data).digest('hex') === receipt.sha256;
 }
-async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = 60000, dnsLookup, timeoutMs } = {}) {
+async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = DEFAULT_NETWORK_TIMEOUT_MS, dnsLookup, timeoutMs, completedMap = {}, handle } = {}) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), Math.max(1, timeoutMs || remainingMs));
+  const tempBase = path.join(paths.mediaDir, (item.stableId || fallbackFailureKey(item, 0)) + '.' + Date.now() + '.part');
   try {
     const res = await fetchWithValidatedRedirects(item.href, { fetchImpl, remainingMs, dnsLookup, signal: ac.signal });
     if (!res.ok) throw new ArchiveError('DOWNLOAD_FAILED', 'download failed with HTTP ' + res.status);
@@ -313,22 +439,53 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
     if (ct.includes('text/html')) throw new ArchiveError('BAD_CONTENT', 'provider returned HTML instead of media');
     const declared = Number(headerGet(res, 'content-length') || '0');
     if (declared > maxBytes) throw new ArchiveError('TOO_LARGE', 'content-length exceeds max bytes');
-    const stableId = item.stableId || stableMediaId(item);
     await ensureSafeDir(paths.mediaDir, paths.root);
     await ensureSafeDir(paths.receiptDir, paths.root);
-    const partBase = path.join(paths.mediaDir, stableId + '.part');
-    const got = await streamResponseToPart(res, partBase, { maxBytes, signal: ac.signal });
+    const got = await streamResponseToPart(res, tempBase, { maxBytes, signal: ac.signal });
     if (declared && declared !== got.bytes) throw new ArchiveError('BAD_LENGTH', 'content-length mismatch');
-    const dest = path.join(paths.mediaDir, stableId + '.' + extFor(got.kind));
-    await fsp.rename(partBase, dest);
-    const receipt = { stableId, shortcode: item.shortcode, carouselIndex: item.carouselIndex || 0, type: item.type || 'unknown', path: path.relative(paths.root, dest), bytes: got.bytes, sha256: got.sha256, contentType: ct || 'application/octet-stream', sourceHost: 'instacognito.com', runId, completedAt: new Date().toISOString() };
+    const mediaType = item.mediaType === 'unknown' ? normalizeMediaType(got.kind) : item.mediaType;
+    const stableId = item.stableId || stableMediaId(item, got.sha256);
+    const ext = extFor(got.kind);
+    const dest = path.join(paths.mediaDir, stableId + '.' + ext);
+    const existing = completedMap[stableId];
+    if (existing && existing.sha256 === got.sha256 && existing.bytes === got.bytes && await verifyReceipt(paths, existing)) {
+      await fsp.rm(tempBase, { force: true }).catch(() => {});
+      return { receipt: existing, fetchedButReused: true };
+    }
+    await fsp.rename(tempBase, dest);
+    const receipt = {
+      stableId,
+      id: stableId,
+      category: item.category,
+      mediaType,
+      shortcode: item.shortcode || null,
+      carouselIndex: item.carouselIndex || 0,
+      identityBasis: item.shortcode ? 'provider-shortcode' : 'content-sha256',
+      captionTruncated: item.captionTruncated ?? null,
+      permalink: item.permalink ?? null,
+      dateRaw: item.dateRaw ?? null,
+      dateParsed: item.dateParsed ?? null,
+      highlightGroup: item.highlightGroup ?? null,
+      likes: item.likes ?? null,
+      comments: item.comments ?? null,
+      profileHandle: handle,
+      path: path.relative(paths.root, dest),
+      bytes: got.bytes,
+      sha256: got.sha256,
+      contentType: ct || 'application/octet-stream',
+      sourceHost: 'instacognito.com',
+      runId,
+      completedAt: new Date().toISOString()
+    };
     await atomicWriteJson(path.join(paths.receiptDir, stableId + '.json'), receipt);
-    return receipt;
+    return { receipt, fetchedButReused: false };
   } catch (err) {
-    await fsp.rm(path.join(paths.mediaDir, (item.stableId || stableMediaId(item)) + '.part'), { force: true }).catch(() => {});
+    await fsp.rm(tempBase, { force: true }).catch(() => {});
     if (err.name === 'AbortError') throw new ArchiveError('TIMEOUT', 'download timeout');
     throw err;
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 function decideOutcome({ reportedTotal, uniquePostCount, failed, noGrowth, hitLimit, mode, reusedOnlyComplete = false }) {
   if (reportedTotal == null) return { status: 'ACTION_REQUIRED', reason: 'reported total could not be parsed' };
@@ -338,78 +495,181 @@ function decideOutcome({ reportedTotal, uniquePostCount, failed, noGrowth, hitLi
   if (reportedTotal != null && uniquePostCount < reportedTotal) return { status: 'PARTIAL', reason: 'advertised shortfall ' + uniquePostCount + '/' + reportedTotal };
   return { status: 'COMPLETE', reason: reusedOnlyComplete ? 'all requested media reused from verified receipts' : 'reported total reached and downloads verified' };
 }
-function sanitizeFailedItem(item, error) { return { stableId: item.stableId || stableMediaId(item), shortcode: item.shortcode, carouselIndex: item.carouselIndex || 0, type: item.type || 'unknown', error: redactSignedUrls(error) }; }
+function sanitizeFailedItem(item, error, index = 0) {
+  return {
+    stableId: item.stableId || fallbackFailureKey(item, index),
+    category: item.category || 'posts',
+    shortcode: item.shortcode || null,
+    carouselIndex: item.carouselIndex || 0,
+    mediaType: item.mediaType || 'unknown',
+    identityBasis: item.identityBasis || (item.shortcode ? 'provider-shortcode' : 'content-sha256'),
+    error: redactSignedUrls(error)
+  };
+}
 async function writeStatus(paths, status) { await atomicWriteJson(paths.status, status); return status; }
-async function archiveProfile(opts = {}) {
-  const handle = validateHandle(opts.handle);
-  const mode = opts.mode || 'full';
-  if (!['full', 'sync'].includes(mode)) throw new ArchiveError('BAD_MODE', 'mode must be full or sync');
-  const root = await safeOutputRoot(opts.output);
-  const paths = profilePaths(root, handle);
-  const runId = Date.now() + '-' + crypto.randomUUID();
-  const started = Date.now();
-  const maxTimeMs = opts.maxTimeMs || DEFAULT_MAX_TIME_MS;
-  await ensureSafeDir(paths.stateDir, paths.root);
-  await ensureSafeDir(paths.mediaDir, paths.root);
-  await ensureSafeDir(paths.receiptDir, paths.root);
-  return withLock(paths, runId, async () => {
-    const prior = await readJson(paths.manifest, { version: 1, handle, completed: {}, failed: {}, runs: [] });
-    await writeStatus(paths, { status: 'RUNNING', reason: 'scan started', runId, handle, mode, startedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length });
-    let scan;
-    try {
-      scan = opts.items ? { items: opts.items, reportedTotal: opts.reportedTotal, noGrowth: !!opts.noGrowth, hitLimit: !!opts.hitLimit } : await scrapeWithPlaywright({ handle, maxPages: opts.maxPages || 12, maxTimeMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp });
-    } catch (err) {
-      const status = { status: err instanceof DeferredError ? 'DEFERRED' : 'ACTION_REQUIRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, updatedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length };
-      await writeStatus(paths, status); throw err;
+function makeSectionRecord(section = {}) {
+  return {
+    category: section.category,
+    status: section.status || 'UNAVAILABLE',
+    reason: section.reason || null,
+    tabPresent: section.tabPresent ?? true,
+    itemCount: section.itemCount ?? 0,
+    downloadedCount: section.downloadedCount ?? 0,
+    reusedCount: section.reusedCount ?? 0,
+    failedCount: section.failedCount ?? 0,
+    mediaTypeFilterApplied: section.mediaTypeFilterApplied || DEFAULT_MEDIA_TYPES,
+    evidence: section.evidence || {},
+    items: section.items || [],
+    reportedTotal: section.reportedTotal ?? null,
+    noGrowth: !!section.noGrowth,
+    hitLimit: !!section.hitLimit
+  };
+}
+function publicItemSummary(item, index = 0) {
+  return {
+    stableId: item?.stableId || fallbackFailureKey(item, index),
+    category: VALID_CATEGORIES.includes(item?.category) ? item.category : 'posts',
+    shortcode: item?.shortcode || null,
+    carouselIndex: Number.isInteger(item?.carouselIndex) ? item.carouselIndex : 0,
+    mediaType: item?.mediaType || 'unknown',
+    identityBasis: item?.identityBasis || (item?.shortcode ? 'provider-shortcode' : 'content-sha256'),
+    captionTruncated: item?.captionTruncated ?? null,
+    dateRaw: item?.dateRaw ?? null,
+    dateParsed: item?.dateParsed ?? null,
+    likes: item?.likes ?? null,
+    comments: item?.comments ?? null,
+    permalink: item?.permalink ?? null,
+    highlightGroup: item?.highlightGroup ?? null
+  };
+}
+function publicSectionRecord(section = {}) {
+  const clean = makeSectionRecord(section);
+  return {
+    category: clean.category,
+    status: clean.status,
+    reason: clean.reason ? redactSignedUrls(clean.reason) : null,
+    tabPresent: clean.tabPresent,
+    itemCount: clean.itemCount,
+    downloadedCount: clean.downloadedCount,
+    reusedCount: clean.reusedCount,
+    failedCount: clean.failedCount,
+    mediaTypeFilterApplied: clean.mediaTypeFilterApplied,
+    evidence: clean.evidence || {},
+    items: (clean.items || []).map((item, index) => publicItemSummary(item, index)),
+    reportedTotal: clean.reportedTotal ?? null,
+    noGrowth: !!clean.noGrowth,
+    hitLimit: !!clean.hitLimit,
+    uniquePostCount: clean.uniquePostCount ?? null
+  };
+}
+function statusSectionRecord(section = {}) {
+  const clean = publicSectionRecord(section);
+  delete clean.items;
+  return clean;
+}
+function publicProfile(profile = null) {
+  if (!profile) return null;
+  return {
+    handle: profile.handle || null,
+    reportedPostCount: profile.reportedPostCount ?? null,
+    rawProfileText: profile.rawProfileText ? redactSignedUrls(String(profile.rawProfileText)) : null
+  };
+}
+function receiptCategory(receipt) {
+  return VALID_CATEGORIES.includes(receipt?.category) ? receipt.category : 'posts';
+}
+function receiptStableId(receipt) {
+  return receipt?.stableId || receipt?.id || null;
+}
+function receiptIdentityBasis(receipt) {
+  return receipt?.identityBasis || (receipt?.shortcode ? 'provider-shortcode' : 'content-sha256');
+}
+function receiptShortcode(receipt) {
+  return typeof receipt?.shortcode === 'string' && receipt.shortcode.trim() ? receipt.shortcode.trim() : null;
+}
+function sectionOutcomeForCompleted(section, completedEntries, { mode }) {
+  const items = section.items || [];
+  const completedForSection = completedEntries.filter(receipt => receiptCategory(receipt) === section.category);
+  if (section.category === 'posts') {
+    const shortcodes = new Set();
+    for (const item of items) if (item.shortcode) shortcodes.add(item.shortcode);
+    for (const receipt of completedForSection) {
+      const shortcode = receiptShortcode(receipt);
+      if (shortcode) shortcodes.add(shortcode);
     }
-    const norm = normalizeItems(scan.items);
-    const freshById = new Map(norm.items.map(i => [i.stableId, i]));
-    const completed = { ...(prior.completed || {}) };
-    const failed = {};
-    for (const [sid, oldFail] of Object.entries(prior.failed || {})) if (!freshById.has(sid)) failed[sid] = sanitizeFailedItem(oldFail, 'pending fresh scan retry');
-    let downloaded = 0, reused = 0;
-    for (const item of freshById.values()) {
-      const sid = item.stableId;
-      if (Date.now() - started > maxTimeMs) { failed[sid] = sanitizeFailedItem(item, 'time budget reached'); continue; }
-      const existing = completed[sid];
-      if (existing && await verifyReceipt(paths, existing)) { reused++; continue; }
-      if (!item.href) { failed[sid] = sanitizeFailedItem(item, 'missing media href'); continue; }
-      try {
-        const receipt = await downloadOne(item, paths, { fetchImpl: opts.fetchImpl, maxBytes: opts.maxBytes || DEFAULT_MAX_BYTES, runId, remainingMs: Math.max(0, maxTimeMs - (Date.now() - started)), dnsLookup: opts.dnsLookup, timeoutMs: Math.min(opts.networkTimeoutMs || Infinity, Math.max(1, maxTimeMs - (Date.now() - started))) });
-        completed[sid] = receipt; delete failed[sid]; downloaded++;
-        await atomicWriteJson(paths.manifest, { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: prior.runs || [] });
-        const remainingAfterDownload = maxTimeMs - (Date.now() - started);
-        if ((opts.delayMs ?? DEFAULT_DELAY_MS) && remainingAfterDownload > 0) await delay(Math.min(opts.delayMs ?? DEFAULT_DELAY_MS, 5000, remainingAfterDownload));
-      } catch (err) {
-        if (err instanceof DeferredError) {
-          const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), { runId, mode, status: 'DEFERRED', completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length }] };
-          await atomicWriteJson(paths.manifest, manifest);
-          await writeStatus(paths, { status: 'DEFERRED', reason: err.message, retryAt: err.retryAt, runId, handle, mode, downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, updatedAt: new Date().toISOString() });
-          throw err;
-        }
-        failed[sid] = sanitizeFailedItem(item, err.message);
-      }
-    }
-    const completedPostSet = new Set([...norm.items.map(i => i.shortcode), ...Object.values(completed).map(r => r.shortcode).filter(Boolean)]);
-    const uniquePostCount = completedPostSet.size;
-    const outcome = decideOutcome({ reportedTotal: scan.reportedTotal, uniquePostCount, failed: Object.keys(failed).length, noGrowth: scan.noGrowth, hitLimit: scan.hitLimit, mode, reusedOnlyComplete: downloaded === 0 && reused > 0 });
-    const run = { runId, mode, status: outcome.status, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused };
-    const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), run] };
-    await atomicWriteJson(paths.manifest, manifest);
-    return writeStatus(paths, { ...outcome, runId, handle, mode, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused, updatedAt: new Date().toISOString() });
+    const outcome = decideOutcome({
+      reportedTotal: section.reportedTotal,
+      uniquePostCount: shortcodes.size,
+      failed: section.failedCount,
+      noGrowth: section.noGrowth,
+      hitLimit: section.hitLimit,
+      mode,
+      reusedOnlyComplete: section.downloadedCount === 0 && section.reusedCount > 0
+    });
+    return { ...outcome, uniquePostCount: shortcodes.size };
+  }
+  if (section.failedCount > 0) return { status: 'PARTIAL', reason: section.reason || (section.failedCount + ' items failed') };
+  if (section.hitLimit) return { status: 'PARTIAL', reason: section.reason || 'bounded limit reached before section settled' };
+  if (section.itemCount === 0) return { status: 'UNAVAILABLE', reason: section.reason || 'no visible items found' };
+  if (section.noGrowth && mode === 'full') return { status: 'COMPLETE', reason: section.reason || 'visible section exhausted without further growth' };
+  return { status: 'COMPLETE', reason: section.reason || 'section downloaded/reused successfully' };
+}
+function normalizeProvidedSections(sections, mediaTypes) {
+  return (sections || []).map(section => {
+    const norm = normalizeItems(section.items || [], { category: section.category, mediaTypes });
+    return makeSectionRecord({
+      category: section.category,
+      status: section.status || (norm.items.length ? 'COMPLETE' : 'UNAVAILABLE'),
+      reason: section.reason || null,
+      tabPresent: section.tabPresent ?? true,
+      itemCount: norm.items.length,
+      downloadedCount: 0,
+      reusedCount: 0,
+      failedCount: 0,
+      mediaTypeFilterApplied: mediaTypes,
+      evidence: section.evidence || {},
+      items: norm.items,
+      reportedTotal: section.reportedTotal ?? null,
+      noGrowth: !!section.noGrowth,
+      hitLimit: !!section.hitLimit
+    });
   });
+}
+function legacyScanFromItems(opts) {
+  const category = opts.category || 'posts';
+  const norm = normalizeItems(opts.items || [], { category, mediaTypes: opts.mediaTypes || DEFAULT_MEDIA_TYPES });
+  return {
+    profile: opts.profile || null,
+    sections: [makeSectionRecord({
+      category,
+      status: 'COMPLETE',
+      reason: null,
+      tabPresent: true,
+      itemCount: norm.items.length,
+      mediaTypeFilterApplied: opts.mediaTypes || DEFAULT_MEDIA_TYPES,
+      evidence: { mode: 'synthetic-items' },
+      items: norm.items,
+      reportedTotal: opts.reportedTotal ?? null,
+      noGrowth: !!opts.noGrowth,
+      hitLimit: !!opts.hitLimit
+    })]
+  };
+}
+function finalGlobalOutcome(sections, failedCount) {
+  if (sections.some(section => section.status === 'ACTION_REQUIRED')) return { status: 'ACTION_REQUIRED', reason: 'one or more requested sections could not prove completeness' };
+  if (sections.every(section => section.status === 'COMPLETE') && failedCount === 0) return { status: 'COMPLETE', reason: 'all requested sections completed and downloads verified' };
+  return { status: 'PARTIAL', reason: 'one or more requested sections were partial, unavailable, unsupported, or blocked' };
 }
 function remainingTimeout(started, maxTimeMs) { return Math.max(1, maxTimeMs - (Date.now() - started)); }
 async function getRenderedCardState(page) {
   return page.locator('#post-container .post-card').evaluateAll(cards => ({
     count: cards.length,
-    ids: [...new Set(cards.map(card => card.querySelector('[data-id]')?.getAttribute('data-id')).filter(Boolean))]
+    ids: [...new Set(cards.map(card => card.querySelector('.likes-trigger[data-id], .comments-trigger[data-id], [data-id]')?.getAttribute('data-id')).filter(Boolean))]
   }));
 }
 async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000, settleMs = 1200, recenterEveryMs = 1000, maxRecenters = 3, targetUniqueCount = null } = {}) {
   const waitBudget = Math.max(1, Math.min(growthWaitMs, remainingTimeout(started, maxTimeMs)));
   const deadline = Date.now() + waitBudget;
-  const beforeIds = new Set(beforeState.ids || []);
   let bestState = beforeState;
   let bestCount = beforeState.count || 0;
   let bestIds = new Set(beforeState.ids || []);
@@ -461,55 +721,499 @@ async function cleanupScrapeBrowser(page, browser) {
   if (page) await page.close().catch(() => {});
   if (browser) await browser.close().catch(() => {});
 }
-async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp }) {
-  if (attachCdp) { const u = new URL(attachCdp); if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>'); }
-  const { chromium } = await require('playwright');
-  let browser, page, attached = false; const started = Date.now();
-  try {
-    if (attachCdp) { browser = await chromium.connectOverCDP(attachCdp, { timeout: remainingTimeout(started, maxTimeMs) }); attached = true; page = await browser.newPage(); }
-    else { browser = await chromium.launch({ headless: true, executablePath: browserExecutable, channel: browserChannel, timeout: remainingTimeout(started, maxTimeMs) }); page = await browser.newPage(); }
-    page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
-    await page.goto(PROVIDER_PHOTO_URL, { waitUntil: 'domcontentloaded', timeout: remainingTimeout(started, maxTimeMs) });
-    await page.fill('input#search-input', handle, { timeout: remainingTimeout(started, maxTimeMs) });
-    await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
-    await page.waitForSelector('#post-container .post-card', { timeout: remainingTimeout(started, maxTimeMs) });
-    const reportedTotal = await extractReportedTotalFromPage(page, remainingTimeout(started, maxTimeMs));
-    const seen = new Set(); let noGrowth = false, hitLimit = false;
-    for (let i = 0; i < maxPages; i++) {
-      page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
-      const beforeState = await getRenderedCardState(page);
-      beforeState.ids.forEach(id => seen.add(id));
-      if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
-      if (reportedTotal && seen.size >= reportedTotal) break;
-      if (beforeState.count === 0) break;
-      const afterState = await scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, targetUniqueCount: reportedTotal });
-      afterState.ids.forEach(id => seen.add(id));
-      if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
-      if (!afterState.grew) { noGrowth = true; break; }
-    }
-    return await extractItemsFromPage(page, reportedTotal, { noGrowth, hitLimit });
-  } finally { await cleanupScrapeBrowser(page, browser); }
+async function extractProfileFromPage(page, handle) {
+  const text = await page.locator('#profile-section').first().innerText({ timeout: 2000 }).catch(() => '');
+  const username = await page.locator('#profile-section .username-text').first().innerText({ timeout: 1000 }).catch(() => '').then(v => String(v || '').replace(/^@/, '').trim() || handle);
+  return { handle: username || handle, reportedPostCount: parseReportedTotal(text), rawProfileText: text ? redactSignedUrls(text) : null };
 }
 async function extractReportedTotalFromPage(page, timeoutMs = 2000) {
   const text = await page.locator('#profile-section, [id*=profile], [class*=profile]').first().innerText({ timeout: Math.max(1, timeoutMs) }).catch(() => '');
   return parseReportedTotal(text);
 }
-async function extractItemsFromPage(page, reportedTotal = null, flags = {}) {
+async function extractSectionError(page) {
+  const checks = [
+    ['#error-private', 'BLOCKED', 'provider reports private or blocked content'],
+    ['#error-not-found', 'BLOCKED', 'provider reports profile not found'],
+    ['#error-no-content', 'UNAVAILABLE', null]
+  ];
+  for (const [selector, status, defaultReason] of checks) {
+    const locator = page.locator(selector).first();
+    const visible = await locator.isVisible().catch(() => false);
+    if (!visible) continue;
+    const text = await locator.innerText().catch(() => '');
+    return { status, reason: text.trim() || defaultReason || selector };
+  }
+  return null;
+}
+async function switchToCategoryTab(page, category, timeoutMs) {
+  const upper = category.toUpperCase();
+  const tab = page.locator('#menu-wrapper .menu-item[data-id="' + upper + '"]').first();
+  if (await tab.count() === 0) return { tabPresent: false };
+  const active = await tab.evaluate(el => el.classList.contains('active')).catch(() => false);
+  if (!active) await tab.click({ timeout: timeoutMs });
+  await page.waitForTimeout(Math.min(250, Math.max(1, timeoutMs)));
+  return { tabPresent: true };
+}
+async function waitForSectionReady(page, category, started, maxTimeMs) {
+  const deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
+  while (Date.now() < deadline) {
+    const err = await extractSectionError(page);
+    if (err) return { kind: 'error', ...err };
+    if (category === 'highlights') {
+      const count = await page.locator('#highlights-container .highlight').count().catch(() => 0);
+      if (count > 0) return { kind: 'highlights' };
+    }
+    const cards = await page.locator('#post-container .post-card').count().catch(() => 0);
+    if (cards > 0) return { kind: 'cards' };
+    await page.waitForTimeout(Math.min(200, Math.max(1, remainingTimeout(started, maxTimeMs))));
+  }
+  return { kind: 'empty' };
+}
+async function extractItemsFromPage(page, maybeOptions = {}, maybeFlags = {}) {
+  let options = {};
+  if (typeof maybeOptions === 'number') options = { reportedTotal: maybeOptions, ...maybeFlags };
+  else options = maybeOptions || {};
   const raw = await page.locator('#post-container .post-card').evaluateAll(cards => cards.map(card => {
-    const shortcode = card.querySelector('[data-id]')?.getAttribute('data-id') || '';
-    const typed = card.querySelector('[data-type]') || card.closest('[data-type]');
-    const link = card.querySelector('.content-download-btn[href]');
-    const footer = card.querySelector('.post-footer')?.innerText || '';
-    return { shortcode, type: typed?.getAttribute('data-type') || 'unknown', href: link?.href || '', dateText: footer };
+    const media = card.querySelector('.post-image, .story-image');
+    const download = card.querySelector('.content-download-btn[href]');
+    const caption = card.querySelector('.post-content p')?.textContent?.trim() || null;
+    const likesEl = card.querySelector('.likes-trigger');
+    const commentsEl = card.querySelector('.comments-trigger');
+    const dateGroup = [...card.querySelectorAll('.post-footer .icon-group')].at(-1);
+    const dateText = dateGroup?.querySelector('span')?.textContent?.trim() || dateGroup?.textContent?.trim() || null;
+    const shortcode = likesEl?.getAttribute('data-id') || commentsEl?.getAttribute('data-id') || card.querySelector('[data-id]')?.getAttribute('data-id') || '';
+    return {
+      shortcode,
+      mediaType: media?.getAttribute('data-type') || 'unknown',
+      href: download?.href || '',
+      captionTruncated: caption,
+      dateRaw: dateText,
+      likes: likesEl?.querySelector('span')?.textContent?.trim() || null,
+      comments: commentsEl?.querySelector('span')?.textContent?.trim() || null,
+      permalink: null
+    };
   }));
-  const norm = normalizeItems(raw);
-  return { items: norm.items, reportedTotal, uniquePostCount: norm.uniquePostCount, noGrowth: !!flags.noGrowth, hitLimit: !!flags.hitLimit };
+  const norm = normalizeItems(raw, { category: options.category || 'posts', mediaTypes: options.mediaTypes || DEFAULT_MEDIA_TYPES, highlightGroup: options.highlightGroup || null });
+  return { items: norm.items, reportedTotal: options.reportedTotal ?? null, uniquePostCount: norm.uniquePostCount, noGrowth: !!options.noGrowth, hitLimit: !!options.hitLimit };
 }
-async function statusProfile({ handle, output }) { validateHandle(handle); const root = await safeOutputRoot(output); const paths = profilePaths(root, handle); await ensureSafeDir(paths.stateDir, paths.root); return await readJson(paths.status, { status: 'ACTION_REQUIRED', reason: 'no status exists yet', handle }); }
+async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, started, maxTimeMs, maxPages }) {
+  let noGrowth = false;
+  let hitLimit = false;
+  let exhaustedPageBudget = maxPages <= 0;
+  for (let i = 0; i < maxPages; i++) {
+    const before = await getRenderedCardState(page);
+    if (before.count === 0) { exhaustedPageBudget = false; break; }
+    if (reportedTotal && before.ids.length >= reportedTotal) { exhaustedPageBudget = false; break; }
+    if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
+    const after = await scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs, targetUniqueCount: reportedTotal });
+    if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
+    if (!after.grew) { noGrowth = true; break; }
+    exhaustedPageBudget = i === maxPages - 1;
+  }
+  if (exhaustedPageBudget && !noGrowth) hitLimit = true;
+  const extracted = await extractItemsFromPage(page, { category, mediaTypes, reportedTotal, noGrowth, hitLimit });
+  const itemCount = extracted.items.length;
+  let status = itemCount ? 'COMPLETE' : 'UNAVAILABLE';
+  let reason = itemCount ? 'visible section extracted' : 'no visible cards in section';
+  if (category === 'posts' && reportedTotal == null) {
+    status = 'ACTION_REQUIRED';
+    reason = 'reported total could not be parsed';
+  } else if (hitLimit) {
+    status = 'PARTIAL';
+    reason = 'bounded limit reached before section settled';
+  } else if (!itemCount && noGrowth) {
+    status = 'UNAVAILABLE';
+    reason = 'provider showed no cards for the selected section';
+  }
+  return makeSectionRecord({ category, status, reason, tabPresent: true, itemCount, mediaTypeFilterApplied: mediaTypes, evidence: { source: '#post-container .post-card' }, items: extracted.items, reportedTotal, noGrowth, hitLimit, uniquePostCount: extracted.uniquePostCount ?? null });
+}
+async function scrapeHighlightsSection(page, { mediaTypes, started, maxTimeMs }) {
+  const tiles = page.locator('#highlights-container .highlight');
+  const count = await tiles.count().catch(() => 0);
+  if (!count) return makeSectionRecord({ category: 'highlights', status: 'UNAVAILABLE', reason: 'provider exposed no highlight groups', tabPresent: true, itemCount: 0, mediaTypeFilterApplied: mediaTypes, evidence: { source: '#highlights-container .highlight' }, items: [] });
+  const allItems = [];
+  for (let i = 0; i < count; i++) {
+    const title = await tiles.nth(i).locator('span').first().innerText().catch(() => '') || 'highlight-' + (i + 1);
+    await tiles.nth(i).click({ timeout: remainingTimeout(started, maxTimeMs) });
+    const ready = await waitForSectionReady(page, 'stories', started, maxTimeMs);
+    if (ready.kind === 'error') continue;
+    const extracted = await extractItemsFromPage(page, { category: 'highlights', mediaTypes, highlightGroup: title });
+    allItems.push(...extracted.items);
+  }
+  return makeSectionRecord({ category: 'highlights', status: allItems.length ? 'COMPLETE' : 'UNAVAILABLE', reason: allItems.length ? 'highlight groups extracted from visible UI' : 'highlight groups had no visible stories', tabPresent: true, itemCount: allItems.length, mediaTypeFilterApplied: mediaTypes, evidence: { source: '#highlights-container .highlight + #post-container .post-card' }, items: allItems });
+}
+async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp, categories = DEFAULT_CATEGORIES, mediaTypes = DEFAULT_MEDIA_TYPES }) {
+  if (attachCdp) {
+    const u = new URL(attachCdp);
+    if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>');
+  }
+  const { chromium } = await require('playwright');
+  let browser, page;
+  const started = Date.now();
+  try {
+    if (attachCdp) { browser = await chromium.connectOverCDP(attachCdp, { timeout: remainingTimeout(started, maxTimeMs) }); page = await browser.newPage(); }
+    else { browser = await chromium.launch({ headless: true, executablePath: browserExecutable, channel: browserChannel, timeout: remainingTimeout(started, maxTimeMs) }); page = await browser.newPage(); }
+    page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
+    await page.goto(PROVIDER_PHOTO_URL, { waitUntil: 'domcontentloaded', timeout: remainingTimeout(started, maxTimeMs) });
+    await page.fill('input#search-input', handle, { timeout: remainingTimeout(started, maxTimeMs) });
+    await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
+    await page.waitForTimeout(Math.min(500, remainingTimeout(started, maxTimeMs)));
+    const profile = await extractProfileFromPage(page, handle);
+    const sections = [];
+    for (const category of categories) {
+      const tab = await switchToCategoryTab(page, category, remainingTimeout(started, maxTimeMs));
+      if (!tab.tabPresent) {
+        sections.push(makeSectionRecord({ category, status: 'UNAVAILABLE', reason: 'provider did not expose a ' + category + ' tab', tabPresent: false, itemCount: 0, mediaTypeFilterApplied: mediaTypes, evidence: { selector: '#menu-wrapper .menu-item[data-id="' + category.toUpperCase() + '"]' }, items: [] }));
+        continue;
+      }
+      const ready = await waitForSectionReady(page, category, started, maxTimeMs);
+      if (ready.kind === 'error') {
+        sections.push(makeSectionRecord({ category, status: ready.status, reason: ready.reason, tabPresent: true, itemCount: 0, mediaTypeFilterApplied: mediaTypes, evidence: { source: 'provider error state' }, items: [] }));
+        continue;
+      }
+      if (ready.kind === 'empty') {
+        sections.push(makeSectionRecord({ category, status: 'UNAVAILABLE', reason: 'provider exposed no visible content for selected tab', tabPresent: true, itemCount: 0, mediaTypeFilterApplied: mediaTypes, evidence: { source: 'empty visible UI' }, items: [] }));
+        continue;
+      }
+      if (category === 'highlights') sections.push(await scrapeHighlightsSection(page, { mediaTypes, started, maxTimeMs }));
+      else sections.push(await scrapeCardSection(page, { category, mediaTypes, reportedTotal: category === 'posts' ? profile.reportedPostCount : null, started, maxTimeMs, maxPages }));
+    }
+    return { profile, sections };
+  } finally {
+    await cleanupScrapeBrowser(page, browser);
+  }
+}
+async function archiveProfile(opts = {}) {
+  const handle = validateHandle(opts.handle);
+  const mode = opts.mode || 'full';
+  if (!['full', 'sync'].includes(mode)) throw new ArchiveError('BAD_MODE', 'mode must be full or sync');
+  const categories = parseCategories(opts.categories);
+  const mediaTypes = parseMediaTypes(opts.mediaTypes);
+  const root = await safeOutputRoot(opts.output);
+  const paths = profilePaths(root, handle);
+  const runId = Date.now() + '-' + crypto.randomUUID();
+  const started = Date.now();
+  const maxTimeMs = opts.maxTimeMs || DEFAULT_MAX_TIME_MS;
+  await ensureSafeDir(paths.stateDir, paths.root);
+  await ensureSafeDir(paths.mediaDir, paths.root);
+  await ensureSafeDir(paths.receiptDir, paths.root);
+  return withLock(paths, runId, async () => {
+    const prior = await readJson(paths.manifest, { version: 2, handle, completed: {}, failed: {}, runs: [], sections: [], requestedCategories: DEFAULT_CATEGORIES, mediaTypes: DEFAULT_MEDIA_TYPES });
+    await writeStatus(paths, { status: 'RUNNING', reason: 'scan started', runId, handle, mode, requestedCategories: categories, mediaTypes, startedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length });
+    let scan;
+    try {
+      if (opts.sections) scan = { profile: opts.profile || null, sections: normalizeProvidedSections(opts.sections, mediaTypes) };
+      else if (opts.items) scan = legacyScanFromItems({ ...opts, category: categories[0] || 'posts', mediaTypes });
+      else scan = await scrapeWithPlaywright({ handle, maxPages: opts.maxPages || 12, maxTimeMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp, categories, mediaTypes });
+    } catch (err) {
+      const status = { status: err instanceof DeferredError ? 'DEFERRED' : 'ACTION_REQUIRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, requestedCategories: categories, mediaTypes, updatedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length };
+      await writeStatus(paths, status);
+      throw err;
+    }
+    const completed = { ...(prior.completed || {}) };
+    const failed = {};
+    const freshKeys = new Set();
+    const finalSections = [];
+    let downloaded = 0;
+    let reused = 0;
+    let failedCount = 0;
+    for (const sectionInput of scan.sections) {
+      const section = makeSectionRecord({ ...sectionInput, mediaTypeFilterApplied: mediaTypes });
+      if (!['COMPLETE', 'PARTIAL'].includes(section.status) && (!section.items || !section.items.length)) {
+        finalSections.push(section);
+        continue;
+      }
+      section.downloadedCount = 0;
+      section.reusedCount = 0;
+      section.failedCount = 0;
+      const items = section.items || [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const failureKey = item.stableId || fallbackFailureKey(item, i);
+        freshKeys.add(failureKey);
+        if (Date.now() - started > maxTimeMs) {
+          section.failedCount++;
+          failedCount++;
+          failed[failureKey] = sanitizeFailedItem(item, 'time budget reached', i);
+          continue;
+        }
+        if (item.stableId && completed[item.stableId] && await verifyReceipt(paths, completed[item.stableId])) {
+          reused++;
+          section.reusedCount++;
+          delete failed[failureKey];
+          delete failed[item.stableId];
+          continue;
+        }
+        if (!item.href) {
+          section.failedCount++;
+          failedCount++;
+          failed[failureKey] = sanitizeFailedItem(item, 'missing media href', i);
+          continue;
+        }
+        try {
+          const result = await downloadOne(item, paths, { fetchImpl: opts.fetchImpl, maxBytes: opts.maxBytes || DEFAULT_MAX_BYTES, runId, remainingMs: Math.max(1, maxTimeMs - (Date.now() - started)), dnsLookup: opts.dnsLookup, timeoutMs: Math.min(opts.networkTimeoutMs || DEFAULT_NETWORK_TIMEOUT_MS, Math.max(1, maxTimeMs - (Date.now() - started))), completedMap: completed, handle });
+          completed[result.receipt.stableId] = result.receipt;
+          delete failed[failureKey];
+          delete failed[result.receipt.stableId];
+          if (result.fetchedButReused) { reused++; section.reusedCount++; }
+          else { downloaded++; section.downloadedCount++; }
+          if ((opts.delayMs ?? DEFAULT_DELAY_MS) && Math.max(0, maxTimeMs - (Date.now() - started)) > 0) await delay(Math.min(opts.delayMs ?? DEFAULT_DELAY_MS, 5000, Math.max(1, maxTimeMs - (Date.now() - started))));
+        } catch (err) {
+          if (err instanceof DeferredError) {
+            for (const [sid, oldFail] of Object.entries(prior.failed || {})) if (!freshKeys.has(sid) && !failed[sid]) failed[sid] = sanitizeFailedItem(oldFail, 'pending fresh scan retry');
+            const manifest = { version: 2, handle, updatedAt: new Date().toISOString(), requestedCategories: categories, mediaTypes, profile: publicProfile(scan.profile), sections: finalSections.map(statusSectionRecord), completed, failed, runs: [...(prior.runs || []), { runId, mode, status: 'DEFERRED', completedCount: Object.keys(completed).length, failedCount }] };
+            await atomicWriteJson(paths.manifest, manifest);
+            await writeStatus(paths, { status: 'DEFERRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, requestedCategories: categories, mediaTypes, sections: finalSections.map(statusSectionRecord), downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, updatedAt: new Date().toISOString() });
+            throw err;
+          }
+          section.failedCount++;
+          failedCount++;
+          failed[failureKey] = sanitizeFailedItem(item, err.message, i);
+        }
+      }
+      const settled = sectionOutcomeForCompleted(section, Object.values(completed), { mode });
+      section.status = settled.status;
+      section.reason = settled.reason;
+      if (settled.uniquePostCount != null) section.uniquePostCount = settled.uniquePostCount;
+      finalSections.push(section);
+    }
+    for (const [sid, oldFail] of Object.entries(prior.failed || {})) if (!freshKeys.has(sid) && !failed[sid]) failed[sid] = sanitizeFailedItem(oldFail, 'pending fresh scan retry');
+    const global = finalGlobalOutcome(finalSections, failedCount);
+    const postSection = finalSections.find(section => section.category === 'posts');
+    const uniquePostCount = new Set(Object.values(completed).filter(receipt => receiptCategory(receipt) === 'posts' && receiptShortcode(receipt)).map(receipt => receiptShortcode(receipt))).size;
+    const manifest = {
+      version: 2,
+      handle,
+      updatedAt: new Date().toISOString(),
+      requestedCategories: categories,
+      mediaTypes,
+      profile: publicProfile(scan.profile),
+      sections: finalSections.map(statusSectionRecord),
+      completed,
+      failed,
+      runs: [...(prior.runs || []), { runId, mode, status: global.status, completedCount: Object.keys(completed).length, failedCount, downloadedCount: downloaded, reusedCount: reused }]
+    };
+    await atomicWriteJson(paths.manifest, manifest);
+    return writeStatus(paths, {
+      status: global.status,
+      reason: global.reason,
+      runId,
+      handle,
+      mode,
+      requestedCategories: categories,
+      mediaTypes,
+      sections: finalSections.map(statusSectionRecord),
+      uniquePostCount,
+      reportedTotal: postSection?.reportedTotal ?? null,
+      completedCount: Object.keys(completed).length,
+      failedCount,
+      downloadedCount: downloaded,
+      reusedCount: reused,
+      updatedAt: new Date().toISOString()
+    });
+  });
+}
+function zipReadmeText(handle, status) {
+  return [
+    'FrameFerry portable export for @' + handle,
+    '',
+    "This is a ZIP of public content exposed through InstaCognito's public UI.",
+    'It is not an Instagram account export and cannot recover deleted, expired, or private stories.',
+    "Code is MIT-licensed; downloaded media remains subject to its owners' rights.",
+    'Packaging success is separate from archive completeness. See manifest.json and sections.json.',
+    'Stories/highlights without stable provider shortcodes are re-fetched on future syncs and deduped after hashing.',
+    'ZIP support is bounded to ZIP32-safe archives: max 2 GiB output and 5000 entries in this release.',
+    '',
+    'Archive status: ' + (status?.status || 'UNKNOWN'),
+    'Archive reason: ' + (status?.reason || 'unknown')
+  ].join('\n') + '\n';
+}
+async function prepareZipDestination(zipPath, root, overwrite) {
+  if (!zipPath) throw new ArchiveError('BAD_ARGS', '--zip is required');
+  const dest = path.resolve(zipPath);
+  if (dest === root || dest.startsWith(root + path.sep)) throw new ArchiveError('BAD_OUTPUT', 'zip destination must be outside the archive root');
+  await ensureNoSymlinkAncestors(dest, { allowMissingLeaf: true });
+  const existing = await fsp.lstat(dest).catch(() => null);
+  if (existing) {
+    if (!overwrite) throw new ArchiveError('BAD_OUTPUT', 'zip destination already exists');
+    if (!existing.isFile()) throw new ArchiveError('BAD_OUTPUT', 'zip destination must be a file path');
+  }
+  return dest;
+}
+async function exportProfile(opts = {}) {
+  const handle = validateHandle(opts.handle);
+  const root = await safeOutputRoot(opts.output);
+  const dest = await prepareZipDestination(opts.zip, root, !!opts.overwriteZip);
+  const part = dest + '.part';
+  if (dest === part) throw new ArchiveError('BAD_OUTPUT', 'zip destination is invalid');
+  const paths = profilePaths(root, handle);
+  const manifest = await readJson(paths.manifest);
+  const status = await readJson(paths.status, { status: 'ACTION_REQUIRED', reason: 'no status exists yet', handle });
+  if (!manifest) throw new ArchiveError('BAD_OUTPUT', 'no manifest exists for this handle');
+  const receipts = Object.values(manifest.completed || {}).sort((a, b) => String(receiptStableId(a)).localeCompare(String(receiptStableId(b))));
+  const maxBytes = asPositiveIntOrDefault(opts.maxZipBytes, ZIP32_HARD_MAX_BYTES, '--max-zip-bytes');
+  const maxEntries = asPositiveIntOrDefault(opts.maxZipEntries, ZIP32_HARD_MAX_ENTRIES, '--max-zip-entries');
+  const maxFiles = asPositiveIntOrDefault(opts.maxZipFiles, ZIP32_HARD_MAX_FILES, '--max-zip-files');
+  if (receipts.length > maxFiles) throw new ArchiveError('BAD_OUTPUT', 'zip source file count exceeds configured limit');
+  const sourceFiles = [];
+  let sourceBytes = 0;
+  for (const receipt of receipts) {
+    if (!await verifyReceipt(paths, receipt)) throw new ArchiveError('BAD_OUTPUT', 'zip source receipt verification failed for ' + (receiptStableId(receipt) || 'unknown')); 
+    const sourcePath = await ensureSafeFileInsideRoot(root, receipt.path);
+    const st = await fsp.stat(sourcePath);
+    sourceBytes += st.size;
+    if (sourceBytes > maxBytes) throw new ArchiveError('BAD_OUTPUT', 'zip source bytes exceed configured ZIP32-safe limit');
+    sourceFiles.push({ receipt, sourcePath, size: st.size });
+  }
+  const timestamp = new Date().toISOString().replace(/[:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const rootEntry = 'frameferry-' + handle + '-' + timestamp;
+  const sections = (status.sections || manifest.sections || []).map(statusSectionRecord);
+  const index = receipts.map(receipt => ({
+    id: receiptStableId(receipt),
+    category: receiptCategory(receipt),
+    mediaType: receipt.mediaType || 'unknown',
+    shortcode: receipt.shortcode ?? null,
+    carouselIndex: receipt.carouselIndex ?? 0,
+    captionTruncated: receipt.captionTruncated ?? null,
+    permalink: receipt.permalink ?? null,
+    dateRaw: receipt.dateRaw ?? null,
+    dateParsed: receipt.dateParsed ?? null,
+    highlightGroup: receipt.highlightGroup ?? null,
+    bytes: receipt.bytes,
+    sha256: receipt.sha256,
+    path: 'media/' + path.basename(receipt.path),
+    identityBasis: receiptIdentityBasis(receipt)
+  }));
+  const zipManifest = {
+    version: 1,
+    toolVersion: VERSION,
+    handle,
+    generatedAt: new Date().toISOString(),
+    provider: { origin: PROVIDER_ORIGIN, photoUrl: PROVIDER_PHOTO_URL, source: 'instacognito-public-ui' },
+    requestedCategories: status.requestedCategories || manifest.requestedCategories || DEFAULT_CATEGORIES,
+    mediaTypes: status.mediaTypes || manifest.mediaTypes || DEFAULT_MEDIA_TYPES,
+    completeness: {
+      packagingStatus: 'COMPLETE',
+      archiveStatus: status.status || 'UNKNOWN',
+      archiveReason: status.reason || null,
+      requestedSectionCount: sections.length,
+      completedSectionCount: sections.filter(section => section.status === 'COMPLETE').length
+    }
+  };
+  const generated = new Map();
+  generated.set(rootEntry + '/manifest.json', Buffer.from(jsonText(zipManifest)));
+  generated.set(rootEntry + '/index.json', Buffer.from(jsonText(index)));
+  generated.set(rootEntry + '/sections.json', Buffer.from(jsonText(sections)));
+  generated.set(rootEntry + '/README.txt', Buffer.from(zipReadmeText(handle, status)));
+  for (const receipt of receipts) {
+    const publicReceipt = { ...receipt, category: receiptCategory(receipt), identityBasis: receiptIdentityBasis(receipt) };
+    delete publicReceipt.href;
+    generated.set(rootEntry + '/receipts/' + receiptStableId(receipt) + '.json', Buffer.from(jsonText(publicReceipt)));
+  }
+  const checksumLines = [];
+  for (const [entryName, buf] of generated.entries()) checksumLines.push(sha256(buf) + '  ' + entryName.slice(rootEntry.length + 1));
+  for (const file of sourceFiles) checksumLines.push(file.receipt.sha256 + '  media/' + path.basename(file.receipt.path));
+  generated.set(rootEntry + '/checksums.txt', Buffer.from(checksumLines.join('\n') + '\n'));
+  if (generated.size + sourceFiles.length > maxEntries) throw new ArchiveError('BAD_OUTPUT', 'zip entry count exceeds configured limit');
+  const stalePart = await fsp.lstat(part).catch(() => null);
+  if (stalePart) {
+    if (!stalePart.isFile()) throw new ArchiveError('BAD_OUTPUT', 'zip temporary .part path already exists and is not a file');
+    if (!opts.overwriteZip) throw new ArchiveError('BAD_OUTPUT', 'zip temporary .part already exists; rerun with --overwrite-zip after inspection');
+    await fsp.rm(part, { force: true });
+  }
+  let writer;
+  let interrupted;
+  const onSignal = async (signal) => {
+    interrupted = new ArchiveError('INTERRUPTED', 'zip export interrupted by ' + signal);
+    await writer?.abort().catch(() => {});
+    await fsp.rm(part, { force: true }).catch(() => {});
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+  try {
+    writer = await ZipWriter.create(part, { maxEntries, maxBytes });
+    for (const [entryName, buf] of generated.entries()) await writer.addBuffer(entryName, buf);
+    for (const file of sourceFiles) await writer.addFile(rootEntry + '/media/' + path.basename(file.receipt.path), file.sourcePath);
+    if (interrupted) throw interrupted;
+    await writer.close();
+    await fsp.rename(part, dest);
+  } catch (err) {
+    await writer?.abort().catch(() => {});
+    await fsp.rm(part, { force: true }).catch(() => {});
+    throw err;
+  } finally {
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+  }
+  return {
+    zipPath: dest,
+    sourceFileCount: sourceFiles.length,
+    generatedEntryCount: generated.size,
+    totalEntryCount: sourceFiles.length + generated.size,
+    maxBytes,
+    archiveStatus: status.status || 'UNKNOWN',
+    archiveReason: status.reason || null
+  };
+}
+async function statusProfile({ handle, output }) {
+  validateHandle(handle);
+  const root = await safeOutputRoot(output);
+  const paths = profilePaths(root, handle);
+  await ensureSafeDir(paths.stateDir, paths.root);
+  return await readJson(paths.status, { status: 'ACTION_REQUIRED', reason: 'no status exists yet', handle });
+}
 async function doctor({ attachCdp } = {}) {
-  const checks = { node: process.versions.node, nodeOk: Number(process.versions.node.split('.')[0]) >= 20, playwright: false, cdpOk: true };
+  const checks = { node: process.versions.node, nodeOk: Number(process.versions.node.split('.')[0]) >= 20, playwright: false, cdpOk: true, zip32ExportLimitBytes: ZIP32_HARD_MAX_BYTES };
   try { require('playwright'); checks.playwright = true; } catch (err) { checks.playwrightError = err.message; }
-  if (attachCdp) { try { const u = new URL(attachCdp); checks.cdpOk = u.protocol === 'http:' && ['127.0.0.1','localhost','::1','[::1]'].includes(u.hostname); } catch { checks.cdpOk = false; } }
-  checks.ok = checks.nodeOk && checks.playwright && checks.cdpOk; return checks;
+  if (attachCdp) {
+    try { const u = new URL(attachCdp); checks.cdpOk = u.protocol === 'http:' && ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname); }
+    catch { checks.cdpOk = false; }
+  }
+  checks.ok = checks.nodeOk && checks.playwright && checks.cdpOk;
+  return checks;
 }
-module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, getRenderedCardState, scrollLastCardCenterAndWaitForGrowth, scrapeWithPlaywright, extractReportedTotalFromPage, extractItemsFromPage, cleanupScrapeBrowser, statusProfile, doctor };
+
+module.exports = {
+  VERSION,
+  PROVIDER_ORIGIN,
+  PROVIDER_PHOTO_URL,
+  VALID_CATEGORIES,
+  VALID_MEDIA_TYPES,
+  ArchiveError,
+  DeferredError,
+  validateHandle,
+  redactSignedUrls,
+  safeOutputRoot,
+  ensureSafeDir,
+  profilePaths,
+  atomicWriteJson,
+  readJson,
+  withLock,
+  parseRetryAfter,
+  legacyStableMediaId,
+  stableMediaId,
+  parseDateText,
+  normalizeItems,
+  parseReportedTotal,
+  validateProviderMediaUrl,
+  validateRedirectTarget,
+  isPrivateIp,
+  isPrivateHostLiteral,
+  fetchWithValidatedRedirects,
+  streamResponseToPart,
+  verifyReceipt,
+  downloadOne,
+  decideOutcome,
+  archiveProfile,
+  exportProfile,
+  getRenderedCardState,
+  scrollLastCardCenterAndWaitForGrowth,
+  scrapeWithPlaywright,
+  extractReportedTotalFromPage,
+  extractItemsFromPage,
+  cleanupScrapeBrowser,
+  statusProfile,
+  doctor,
+  parseCategories,
+  parseMediaTypes
+};
