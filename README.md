@@ -1,4 +1,4 @@
-# InstaScrap
+# FrameFerry
 
 A small public OpenClaw skill plus Node CLI for archiving public Instagram media through https://instacognito.com/en/photo with bounded scans, durable receipts, and honest status reporting.
 
@@ -7,8 +7,8 @@ This is conservative: no login, cookies, paid APIs, reverse-engineered signature
 ## Install from GitHub
 
 ```bash
-git clone https://github.com/saju01/instascrap.git
-cd instascrap
+git clone https://github.com/saju01/frameferry.git
+cd frameferry
 npm ci
 # Browser setup is explicit; this package does not auto-install a service or schedule.
 npx playwright install chromium
@@ -20,10 +20,10 @@ Node >=20 is needed. Playwright is locked to 1.63.0.
 ## CLI
 
 ```bash
-instascrap doctor
-instascrap archive <handle> --mode full --output <path>
-instascrap archive <handle> --mode sync --output <path> --max-pages 6
-instascrap status <handle> --output <path>
+frameferry doctor
+frameferry archive <handle> --mode full --output <path>
+frameferry archive <handle> --mode sync --output <path> --max-pages 6
+frameferry status <handle> --output <path>
 ```
 
 Options: `--max-pages`, `--max-time-ms`, `--max-bytes`, `--delay-ms`, `--browser-executable`, `--browser-channel`, `--attach-cdp http://127.0.0.1:<port>`, `--json`. CDP attach is loopback only; attached browsers are not closed wholesale.
@@ -33,9 +33,9 @@ Options: `--max-pages`, `--max-time-ms`, `--max-bytes`, `--delay-ms`, `--browser
 ```text
 <output>/media/<handle>/<stable-id>.<ext>
 <output>/receipts/<handle>/<stable-id>.json
-<output>/.instascrap/<handle>/manifest.json
-<output>/.instascrap/<handle>/status.json
-<output>/.instascrap/<handle>/lock.json
+<output>/.frameferry/<handle>/manifest.json
+<output>/.frameferry/<handle>/status.json
+<output>/.frameferry/<handle>/lock.json
 ```
 
 Manifest and status are mode 600. Receipts include stable IDs, bytes, SHA-256, content type, source host, run ID, and timestamps. They do not include ephemeral signed media URLs. Stable media IDs are `post-shortcode + carousel-index`, so URL rotation does not create duplicates.
@@ -53,7 +53,7 @@ The scraper expects `input#search-input`, `button#download-btn`, `#post-containe
 No schedules are installed. If you want daily sync, add your own scheduler with an exact fixed-path command, for example:
 
 ```bash
-instascrap archive example_handle --mode sync --output /archives/instagram/example_handle --max-pages 6 --max-time-ms 600000
+frameferry archive example_handle --mode sync --output /archives/instagram/example_handle --max-pages 6 --max-time-ms 600000
 ```
 
 No secrets are needed; do not put secrets on command lines.

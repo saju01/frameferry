@@ -11,8 +11,8 @@ const png = Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,1,2,3]);
 const publicDns = async () => [{ address: '93.184.216.34', family: 4 }];
 function streamOf(buf, chunk=3) { let off=0; return new ReadableStream({ pull(controller){ if(off>=buf.length){controller.close(); return;} controller.enqueue(buf.subarray(off, off+chunk)); off+=chunk; } }); }
 function res({status=200,url='https://instacognito.com/media?id=rotated',body=jpg,headers={'content-type':'image/jpeg'}}={}){ const lower=Object.fromEntries(Object.entries(headers).map(([k,v])=>[k.toLowerCase(),String(v)])); if(!lower['content-length']) lower['content-length']=String(body.length); return {status,ok:status>=200&&status<300,url,headers:{get:k=>lower[String(k).toLowerCase()]||null},body:streamOf(body)}; }
-async function tmp(){ return await fsp.mkdtemp(path.join(os.tmpdir(),'instascrap-test-')); }
-async function readManifest(out){ return JSON.parse(await fsp.readFile(path.join(out,'.instascrap','example','manifest.json'),'utf8')); }
+async function tmp(){ return await fsp.mkdtemp(path.join(os.tmpdir(),'frameferry-test-')); }
+async function readManifest(out){ return JSON.parse(await fsp.readFile(path.join(out,'.frameferry','example','manifest.json'),'utf8')); }
 
 test('normalizes real provider carousel: one card per slide with same shortcode becomes multiple media', () => {
   const raw=[
@@ -94,7 +94,7 @@ test('429 Retry-After beyond budget persists DEFERRED and preserves prior comple
   await lib.archiveProfile({handle:'example',output:out,reportedTotal:1,items:[okItem],dnsLookup:publicDns,fetchImpl:async()=>res(),delayMs:0});
   const deferItem={shortcode:'B',href:'https://instacognito.com/media?id=b'};
   await assert.rejects(()=>lib.archiveProfile({handle:'example',output:out,reportedTotal:2,items:[okItem,deferItem],dnsLookup:publicDns,fetchImpl:async url=> url.includes('b') ? res({status:429,headers:{'retry-after':'120','content-type':'image/jpeg'}}) : res(),remainingMs:1000,maxTimeMs:1000,delayMs:0}), err => err.code==='DEFERRED');
-  const status=JSON.parse(await fsp.readFile(path.join(out,'.instascrap','example','status.json'),'utf8'));
+  const status=JSON.parse(await fsp.readFile(path.join(out,'.frameferry','example','status.json'),'utf8'));
   const manifest=await readManifest(out);
   assert.equal(status.status,'DEFERRED'); assert.ok(status.retryAt); assert.equal(Object.keys(manifest.completed).length,1);
 });
@@ -165,7 +165,7 @@ test('profile extraction accepts a caller supplied timeout', async () => {
 });
 
 test('CLI doctor parses --attach-cdp without swallowing it as handle, and bad flags fail', () => {
-  const bin=path.join(__dirname,'..','bin','instascrap.js');
+  const bin=path.join(__dirname,'..','bin','frameferry.js');
   const bad=spawnSync(process.execPath,[bin,'doctor','--attach-cdp','http://192.168.1.2:9222'],{encoding:'utf8'});
   assert.equal(bad.status,1); assert.match(bad.stdout, /"cdpOk": false/);
   const miss=spawnSync(process.execPath,[bin,'archive','example','--max-pages'],{encoding:'utf8'});

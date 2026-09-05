@@ -3,7 +3,7 @@ npm-debug.log*
 .DS_Store
 coverage/
 *.tgz
-.instascrap/
+.frameferry/
 *.part
 reports/
 .env

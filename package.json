@@ -1,9 +1,9 @@
 {
-  "name": "instascrap",
+  "name": "frameferry",
   "version": "0.1.0",
-  "description": "OpenClaw skill and CLI for bounded, verifiable InstaScrap archives using the InstaCognito public provider.",
+  "description": "OpenClaw skill and CLI for bounded, verifiable FrameFerry archives using the InstaCognito public provider.",
   "bin": {
-    "instascrap": "./bin/instascrap.js"
+    "frameferry": "./bin/frameferry.js"
   },
   "scripts": {
     "test": "node --test",

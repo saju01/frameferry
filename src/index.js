@@ -80,12 +80,12 @@ function profilePaths(root, handle) {
   validateHandle(handle);
   return {
     root,
-    stateDir: path.join(root, '.instascrap', handle),
+    stateDir: path.join(root, '.frameferry', handle),
     mediaDir: path.join(root, 'media', handle),
     receiptDir: path.join(root, 'receipts', handle),
-    lock: path.join(root, '.instascrap', handle, 'lock.json'),
-    manifest: path.join(root, '.instascrap', handle, 'manifest.json'),
-    status: path.join(root, '.instascrap', handle, 'status.json')
+    lock: path.join(root, '.frameferry', handle, 'lock.json'),
+    manifest: path.join(root, '.frameferry', handle, 'manifest.json'),
+    status: path.join(root, '.frameferry', handle, 'status.json')
   };
 }
 async function atomicWriteJson(file, data, mode = 0o600) {
