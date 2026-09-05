@@ -270,3 +270,26 @@ test('pagination waits for partial batch to settle and recenters current last ca
     assert.equal(calls[0].opts.block, 'center');
   } finally { await browser.close(); }
 });
+
+
+test('pagination snapshot merge preserves cards evicted from final DOM', async (t) => {
+  let chromium; try { chromium=require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless:true, executablePath: exe });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<div id="post-container"><article class="post-card"><span data-id="P1"></span><span data-type="photo"></span><a class="content-download-btn" href="https://instacognito.com/media?id=one">d</a></article><article class="post-card"><span data-id="P2"></span><span data-type="photo"></span><a class="content-download-btn" href="https://instacognito.com/media?id=two">d</a></article></div><script>Element.prototype.scrollIntoView=function(){ if(!window.started){ window.started=1; setTimeout(()=>{ const c=document.querySelector('#post-container'); c.innerHTML='<article class="post-card"><span data-id="P3"></span><span data-type="photo"></span><a class="content-download-btn" href="https://instacognito.com/media?id=three">d</a></article><article class="post-card"><span data-id="P4"></span><span data-type="photo"></span><a class="content-download-btn" href="https://instacognito.com/media?id=four">d</a></article>'; }, 500); } };</script>`);
+    const snapshots = [];
+    const before = await lib.getRenderedCardState(page);
+    snapshots.push(await lib.extractRawItemsFromPage(page));
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started: Date.now(), maxTimeMs: 5000, growthWaitMs: 3000, settleMs: 500 });
+    snapshots.push(after.rawItems || await lib.extractRawItemsFromPage(page));
+    snapshots.push(await lib.extractRawItemsFromPage(page));
+    const merged = lib.mergeRawItemSnapshots(snapshots);
+    assert.deepEqual(merged.items.map(i => i.shortcode), ['P1','P2','P3','P4']);
+    assert.equal(merged.uniquePostCount, 4);
+    const finalOnly = await lib.extractItemsFromPage(page, 4);
+    assert.deepEqual(finalOnly.items.map(i => i.shortcode), ['P3','P4']);
+  } finally { await browser.close(); }
+});

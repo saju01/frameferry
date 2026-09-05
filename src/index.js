@@ -400,6 +400,18 @@ async function archiveProfile(opts = {}) {
   });
 }
 function remainingTimeout(started, maxTimeMs) { return Math.max(1, maxTimeMs - (Date.now() - started)); }
+async function extractRawItemsFromPage(page) {
+  return page.locator('#post-container .post-card').evaluateAll(cards => cards.map(card => {
+    const shortcode = card.querySelector('[data-id]')?.getAttribute('data-id') || '';
+    const typed = card.querySelector('[data-type]') || card.closest('[data-type]');
+    const link = card.querySelector('.content-download-btn[href]');
+    const footer = card.querySelector('.post-footer')?.innerText || '';
+    return { shortcode, type: typed?.getAttribute('data-type') || 'unknown', href: link?.href || '', dateText: footer };
+  }));
+}
+function mergeRawItemSnapshots(snapshots) {
+  return normalizeItems((snapshots || []).flat().filter(Boolean));
+}
 async function getRenderedCardState(page) {
   return page.locator('#post-container .post-card').evaluateAll(cards => ({
     count: cards.length,
@@ -411,6 +423,7 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   const deadline = Date.now() + waitBudget;
   const beforeIds = new Set(beforeState.ids || []);
   let bestState = beforeState;
+  let bestRawItems = [];
   let bestCount = beforeState.count || 0;
   let bestIds = new Set(beforeState.ids || []);
   let grew = false;
@@ -444,18 +457,19 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
       grew = true;
       lastGrowthAt = Date.now();
       bestState = state;
+      bestRawItems = await extractRawItemsFromPage(page);
       bestCount = Math.max(bestCount, state.count);
       bestIds = stateIds;
-      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, rawItems: bestRawItems, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
     }
     if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
       const finalState = await getRenderedCardState(page);
-      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      return { ...finalState, rawItems: await extractRawItemsFromPage(page), grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
     }
     await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
   }
   const finalState = await getRenderedCardState(page);
-  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount };
+  return { ...finalState, rawItems: grew ? bestRawItems : await extractRawItemsFromPage(page), grew, sawLoading, waitedMs: waitBudget, recenterCount };
 }
 async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp }) {
   if (attachCdp) { const u = new URL(attachCdp); if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>'); }
@@ -470,20 +484,24 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
     await page.waitForSelector('#post-container .post-card', { timeout: remainingTimeout(started, maxTimeMs) });
     const reportedTotal = await extractReportedTotalFromPage(page, remainingTimeout(started, maxTimeMs));
-    const seen = new Set(); let noGrowth = false, hitLimit = false;
+    const seen = new Set(); const rawSnapshots = []; let noGrowth = false, hitLimit = false;
     for (let i = 0; i < maxPages; i++) {
       page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
       const beforeState = await getRenderedCardState(page);
+      rawSnapshots.push(await extractRawItemsFromPage(page));
       beforeState.ids.forEach(id => seen.add(id));
       if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
       if (reportedTotal && seen.size >= reportedTotal) break;
       if (beforeState.count === 0) break;
       const afterState = await scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, targetUniqueCount: reportedTotal });
+      rawSnapshots.push(afterState.rawItems || await extractRawItemsFromPage(page));
       afterState.ids.forEach(id => seen.add(id));
       if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
       if (!afterState.grew) { noGrowth = true; break; }
     }
-    return await extractItemsFromPage(page, reportedTotal, { noGrowth, hitLimit });
+    rawSnapshots.push(await extractRawItemsFromPage(page));
+    const merged = mergeRawItemSnapshots(rawSnapshots);
+    return { items: merged.items, reportedTotal, uniquePostCount: merged.uniquePostCount, noGrowth, hitLimit };
   } finally { if (page) await page.close().catch(() => {}); if (browser && !attached) await browser.close().catch(() => {}); }
 }
 async function extractReportedTotalFromPage(page, timeoutMs = 2000) {
@@ -491,14 +509,7 @@ async function extractReportedTotalFromPage(page, timeoutMs = 2000) {
   return parseReportedTotal(text);
 }
 async function extractItemsFromPage(page, reportedTotal = null, flags = {}) {
-  const raw = await page.locator('#post-container .post-card').evaluateAll(cards => cards.map(card => {
-    const shortcode = card.querySelector('[data-id]')?.getAttribute('data-id') || '';
-    const typed = card.querySelector('[data-type]') || card.closest('[data-type]');
-    const link = card.querySelector('.content-download-btn[href]');
-    const footer = card.querySelector('.post-footer')?.innerText || '';
-    return { shortcode, type: typed?.getAttribute('data-type') || 'unknown', href: link?.href || '', dateText: footer };
-  }));
-  const norm = normalizeItems(raw);
+  const norm = mergeRawItemSnapshots([await extractRawItemsFromPage(page)]);
   return { items: norm.items, reportedTotal, uniquePostCount: norm.uniquePostCount, noGrowth: !!flags.noGrowth, hitLimit: !!flags.hitLimit };
 }
 async function statusProfile({ handle, output }) { validateHandle(handle); const root = await safeOutputRoot(output); const paths = profilePaths(root, handle); await ensureSafeDir(paths.stateDir, paths.root); return await readJson(paths.status, { status: 'ACTION_REQUIRED', reason: 'no status exists yet', handle }); }
@@ -508,4 +519,4 @@ async function doctor({ attachCdp } = {}) {
   if (attachCdp) { try { const u = new URL(attachCdp); checks.cdpOk = u.protocol === 'http:' && ['127.0.0.1','localhost','::1','[::1]'].includes(u.hostname); } catch { checks.cdpOk = false; } }
   checks.ok = checks.nodeOk && checks.playwright && checks.cdpOk; return checks;
 }
-module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, getRenderedCardState, scrollLastCardCenterAndWaitForGrowth, scrapeWithPlaywright, extractReportedTotalFromPage, extractItemsFromPage, statusProfile, doctor };
+module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, getRenderedCardState, scrollLastCardCenterAndWaitForGrowth, scrapeWithPlaywright, extractRawItemsFromPage, mergeRawItemSnapshots, extractReportedTotalFromPage, extractItemsFromPage, statusProfile, doctor };
