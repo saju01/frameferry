@@ -41,6 +41,7 @@ test('malformed dates are preserved instead of becoming invalid watermark', () =
 test('reported count parser uses POSTS adjacency, not max followers/header integers', () => {
   assert.equal(lib.parseReportedTotal('Followers 125,000 Following 12 POSTS 68'), 68);
   assert.equal(lib.parseReportedTotal('68 posts 125,000 followers'), 68);
+  assert.equal(lib.parseReportedTotal('68\nposts\n680.2k\nfollowers\n656\nfollowing'), 68);
   assert.equal(lib.parseReportedTotal('125,000 followers only'), null);
 });
 

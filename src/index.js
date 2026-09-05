@@ -162,16 +162,16 @@ function normalizeItems(rawItems) {
 function parseReportedTotal(text) {
   if (!text) return null;
   const s = String(text);
-  const num = '(\\d{1,3}(?:[,. ]\\d{3})*|\\d+)';
+  const num = '(?<![\\d.])(\\d+(?:[,. ]\\d{3})*)(?![\\d.])';
   const candidates = [];
-  for (const m of s.matchAll(new RegExp('(?:posts?|post)\\D{0,10}' + num, 'gi'))) {
-    const suffix = s.slice(m.index + m[0].length, m.index + m[0].length + 16).toLowerCase();
-    if (/^\s*follow(?:ing|ers?)/.test(suffix)) continue;
-    candidates.push({ value: m[1], score: 0, index: m.index });
-  }
   for (const m of s.matchAll(new RegExp(num + '\\s*(?:posts?|post)\\b', 'gi'))) {
     const prefix = s.slice(Math.max(0, m.index - 16), m.index).toLowerCase();
     if (/following\s*$/.test(prefix)) continue;
+    candidates.push({ value: m[1], score: 0, index: m.index });
+  }
+  for (const m of s.matchAll(new RegExp('(?:posts?|post)\\D{0,20}' + num, 'gi'))) {
+    const suffix = s.slice(m.index + m[0].length, m.index + m[0].length + 16).toLowerCase();
+    if (/^\s*follow(?:ing|ers?)/.test(suffix)) continue;
     candidates.push({ value: m[1], score: 1, index: m.index });
   }
   if (!candidates.length) return null;
