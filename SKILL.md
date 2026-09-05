@@ -1,11 +1,11 @@
 ---
-name: instacognito-archive
+name: instascrap
 description: Archive public Instagram media through InstaCognito with bounded full and incremental sync runs, durable manifests, receipt verification, and honest COMPLETE/PARTIAL/DEFERRED/ACTION_REQUIRED outcomes.
 license: MIT
-homepage: https://github.com/saju01/instacognito-archive-skill
+homepage: https://github.com/saju01/instascrap
 ---
 
-# InstaCognito Archive
+# InstaScrap
 
 Use this skill when the user wants a standalone free archive or periodic sync of public Instagram media through InstaCognito for personal or explicitly authorized public-profile archiving. InstaCognito advertises free public-profile viewing/download with no login at `https://instacognito.com/en/photo`; its terms at `https://instacognito.com/terms-and-conditions` prohibit commercial-scale scraping/archiving without authorization, copyright infringement, privacy abuse, private-access circumvention, and overburdening. Do not use this skill for logins, cookies, paid APIs, proxy rotation, signature reversal, anti-bot bypass, commercial scrape platforms, or unlimited/guaranteed-complete claims.
 
@@ -15,14 +15,14 @@ Use this skill when the user wants a standalone free archive or periodic sync of
 2. Run a bounded full pass:
 
    ```bash
-   instacognito-archive archive example_handle --mode full --output /path/to/archive/example_handle
+   instascrap archive example_handle --mode full --output /path/to/archive/example_handle
    ```
 
    Optional bounds: `--max-pages`, `--max-time-ms`, `--max-bytes`, `--delay-ms`, `--browser-channel`, `--browser-executable`, or `--attach-cdp http://127.0.0.1:9222`. Completion: the command exits 0 only for `COMPLETE`; `PARTIAL`, `DEFERRED`, and `ACTION_REQUIRED` exit non-zero and preserve state.
 3. Verify receipts before using files:
 
    ```bash
-   instacognito-archive status example_handle --output /path/to/archive/example_handle
+   instascrap status example_handle --output /path/to/archive/example_handle
    ```
 
    Completion: status shows immutable completed receipts with stable media identities, byte lengths, SHA-256 hashes, and no signed media URLs.
@@ -33,7 +33,7 @@ Use this skill when the user wants a standalone free archive or periodic sync of
 2. Run sync with overlap, not a date-only watermark:
 
    ```bash
-   instacognito-archive archive example_handle --mode sync --output /path/to/archive/example_handle --max-pages 6
+   instascrap archive example_handle --mode sync --output /path/to/archive/example_handle --max-pages 6
    ```
 
    Completion: prior successful receipts are retained, failed receipts are retried, and new carousel items are keyed by `postShortcode + carouselIndex` so signed URL rotation does not create duplicates.
@@ -48,4 +48,4 @@ Use this skill when the user wants a standalone free archive or periodic sync of
 
 ## Verification
 
-Run `instacognito-archive doctor`, then `instacognito-archive status <handle> --output <path>`. Repository verification before publishing: `npm ci && npm test && npm run test:sandbox`.
+Run `instascrap doctor`, then `instascrap status <handle> --output <path>`. Repository verification before publishing: `npm ci && npm test && npm run test:sandbox`.

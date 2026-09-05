@@ -3,6 +3,6 @@ npm-debug.log*
 .DS_Store
 coverage/
 *.tgz
-.instacognito/
+.instascrap/
 *.part
 reports/

@@ -32,7 +32,7 @@ function num(opts, key, d) {
   if (!Number.isFinite(n) || n < 0) throw new ArchiveError('BAD_ARGS', '--' + key.replace(/[A-Z]/g, c => '-' + c.toLowerCase()) + ' must be a non-negative number');
   return n;
 }
-function usage(code) { console.log('Usage:\n  instacognito-archive doctor [--attach-cdp http://127.0.0.1:9222]\n  instacognito-archive archive <handle> --mode full|sync --output <path>\n  instacognito-archive status <handle> --output <path>'); process.exitCode = code; }
+function usage(code) { console.log('Usage:\n  instascrap doctor [--attach-cdp http://127.0.0.1:9222]\n  instascrap archive <handle> --mode full|sync --output <path>\n  instascrap status <handle> --output <path>'); process.exitCode = code; }
 (async () => {
   const opts = parse(process.argv.slice(2));
   if (opts.cmd === 'help' || opts.cmd === '--help') return usage(0);

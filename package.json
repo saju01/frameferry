@@ -1,9 +1,9 @@
 {
-  "name": "instacognito-archive-skill",
+  "name": "instascrap",
   "version": "0.1.0",
-  "description": "OpenClaw skill and CLI for bounded, verifiable InstaCognito profile archiving.",
+  "description": "OpenClaw skill and CLI for bounded, verifiable InstaScrap archives using the InstaCognito public provider.",
   "bin": {
-    "instacognito-archive": "./bin/instacognito-archive.js"
+    "instascrap": "./bin/instascrap.js"
   },
   "scripts": {
     "test": "node --test",
