@@ -357,7 +357,7 @@ async function archiveProfile(opts = {}) {
     await writeStatus(paths, { status: 'RUNNING', reason: 'scan started', runId, handle, mode, startedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length });
     let scan;
     try {
-      scan = opts.items ? { items: opts.items, reportedTotal: opts.reportedTotal, noGrowth: !!opts.noGrowth, hitLimit: !!opts.hitLimit } : await scrapeWithPlaywright({ handle, maxPages: opts.maxPages || 12, maxTimeMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp });
+      scan = opts.items ? { items: opts.items, reportedTotal: opts.reportedTotal, uniquePostCount: normalizeItems(opts.items).uniquePostCount, scanSeenPostCount: normalizeItems(opts.items).uniquePostCount, extractedPostCount: normalizeItems(opts.items).uniquePostCount, noGrowth: !!opts.noGrowth, hitLimit: !!opts.hitLimit } : await scrapeWithPlaywright({ handle, maxPages: opts.maxPages || 12, maxTimeMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp });
     } catch (err) {
       const status = { status: err instanceof DeferredError ? 'DEFERRED' : 'ACTION_REQUIRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, updatedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length };
       await writeStatus(paths, status); throw err;
@@ -382,9 +382,9 @@ async function archiveProfile(opts = {}) {
         if ((opts.delayMs ?? DEFAULT_DELAY_MS) && remainingAfterDownload > 0) await delay(Math.min(opts.delayMs ?? DEFAULT_DELAY_MS, 5000, remainingAfterDownload));
       } catch (err) {
         if (err instanceof DeferredError) {
-          const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), { runId, mode, status: 'DEFERRED', completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length }] };
+          const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), { runId, mode, status: 'DEFERRED', scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length }] };
           await atomicWriteJson(paths.manifest, manifest);
-          await writeStatus(paths, { status: 'DEFERRED', reason: err.message, retryAt: err.retryAt, runId, handle, mode, downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, updatedAt: new Date().toISOString() });
+          await writeStatus(paths, { status: 'DEFERRED', reason: err.message, retryAt: err.retryAt, runId, handle, mode, scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, noGrowth: !!scan.noGrowth, downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, updatedAt: new Date().toISOString() });
           throw err;
         }
         failed[sid] = sanitizeFailedItem(item, err.message);
@@ -393,10 +393,10 @@ async function archiveProfile(opts = {}) {
     const completedPostSet = new Set([...norm.items.map(i => i.shortcode), ...Object.values(completed).map(r => r.shortcode).filter(Boolean)]);
     const uniquePostCount = completedPostSet.size;
     const outcome = decideOutcome({ reportedTotal: scan.reportedTotal, uniquePostCount, failed: Object.keys(failed).length, noGrowth: scan.noGrowth, hitLimit: scan.hitLimit, mode, reusedOnlyComplete: downloaded === 0 && reused > 0 });
-    const run = { runId, mode, status: outcome.status, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused };
+    const run = { runId, mode, status: outcome.status, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, noGrowth: !!scan.noGrowth, hitLimit: !!scan.hitLimit, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused };
     const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), run] };
     await atomicWriteJson(paths.manifest, manifest);
-    return writeStatus(paths, { ...outcome, runId, handle, mode, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused, updatedAt: new Date().toISOString() });
+    return writeStatus(paths, { ...outcome, runId, handle, mode, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, noGrowth: !!scan.noGrowth, hitLimit: !!scan.hitLimit, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused, updatedAt: new Date().toISOString() });
   });
 }
 function remainingTimeout(started, maxTimeMs) { return Math.max(1, maxTimeMs - (Date.now() - started)); }
@@ -501,7 +501,7 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     }
     rawSnapshots.push(await extractRawItemsFromPage(page));
     const merged = mergeRawItemSnapshots(rawSnapshots);
-    return { items: merged.items, reportedTotal, uniquePostCount: merged.uniquePostCount, noGrowth, hitLimit };
+    return { items: merged.items, reportedTotal, uniquePostCount: merged.uniquePostCount, scanSeenPostCount: seen.size, extractedPostCount: merged.uniquePostCount, noGrowth, hitLimit };
   } finally { if (page) await page.close().catch(() => {}); if (browser && !attached) await browser.close().catch(() => {}); }
 }
 async function extractReportedTotalFromPage(page, timeoutMs = 2000) {

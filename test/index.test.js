@@ -293,3 +293,16 @@ test('pagination snapshot merge preserves cards evicted from final DOM', async (
     assert.deepEqual(finalOnly.items.map(i => i.shortcode), ['P3','P4']);
   } finally { await browser.close(); }
 });
+
+
+test('status includes safe scan diagnostics to distinguish seen-vs-extracted shortfalls', async () => {
+  const d=await tmp(); const out=path.join(d,'out');
+  const s=await lib.archiveProfile({handle:'example',output:out,reportedTotal:3,items:[{shortcode:'A',href:'https://instacognito.com/media?id=a'},{shortcode:'B',href:'https://instacognito.com/media?id=b'}],dnsLookup:publicDns,fetchImpl:async()=>res(),noGrowth:true,delayMs:0});
+  assert.equal(s.status,'PARTIAL');
+  assert.equal(s.scanSeenPostCount,2);
+  assert.equal(s.extractedPostCount,2);
+  assert.equal(s.noGrowth,true);
+  const manifest=await readManifest(out);
+  assert.equal(manifest.runs.at(-1).scanSeenPostCount,2);
+  assert.equal(manifest.runs.at(-1).extractedPostCount,2);
+});
