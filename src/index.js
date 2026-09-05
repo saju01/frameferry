@@ -85,13 +85,18 @@ async function ensureNoSymlinkAncestors(target, { allowMissingLeaf = true } = {}
   const resolved = path.resolve(target);
   const parts = resolved.split(path.sep).filter(Boolean);
   let probe = path.isAbsolute(resolved) ? path.sep : '';
+  let missing = false;
   for (let i = 0; i < parts.length; i++) {
     probe = path.join(probe, parts[i]);
+    if (missing) continue;
     try {
       const st = await fsp.lstat(probe);
       if (st.isSymbolicLink()) throw new ArchiveError('BAD_OUTPUT', 'path contains symlink: ' + probe);
     } catch (err) {
-      if (err.code === 'ENOENT' && allowMissingLeaf) return resolved;
+      if (err.code === 'ENOENT' && allowMissingLeaf) {
+        missing = true;
+        continue;
+      }
       if (err.code === 'ENOENT') throw new ArchiveError('BAD_OUTPUT', 'path ancestor missing: ' + probe);
       throw err;
     }

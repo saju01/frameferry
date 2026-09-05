@@ -655,6 +655,9 @@ test('exportProfile rejects dangerous destinations and symlink ancestors', async
   await fsp.mkdir(real, { recursive: true });
   await fsp.symlink(real, link);
   await assert.rejects(() => lib.exportProfile({ handle: 'example', output: out, zip: path.join(link, 'bad.zip') }), /symlink/);
+  const nested = path.join(d, 'new', 'dir', 'export.zip');
+  await lib.exportProfile({ handle: 'example', output: out, zip: nested });
+  assert.equal(fs.existsSync(nested), true);
 });
 
 test('exportProfile refuses corrupted bytes, stale part files, and zero zip limits', async () => {
