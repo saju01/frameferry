@@ -7,6 +7,8 @@ const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const lib = require('../src/index.js');
 
+const python3Available = spawnSync('python3', ['-c', 'import zipfile'], { stdio: 'ignore' }).status === 0;
+
 const jpg = Buffer.from([0xff,0xd8,0xff,0xe0,1,2,3,4,0xff,0xd9]);
 const png = Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,1,2,3]);
 const mp4 = Buffer.from([0,0,0,20,0x66,0x74,0x79,0x70,0x69,0x73,0x6f,0x6d,0,0,0,0,0,0,0,0]);
@@ -550,7 +552,7 @@ test('status and manifest sections never persist signed provider URLs', async ()
   assert.equal(manifest.includes('media?id='), false);
 });
 
-test('legacy post receipts without category still count toward uniquePostCount and export as posts', async () => {
+test('legacy post receipts without category still count toward uniquePostCount and export as posts', { skip: !python3Available }, async () => {
   const d = await tmp();
   const out = path.join(d, 'out');
   const zipPath = path.join(d, 'legacy.zip');
@@ -592,7 +594,7 @@ test('legacy post receipts without category still count toward uniquePostCount a
   assert.equal(py.stdout.trim(), 'posts');
 });
 
-test('exportProfile writes ZIP with metadata, checksums, and byte-exact media', async () => {
+test('exportProfile writes ZIP with metadata, checksums, and byte-exact media', { skip: !python3Available }, async () => {
   const d = await tmp();
   const out = path.join(d, 'out');
   const zipPath = path.join(d, 'export.zip');

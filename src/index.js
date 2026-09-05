@@ -91,7 +91,7 @@ async function ensureNoSymlinkAncestors(target, { allowMissingLeaf = true } = {}
       const st = await fsp.lstat(probe);
       if (st.isSymbolicLink()) throw new ArchiveError('BAD_OUTPUT', 'path contains symlink: ' + probe);
     } catch (err) {
-      if (err.code === 'ENOENT' && allowMissingLeaf && i === parts.length - 1) return resolved;
+      if (err.code === 'ENOENT' && allowMissingLeaf) return resolved;
       if (err.code === 'ENOENT') throw new ArchiveError('BAD_OUTPUT', 'path ancestor missing: ' + probe);
       throw err;
     }
@@ -431,7 +431,7 @@ async function verifyReceipt(paths, receipt) {
 async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = DEFAULT_NETWORK_TIMEOUT_MS, dnsLookup, timeoutMs, completedMap = {}, handle } = {}) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), Math.max(1, timeoutMs || remainingMs));
-  const tempBase = path.join(paths.mediaDir, (item.stableId || fallbackFailureKey(item, 0)) + '.' + Date.now() + '.part');
+  const tempBase = path.join(paths.mediaDir, (item.stableId || fallbackFailureKey(item, 0)) + '.' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '.part');
   try {
     const res = await fetchWithValidatedRedirects(item.href, { fetchImpl, remainingMs, dnsLookup, signal: ac.signal });
     if (!res.ok) throw new ArchiveError('DOWNLOAD_FAILED', 'download failed with HTTP ' + res.status);
