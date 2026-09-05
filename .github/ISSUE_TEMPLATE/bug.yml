@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible defect using sanitized or synthetic evidence.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include real handles, downloaded media, cookies, tokens, signed URLs or private logs. Security issues belong in private reporting."
+  - type: input
+    id: version
+    attributes:
+      label: FrameFerry version or commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Node version, OS and browser version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Sanitized reproduction
+      description: Commands with example placeholders and a synthetic fixture where possible.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result and sanitized error/status
+    validations:
+      required: true
