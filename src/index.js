@@ -406,25 +406,56 @@ async function getRenderedCardState(page) {
     ids: [...new Set(cards.map(card => card.querySelector('[data-id]')?.getAttribute('data-id')).filter(Boolean))]
   }));
 }
-async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000 } = {}) {
+async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000, settleMs = 1200, recenterEveryMs = 1000, maxRecenters = 3, targetUniqueCount = null } = {}) {
   const waitBudget = Math.max(1, Math.min(growthWaitMs, remainingTimeout(started, maxTimeMs)));
   const deadline = Date.now() + waitBudget;
   const beforeIds = new Set(beforeState.ids || []);
-  const cards = page.locator('#post-container .post-card');
-  const count = await cards.count();
-  if (count === 0) return { ...beforeState, grew: false, waitedMs: 0 };
-  await cards.nth(count - 1).evaluate(el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }));
+  let bestState = beforeState;
+  let bestCount = beforeState.count || 0;
+  let bestIds = new Set(beforeState.ids || []);
+  let grew = false;
   let sawLoading = false;
+  let lastGrowthAt = 0;
+  let nextRecenterAt = 0;
+  let recenterCount = 0;
+  async function recenterLastCard() {
+    const cards = page.locator('#post-container .post-card');
+    const count = await cards.count();
+    if (count === 0) return false;
+    await cards.nth(count - 1).evaluate(el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }));
+    return true;
+  }
+  if (!await recenterLastCard()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0 };
+  recenterCount++;
+  nextRecenterAt = Date.now() + recenterEveryMs;
   while (Date.now() < deadline && Date.now() - started < maxTimeMs) {
+    const now = Date.now();
+    if (now >= nextRecenterAt && recenterCount < maxRecenters) {
+      if (await recenterLastCard()) recenterCount++;
+      nextRecenterAt = now + recenterEveryMs;
+    }
     const state = await getRenderedCardState(page);
-    const uniqueGrew = state.ids.some(id => !beforeIds.has(id));
-    if (state.count > beforeState.count || uniqueGrew) return { ...state, grew: true, waitedMs: waitBudget - Math.max(0, deadline - Date.now()) };
+    const stateIds = new Set(state.ids || []);
+    const uniqueGrew = [...stateIds].some(id => !bestIds.has(id));
+    const countGrew = state.count > bestCount;
     const loading = await page.locator('.loading, .spinner, [aria-busy="true"], [data-loading="true"]').count().catch(() => 0);
     sawLoading = sawLoading || loading > 0;
+    if (countGrew || uniqueGrew) {
+      grew = true;
+      lastGrowthAt = Date.now();
+      bestState = state;
+      bestCount = Math.max(bestCount, state.count);
+      bestIds = stateIds;
+      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+    }
+    if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
+      const finalState = await getRenderedCardState(page);
+      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+    }
     await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
   }
   const finalState = await getRenderedCardState(page);
-  return { ...finalState, grew: false, sawLoading, waitedMs: waitBudget };
+  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount };
 }
 async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp }) {
   if (attachCdp) { const u = new URL(attachCdp); if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>'); }
@@ -447,7 +478,7 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
       if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
       if (reportedTotal && seen.size >= reportedTotal) break;
       if (beforeState.count === 0) break;
-      const afterState = await scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs });
+      const afterState = await scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, targetUniqueCount: reportedTotal });
       afterState.ids.forEach(id => seen.add(id));
       if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
       if (!afterState.grew) { noGrowth = true; break; }

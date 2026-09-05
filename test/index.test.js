@@ -248,3 +248,23 @@ test('pagination no-growth waits only bounded budget before declaring no growth'
     assert.ok(Date.now() - started < 2000);
   } finally { await browser.close(); }
 });
+
+
+test('pagination waits for partial batch to settle and recenters current last card', async (t) => {
+  let chromium; try { chromium=require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless:true, executablePath: exe });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<div id="post-container"><article class="post-card"><span data-id="P1"></span><a class="content-download-btn" href="https://instacognito.com/media?id=one">d</a></article></div><script>window.scrollCalls=[]; Element.prototype.scrollIntoView=function(opts){ window.scrollCalls.push({opts, at: Date.now(), last: this.querySelector('[data-id]')?.getAttribute('data-id')}); if(!window.started){ window.started=1; setTimeout(()=>document.querySelector('#post-container').insertAdjacentHTML('beforeend','<article class="post-card"><span data-id="P2"></span><a class="content-download-btn" href="https://instacognito.com/media?id=two">d</a></article>'), 500); setTimeout(()=>document.querySelector('#post-container').insertAdjacentHTML('beforeend','<article class="post-card"><span data-id="P3"></span><a class="content-download-btn" href="https://instacognito.com/media?id=three">d</a></article>'), 1300); } };</script>`);
+    const before = await lib.getRenderedCardState(page);
+    const started = Date.now();
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 6000, growthWaitMs: 5000, settleMs: 700, recenterEveryMs: 600, maxRecenters: 3, targetUniqueCount: 3 });
+    assert.equal(after.grew, true);
+    assert.deepEqual(after.ids, ['P1','P2','P3']);
+    const calls = await page.evaluate(() => window.scrollCalls);
+    assert.ok(calls.length >= 2 && calls.length <= 3);
+    assert.equal(calls[0].opts.block, 'center');
+  } finally { await browser.close(); }
+});
