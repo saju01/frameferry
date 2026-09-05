@@ -1,0 +1,22 @@
+name: Feature proposal
+description: Propose a bounded improvement that respects privacy and provider restrictions.
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Explain the need without including real profile data.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and alternatives
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Provider, privacy and safety considerations
+      description: No bypass, credentials, paid-service assumptions or unlimited claims.
