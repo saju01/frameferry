@@ -224,8 +224,10 @@ test('pagination waits for delayed growth after explicit center scroll of alread
     await page.setContent(`<div id="post-container"><article class="post-card"><span data-id="P1"></span><a class="content-download-btn" href="https://instacognito.com/media?id=one">d</a></article></div><script>window.scrollCalls=[]; Element.prototype.scrollIntoView=function(opts){ window.scrollCalls.push(opts); setTimeout(()=>{ if(!document.querySelector('[data-id=P2]')) document.querySelector('#post-container').insertAdjacentHTML('beforeend','<article class="post-card"><span data-id="P2"></span><a class="content-download-btn" href="https://instacognito.com/media?id=two">d</a></article>'); }, 1100); };</script>`);
     const before = await lib.getRenderedCardState(page);
     const started = Date.now();
-    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 5000, growthWaitMs: 3000 });
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 7000, growthWaitMs: 5000 });
+    const elapsed = Date.now() - started;
     assert.equal(after.grew, true);
+    assert.ok(elapsed < 4200, `settled before full growth window; elapsed=${elapsed}`);
     assert.deepEqual(after.ids, ['P1','P2']);
     const calls = await page.evaluate(() => window.scrollCalls);
     assert.equal(calls[0].block, 'center');
@@ -260,7 +262,7 @@ test('pagination waits for partial batch to settle and recenters current last ca
     await page.setContent(`<div id="post-container"><article class="post-card"><span data-id="P1"></span><a class="content-download-btn" href="https://instacognito.com/media?id=one">d</a></article></div><script>window.scrollCalls=[]; Element.prototype.scrollIntoView=function(opts){ window.scrollCalls.push({opts, at: Date.now(), last: this.querySelector('[data-id]')?.getAttribute('data-id')}); if(!window.started){ window.started=1; setTimeout(()=>document.querySelector('#post-container').insertAdjacentHTML('beforeend','<article class="post-card"><span data-id="P2"></span><a class="content-download-btn" href="https://instacognito.com/media?id=two">d</a></article>'), 500); setTimeout(()=>document.querySelector('#post-container').insertAdjacentHTML('beforeend','<article class="post-card"><span data-id="P3"></span><a class="content-download-btn" href="https://instacognito.com/media?id=three">d</a></article>'), 1300); } };</script>`);
     const before = await lib.getRenderedCardState(page);
     const started = Date.now();
-    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 6000, growthWaitMs: 5000, settleMs: 700, recenterEveryMs: 600, maxRecenters: 3, targetUniqueCount: 3 });
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 6000, growthWaitMs: 5000, settleMs: 1000, recenterEveryMs: 600, maxRecenters: 3, targetUniqueCount: 3 });
     assert.equal(after.grew, true);
     assert.deepEqual(after.ids, ['P1','P2','P3']);
     const calls = await page.evaluate(() => window.scrollCalls);
