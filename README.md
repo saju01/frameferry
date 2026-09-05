@@ -26,7 +26,7 @@ frameferry archive <handle> --mode sync --output <path> --max-pages 6
 frameferry status <handle> --output <path>
 ```
 
-Options: `--max-pages`, `--max-time-ms`, `--max-bytes`, `--delay-ms`, `--browser-executable`, `--browser-channel`, `--attach-cdp http://127.0.0.1:<port>`, `--json`. CDP attach is loopback only; attached browsers are not closed wholesale.
+Options: `--max-pages`, `--max-time-ms`, `--max-bytes`, `--delay-ms`, `--browser-executable`, `--browser-channel`, `--attach-cdp http://127.0.0.1:<port>`, `--json`. CDP attach is loopback only and requires owner permission. When using `--attach-cdp`, FrameFerry closes its own page/context and disconnects the Playwright transport, but does not kill the existing browser process or remote-debugging server. Clean fresh browser contexts can still legitimately return `PARTIAL`; rerun with the same output path to resume/reuse receipts.
 
 ## Output
 

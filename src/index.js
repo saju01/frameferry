@@ -357,7 +357,7 @@ async function archiveProfile(opts = {}) {
     await writeStatus(paths, { status: 'RUNNING', reason: 'scan started', runId, handle, mode, startedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length });
     let scan;
     try {
-      scan = opts.items ? { items: opts.items, reportedTotal: opts.reportedTotal, uniquePostCount: normalizeItems(opts.items).uniquePostCount, scanSeenPostCount: normalizeItems(opts.items).uniquePostCount, extractedPostCount: normalizeItems(opts.items).uniquePostCount, noGrowth: !!opts.noGrowth, hitLimit: !!opts.hitLimit } : await scrapeWithPlaywright({ handle, maxPages: opts.maxPages || 12, maxTimeMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp });
+      scan = opts.items ? { items: opts.items, reportedTotal: opts.reportedTotal, noGrowth: !!opts.noGrowth, hitLimit: !!opts.hitLimit } : await scrapeWithPlaywright({ handle, maxPages: opts.maxPages || 12, maxTimeMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp });
     } catch (err) {
       const status = { status: err instanceof DeferredError ? 'DEFERRED' : 'ACTION_REQUIRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, updatedAt: new Date().toISOString(), priorCompletedCount: Object.keys(prior.completed || {}).length };
       await writeStatus(paths, status); throw err;
@@ -382,9 +382,9 @@ async function archiveProfile(opts = {}) {
         if ((opts.delayMs ?? DEFAULT_DELAY_MS) && remainingAfterDownload > 0) await delay(Math.min(opts.delayMs ?? DEFAULT_DELAY_MS, 5000, remainingAfterDownload));
       } catch (err) {
         if (err instanceof DeferredError) {
-          const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), { runId, mode, status: 'DEFERRED', scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length }] };
+          const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), { runId, mode, status: 'DEFERRED', completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length }] };
           await atomicWriteJson(paths.manifest, manifest);
-          await writeStatus(paths, { status: 'DEFERRED', reason: err.message, retryAt: err.retryAt, runId, handle, mode, scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, noGrowth: !!scan.noGrowth, downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, updatedAt: new Date().toISOString() });
+          await writeStatus(paths, { status: 'DEFERRED', reason: err.message, retryAt: err.retryAt, runId, handle, mode, downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, updatedAt: new Date().toISOString() });
           throw err;
         }
         failed[sid] = sanitizeFailedItem(item, err.message);
@@ -393,25 +393,13 @@ async function archiveProfile(opts = {}) {
     const completedPostSet = new Set([...norm.items.map(i => i.shortcode), ...Object.values(completed).map(r => r.shortcode).filter(Boolean)]);
     const uniquePostCount = completedPostSet.size;
     const outcome = decideOutcome({ reportedTotal: scan.reportedTotal, uniquePostCount, failed: Object.keys(failed).length, noGrowth: scan.noGrowth, hitLimit: scan.hitLimit, mode, reusedOnlyComplete: downloaded === 0 && reused > 0 });
-    const run = { runId, mode, status: outcome.status, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, noGrowth: !!scan.noGrowth, hitLimit: !!scan.hitLimit, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused };
+    const run = { runId, mode, status: outcome.status, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused };
     const manifest = { version: 1, handle, updatedAt: new Date().toISOString(), completed, failed, runs: [...(prior.runs || []), run] };
     await atomicWriteJson(paths.manifest, manifest);
-    return writeStatus(paths, { ...outcome, runId, handle, mode, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, scanSeenPostCount: scan.scanSeenPostCount ?? null, extractedPostCount: scan.extractedPostCount ?? norm.uniquePostCount, noGrowth: !!scan.noGrowth, hitLimit: !!scan.hitLimit, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused, updatedAt: new Date().toISOString() });
+    return writeStatus(paths, { ...outcome, runId, handle, mode, uniquePostCount, reportedTotal: scan.reportedTotal ?? null, completedCount: Object.keys(completed).length, failedCount: Object.keys(failed).length, downloadedCount: downloaded, reusedCount: reused, updatedAt: new Date().toISOString() });
   });
 }
 function remainingTimeout(started, maxTimeMs) { return Math.max(1, maxTimeMs - (Date.now() - started)); }
-async function extractRawItemsFromPage(page) {
-  return page.locator('#post-container .post-card').evaluateAll(cards => cards.map(card => {
-    const shortcode = card.querySelector('[data-id]')?.getAttribute('data-id') || '';
-    const typed = card.querySelector('[data-type]') || card.closest('[data-type]');
-    const link = card.querySelector('.content-download-btn[href]');
-    const footer = card.querySelector('.post-footer')?.innerText || '';
-    return { shortcode, type: typed?.getAttribute('data-type') || 'unknown', href: link?.href || '', dateText: footer };
-  }));
-}
-function mergeRawItemSnapshots(snapshots) {
-  return normalizeItems((snapshots || []).flat().filter(Boolean));
-}
 async function getRenderedCardState(page) {
   return page.locator('#post-container .post-card').evaluateAll(cards => ({
     count: cards.length,
@@ -423,7 +411,6 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   const deadline = Date.now() + waitBudget;
   const beforeIds = new Set(beforeState.ids || []);
   let bestState = beforeState;
-  let bestRawItems = [];
   let bestCount = beforeState.count || 0;
   let bestIds = new Set(beforeState.ids || []);
   let grew = false;
@@ -457,19 +444,22 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
       grew = true;
       lastGrowthAt = Date.now();
       bestState = state;
-      bestRawItems = await extractRawItemsFromPage(page);
       bestCount = Math.max(bestCount, state.count);
       bestIds = stateIds;
-      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, rawItems: bestRawItems, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
     }
     if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
       const finalState = await getRenderedCardState(page);
-      return { ...finalState, rawItems: await extractRawItemsFromPage(page), grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
     }
     await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
   }
   const finalState = await getRenderedCardState(page);
-  return { ...finalState, rawItems: grew ? bestRawItems : await extractRawItemsFromPage(page), grew, sawLoading, waitedMs: waitBudget, recenterCount };
+  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount };
+}
+async function cleanupScrapeBrowser(page, browser) {
+  if (page) await page.close().catch(() => {});
+  if (browser) await browser.close().catch(() => {});
 }
 async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp }) {
   if (attachCdp) { const u = new URL(attachCdp); if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>'); }
@@ -484,32 +474,35 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
     await page.waitForSelector('#post-container .post-card', { timeout: remainingTimeout(started, maxTimeMs) });
     const reportedTotal = await extractReportedTotalFromPage(page, remainingTimeout(started, maxTimeMs));
-    const seen = new Set(); const rawSnapshots = []; let noGrowth = false, hitLimit = false;
+    const seen = new Set(); let noGrowth = false, hitLimit = false;
     for (let i = 0; i < maxPages; i++) {
       page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
       const beforeState = await getRenderedCardState(page);
-      rawSnapshots.push(await extractRawItemsFromPage(page));
       beforeState.ids.forEach(id => seen.add(id));
       if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
       if (reportedTotal && seen.size >= reportedTotal) break;
       if (beforeState.count === 0) break;
       const afterState = await scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, targetUniqueCount: reportedTotal });
-      rawSnapshots.push(afterState.rawItems || await extractRawItemsFromPage(page));
       afterState.ids.forEach(id => seen.add(id));
       if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
       if (!afterState.grew) { noGrowth = true; break; }
     }
-    rawSnapshots.push(await extractRawItemsFromPage(page));
-    const merged = mergeRawItemSnapshots(rawSnapshots);
-    return { items: merged.items, reportedTotal, uniquePostCount: merged.uniquePostCount, scanSeenPostCount: seen.size, extractedPostCount: merged.uniquePostCount, noGrowth, hitLimit };
-  } finally { if (page) await page.close().catch(() => {}); if (browser && !attached) await browser.close().catch(() => {}); }
+    return await extractItemsFromPage(page, reportedTotal, { noGrowth, hitLimit });
+  } finally { await cleanupScrapeBrowser(page, browser); }
 }
 async function extractReportedTotalFromPage(page, timeoutMs = 2000) {
   const text = await page.locator('#profile-section, [id*=profile], [class*=profile]').first().innerText({ timeout: Math.max(1, timeoutMs) }).catch(() => '');
   return parseReportedTotal(text);
 }
 async function extractItemsFromPage(page, reportedTotal = null, flags = {}) {
-  const norm = mergeRawItemSnapshots([await extractRawItemsFromPage(page)]);
+  const raw = await page.locator('#post-container .post-card').evaluateAll(cards => cards.map(card => {
+    const shortcode = card.querySelector('[data-id]')?.getAttribute('data-id') || '';
+    const typed = card.querySelector('[data-type]') || card.closest('[data-type]');
+    const link = card.querySelector('.content-download-btn[href]');
+    const footer = card.querySelector('.post-footer')?.innerText || '';
+    return { shortcode, type: typed?.getAttribute('data-type') || 'unknown', href: link?.href || '', dateText: footer };
+  }));
+  const norm = normalizeItems(raw);
   return { items: norm.items, reportedTotal, uniquePostCount: norm.uniquePostCount, noGrowth: !!flags.noGrowth, hitLimit: !!flags.hitLimit };
 }
 async function statusProfile({ handle, output }) { validateHandle(handle); const root = await safeOutputRoot(output); const paths = profilePaths(root, handle); await ensureSafeDir(paths.stateDir, paths.root); return await readJson(paths.status, { status: 'ACTION_REQUIRED', reason: 'no status exists yet', handle }); }
@@ -519,4 +512,4 @@ async function doctor({ attachCdp } = {}) {
   if (attachCdp) { try { const u = new URL(attachCdp); checks.cdpOk = u.protocol === 'http:' && ['127.0.0.1','localhost','::1','[::1]'].includes(u.hostname); } catch { checks.cdpOk = false; } }
   checks.ok = checks.nodeOk && checks.playwright && checks.cdpOk; return checks;
 }
-module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, getRenderedCardState, scrollLastCardCenterAndWaitForGrowth, scrapeWithPlaywright, extractRawItemsFromPage, mergeRawItemSnapshots, extractReportedTotalFromPage, extractItemsFromPage, statusProfile, doctor };
+module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, getRenderedCardState, scrollLastCardCenterAndWaitForGrowth, scrapeWithPlaywright, extractReportedTotalFromPage, extractItemsFromPage, cleanupScrapeBrowser, statusProfile, doctor };
