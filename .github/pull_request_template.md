@@ -4,7 +4,7 @@ What problem does this solve? Link the issue if one exists.
 
 ## Changes
 
-- 
+<!-- Describe the changes. -->
 
 ## Verification
 
