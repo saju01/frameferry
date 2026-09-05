@@ -400,6 +400,32 @@ async function archiveProfile(opts = {}) {
   });
 }
 function remainingTimeout(started, maxTimeMs) { return Math.max(1, maxTimeMs - (Date.now() - started)); }
+async function getRenderedCardState(page) {
+  return page.locator('#post-container .post-card').evaluateAll(cards => ({
+    count: cards.length,
+    ids: [...new Set(cards.map(card => card.querySelector('[data-id]')?.getAttribute('data-id')).filter(Boolean))]
+  }));
+}
+async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000 } = {}) {
+  const waitBudget = Math.max(1, Math.min(growthWaitMs, remainingTimeout(started, maxTimeMs)));
+  const deadline = Date.now() + waitBudget;
+  const beforeIds = new Set(beforeState.ids || []);
+  const cards = page.locator('#post-container .post-card');
+  const count = await cards.count();
+  if (count === 0) return { ...beforeState, grew: false, waitedMs: 0 };
+  await cards.nth(count - 1).evaluate(el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }));
+  let sawLoading = false;
+  while (Date.now() < deadline && Date.now() - started < maxTimeMs) {
+    const state = await getRenderedCardState(page);
+    const uniqueGrew = state.ids.some(id => !beforeIds.has(id));
+    if (state.count > beforeState.count || uniqueGrew) return { ...state, grew: true, waitedMs: waitBudget - Math.max(0, deadline - Date.now()) };
+    const loading = await page.locator('.loading, .spinner, [aria-busy="true"], [data-loading="true"]').count().catch(() => 0);
+    sawLoading = sawLoading || loading > 0;
+    await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
+  }
+  const finalState = await getRenderedCardState(page);
+  return { ...finalState, grew: false, sawLoading, waitedMs: waitBudget };
+}
 async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp }) {
   if (attachCdp) { const u = new URL(attachCdp); if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>'); }
   const { chromium } = await require('playwright');
@@ -413,20 +439,18 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
     await page.waitForSelector('#post-container .post-card', { timeout: remainingTimeout(started, maxTimeMs) });
     const reportedTotal = await extractReportedTotalFromPage(page, remainingTimeout(started, maxTimeMs));
-    const seen = new Set(); let lastCount = 0, noGrowth = false, hitLimit = false;
+    const seen = new Set(); let noGrowth = false, hitLimit = false;
     for (let i = 0; i < maxPages; i++) {
       page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
-      const ids = await page.locator('#post-container .post-card [data-id]').evaluateAll(els => els.map(e => e.getAttribute('data-id')).filter(Boolean));
-      ids.forEach(id => seen.add(id));
-      if (Date.now() - started > maxTimeMs) { hitLimit = true; break; }
+      const beforeState = await getRenderedCardState(page);
+      beforeState.ids.forEach(id => seen.add(id));
+      if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
       if (reportedTotal && seen.size >= reportedTotal) break;
-      const cards = page.locator('#post-container .post-card'); const count = await cards.count();
-      if (count === 0) break;
-      await cards.nth(count - 1).scrollIntoViewIfNeeded({ timeout: remainingTimeout(started, maxTimeMs) });
-      await page.waitForTimeout(Math.min(750, remainingTimeout(started, maxTimeMs)));
-      const nowCount = await page.locator('#post-container .post-card [data-id]').evaluateAll(els => new Set(els.map(e => e.getAttribute('data-id')).filter(Boolean)).size);
-      if (nowCount <= lastCount) { noGrowth = true; break; }
-      lastCount = nowCount;
+      if (beforeState.count === 0) break;
+      const afterState = await scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs });
+      afterState.ids.forEach(id => seen.add(id));
+      if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
+      if (!afterState.grew) { noGrowth = true; break; }
     }
     return await extractItemsFromPage(page, reportedTotal, { noGrowth, hitLimit });
   } finally { if (page) await page.close().catch(() => {}); if (browser && !attached) await browser.close().catch(() => {}); }
@@ -453,4 +477,4 @@ async function doctor({ attachCdp } = {}) {
   if (attachCdp) { try { const u = new URL(attachCdp); checks.cdpOk = u.protocol === 'http:' && ['127.0.0.1','localhost','::1','[::1]'].includes(u.hostname); } catch { checks.cdpOk = false; } }
   checks.ok = checks.nodeOk && checks.playwright && checks.cdpOk; return checks;
 }
-module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, scrapeWithPlaywright, extractReportedTotalFromPage, extractItemsFromPage, statusProfile, doctor };
+module.exports = { VERSION, PROVIDER_ORIGIN, PROVIDER_PHOTO_URL, ArchiveError, DeferredError, validateHandle, redactSignedUrls, safeOutputRoot, ensureSafeDir, profilePaths, atomicWriteJson, readJson, withLock, parseRetryAfter, stableMediaId, parseDateText, normalizeItems, parseReportedTotal, validateProviderMediaUrl, validateRedirectTarget, isPrivateIp, isPrivateHostLiteral, fetchWithValidatedRedirects, streamResponseToPart, verifyReceipt, downloadOne, decideOutcome, archiveProfile, getRenderedCardState, scrollLastCardCenterAndWaitForGrowth, scrapeWithPlaywright, extractReportedTotalFromPage, extractItemsFromPage, statusProfile, doctor };

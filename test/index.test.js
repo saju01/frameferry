@@ -212,3 +212,39 @@ test('internal state/media/receipt symlink components are rejected', async () =>
   await fsp.symlink(path.join(d,'elsewhere'), path.join(out,'media'));
   await assert.rejects(()=>lib.archiveProfile({handle:'example',output:out,reportedTotal:1,items:[{shortcode:'A',href:'https://instacognito.com/media?id=x'}],dnsLookup:publicDns,fetchImpl:async()=>res(),delayMs:0}), /internal directory path contains symlink/);
 });
+
+
+test('pagination waits for delayed growth after explicit center scroll of already-visible last card', async (t) => {
+  let chromium; try { chromium=require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless:true, executablePath: exe });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<div id="post-container"><article class="post-card"><span data-id="P1"></span><a class="content-download-btn" href="https://instacognito.com/media?id=one">d</a></article></div><script>window.scrollCalls=[]; Element.prototype.scrollIntoView=function(opts){ window.scrollCalls.push(opts); setTimeout(()=>{ if(!document.querySelector('[data-id=P2]')) document.querySelector('#post-container').insertAdjacentHTML('beforeend','<article class="post-card"><span data-id="P2"></span><a class="content-download-btn" href="https://instacognito.com/media?id=two">d</a></article>'); }, 1100); };</script>`);
+    const before = await lib.getRenderedCardState(page);
+    const started = Date.now();
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 5000, growthWaitMs: 3000 });
+    assert.equal(after.grew, true);
+    assert.deepEqual(after.ids, ['P1','P2']);
+    const calls = await page.evaluate(() => window.scrollCalls);
+    assert.equal(calls[0].block, 'center');
+  } finally { await browser.close(); }
+});
+
+test('pagination no-growth waits only bounded budget before declaring no growth', async (t) => {
+  let chromium; try { chromium=require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless:true, executablePath: exe });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<div id="post-container"><article class="post-card"><span data-id="ONLY"></span><a class="content-download-btn" href="https://instacognito.com/media?id=one">d</a></article></div>`);
+    const before = await lib.getRenderedCardState(page);
+    const started = Date.now();
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 5000, growthWaitMs: 400 });
+    assert.equal(after.grew, false);
+    assert.ok(Date.now() - started >= 350);
+    assert.ok(Date.now() - started < 2000);
+  } finally { await browser.close(); }
+});
