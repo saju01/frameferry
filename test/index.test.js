@@ -896,3 +896,233 @@ test('content-export branch retains at least the baseline test inventory plus ne
   for (const name of baselineNames) assert.ok(newNames.includes(name), 'missing baseline test: ' + name);
   assert.ok(newNames.length >= baselineNames.length + 6, 'expected expanded coverage beyond ' + baselineNames.length + ', got ' + newNames.length);
 });
+
+// --- bounded, request-aware continuation grace -------------------------------------------------
+// Every fixture below is served entirely from page.route: a catch-all route intercepts the
+// document, the continuation endpoint, and anything else, so no request can reach the network.
+const CONTINUATION_FIXTURE_URL = 'https://instacognito.com/en/photo';
+
+function continuationFixtureHtml(providerScript) {
+  const card = (marker, id) => '<article class="post-card" data-marker="' + marker + '"><span class="likes-trigger" data-id="' + id + '"><span>5</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=' + id + '">d</a></article>';
+  const lead = Array.from({ length: 8 }, (_, i) => card('lead', 'P' + (i + 1))).join('');
+  return '<!doctype html><style>body{margin:0}#post-container{display:block}.post-card{display:block;height:300px;box-sizing:border-box;border:1px solid #ccc}</style>'
+    + '<div id="post-container">' + lead + card('parent', 'PLAST') + '</div>'
+    + '<script>(function(){'
+    + 'const attr = "data-ff-pagination-sentinel";'
+    + 'const Native = window.IntersectionObserver;'
+    + 'function Probed(cb, opts){ const o = new Native(cb, opts); const nat = o.observe.bind(o); o.observe = function(target){ for (const m of document.querySelectorAll("[" + attr + "]")) m.removeAttribute(attr); target.setAttribute(attr, "1"); return nat(target); }; return o; }'
+    + 'Probed.prototype = Native.prototype; window.IntersectionObserver = Probed;'
+    + 'window.intersections = 0; window.appended = 0; window.lastStatus = null;'
+    + 'window.appendBatch = function(n){ for (let i = 0; i < n; i++) { window.appended++; document.getElementById("post-container").insertAdjacentHTML("beforeend", \'<article class="post-card" data-marker="next"><span class="likes-trigger" data-id="PNEXT\' + window.appended + \'"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=next\' + window.appended + \'">d</a></article>\'); } };'
+    + 'window.sentinel = document.querySelector(\'#post-container .post-card[data-marker="parent"]\');'
+    + providerScript
+    + '})();</script>';
+}
+
+async function serveContinuationFixture(page, providerScript, apiHandler) {
+  const html = continuationFixtureHtml(providerScript);
+  const seen = { api: 0, unexpected: [] };
+  await page.route('**/*', async route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/en/photo') return route.fulfill({ status: 200, contentType: 'text/html', body: html });
+    if (url.pathname === '/api/posts') { seen.api++; return apiHandler(route, seen); }
+    if (url.pathname === '/favicon.ico') return route.fulfill({ status: 204, body: '' });
+    seen.unexpected.push(url.href);
+    return route.abort();
+  });
+  await page.goto(CONTINUATION_FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+  const geometry = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll('#post-container .post-card')];
+    const marked = document.querySelector('[data-ff-pagination-sentinel]');
+    return { markedIndex: cards.indexOf(marked), markedTop: marked ? marked.getBoundingClientRect().top : null, viewport: window.innerHeight };
+  });
+  assert.equal(geometry.markedIndex, 8, 'observe() must mark the sentinel the fixture provider watches');
+  assert.ok(geometry.markedTop > geometry.viewport + 200, 'sentinel must start outside viewport + rootMargin; top=' + geometry.markedTop);
+  await page.waitForTimeout(250);
+  assert.equal(await page.evaluate(() => window.intersections), 0, 'observer must not fire before the helper scrolls');
+  return seen;
+}
+
+const jsonRoute = (body, extra = {}) => route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body), ...extra });
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+test('continuation grace re-arms the observed sentinel when the first trigger fires no request', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // The Sydney trace: the observed sentinel is present and valid, the first bounded trigger
+    // produces no /api/posts request at all, and the second trigger paginates normally.
+    const seen = await serveContinuationFixture(page, 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; if (window.intersections < 2) return; io.disconnect(); fetch("/api/posts", { method: "POST", body: "{}" }).then(r => r.json()).then(d => window.appendBatch(d.count)); }, { rootMargin: "200px" }); io.observe(window.sentinel);', jsonRoute({ count: 3 }));
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const before = await lib.getRenderedCardState(page);
+      assert.equal(before.count, 9);
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 25000, growthWaitMs: 1200, graceWaitMs: 4000, inFlightSettleMs: 4000, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      assert.equal(after.grew, true, 'a first window with no continuation request must not be terminal');
+      assert.equal(after.graceAttemptsUsed, 1, 'exactly one bounded grace attempt');
+      assert.equal(after.sentinelSource, 'observed');
+      assert.equal(after.blocked, null);
+      assert.equal(after.continuationRequests, 1, 'the continuation request fired inside the grace window');
+      assert.equal(after.count, 12);
+      assert.ok(after.ids.includes('PNEXT1'), 'new batch must be observed: ' + JSON.stringify(after.ids));
+      assert.equal(await page.evaluate(() => window.intersections), 2, 'the grace attempt must produce a fresh intersection transition');
+      assert.equal(seen.api, 1);
+      assert.equal(monitor.count(), 1);
+      assert.equal(monitor.inFlight(), 0);
+      assert.equal(monitor.denial(), null);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('continuation in-flight response settles without consuming a grace attempt', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = await serveContinuationFixture(page, 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; io.disconnect(); fetch("/api/posts", { method: "POST", body: "{}" }).then(r => r.json()).then(d => window.appendBatch(d.count)); }, { rootMargin: "200px" }); io.observe(window.sentinel);', async route => { await sleep(1500); return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 2 }) }); });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const before = await lib.getRenderedCardState(page);
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 25000, growthWaitMs: 700, graceWaitMs: 4000, inFlightSettleMs: 4000, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      assert.equal(after.grew, true, 'a response still in flight must be allowed to settle');
+      assert.equal(after.graceAttemptsUsed, 0, 'settlement is not a retry and must not spend the grace budget');
+      assert.equal(after.continuationRequests, 1);
+      assert.equal(after.blocked, null);
+      assert.equal(after.count, 11);
+      assert.ok(after.ids.includes('PNEXT1'), 'new batch must be observed: ' + JSON.stringify(after.ids));
+      assert.ok(elapsed < 6000, 'settlement stays bounded; elapsed=' + elapsed);
+      assert.equal(await page.evaluate(() => window.intersections), 1, 'no re-arm was needed');
+      assert.equal(seen.api, 1);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('continuation grace stays bounded when the provider never fires and skips heuristic sentinels', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = await serveContinuationFixture(page, 'const io = new IntersectionObserver(function(entries){ if (entries[0].isIntersecting) window.intersections++; }, { rootMargin: "200px" }); io.observe(window.sentinel);', jsonRoute({ count: 0 }));
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const before = await lib.getRenderedCardState(page);
+      const maxTimeMs = 30000;
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs, growthWaitMs: 600, graceWaitMs: 600, inFlightSettleMs: 600, graceAttempts: 1, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      assert.equal(after.grew, false, 'a stalled provider still terminates');
+      assert.equal(after.graceAttemptsUsed, 1, 'at most graceAttempts extra attempts');
+      assert.equal(after.continuationRequests, 0);
+      assert.equal(after.blocked, null);
+      assert.equal(after.count, 9);
+      assert.ok(elapsed < 600 + 600 + 600 + 2500, 'total wait stays within growthWaitMs + graceWaitMs + inFlightSettleMs plus overhead; elapsed=' + elapsed);
+      assert.ok(elapsed < maxTimeMs, 'never exceeds the global deadline; elapsed=' + elapsed);
+      assert.equal(seen.api, 0);
+
+      // A heuristic sentinel is not authoritative, so it keeps today's fail-closed behavior.
+      await page.evaluate(() => document.querySelector('[data-ff-pagination-sentinel]').removeAttribute('data-ff-pagination-sentinel'));
+      const heuristicStarted = Date.now();
+      const heuristic = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started: heuristicStarted, maxTimeMs, growthWaitMs: 600, graceWaitMs: 600, inFlightSettleMs: 600, graceAttempts: 1, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const heuristicElapsed = Date.now() - heuristicStarted;
+      assert.equal(heuristic.grew, false);
+      assert.notEqual(heuristic.sentinelSource, 'observed');
+      assert.equal(heuristic.graceAttemptsUsed, 0, 'heuristic sentinels get no grace');
+      assert.ok(heuristicElapsed < 600 + 2000, 'heuristic path keeps the single bounded window; elapsed=' + heuristicElapsed);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('continuation denial with 429 Retry-After blocks instead of retrying', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = await serveContinuationFixture(page, 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; io.disconnect(); fetch("/api/posts", { method: "POST", body: "{}" }).then(r => { window.lastStatus = r.status; }); }, { rootMargin: "200px" }); io.observe(window.sentinel);', route => route.fulfill({ status: 429, contentType: 'application/json', headers: { 'retry-after': '120' }, body: '{"error":"rate limited"}' }));
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const before = await lib.getRenderedCardState(page);
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 30000, growthWaitMs: 700, graceWaitMs: 5000, inFlightSettleMs: 5000, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      assert.equal(after.grew, false);
+      assert.ok(after.blocked, 'a provider denial must be reported, not retried');
+      assert.equal(after.blocked.status, 429);
+      assert.match(after.blocked.reason, /429/);
+      assert.equal(typeof after.blocked.retryAt, 'string');
+      assert.ok(Date.parse(after.blocked.retryAt) > Date.now(), 'Retry-After must be parsed forward: ' + after.blocked.retryAt);
+      assert.equal(after.graceAttemptsUsed, 0, 'never retry into a denial');
+      assert.equal(after.continuationRequests, 1);
+      assert.ok(elapsed < 3000, 'denial returns without spending the grace or settlement windows; elapsed=' + elapsed);
+      assert.equal(await page.evaluate(() => window.lastStatus), 429);
+      assert.equal(seen.api, 1);
+      assert.ok(monitor.denial(), 'monitor must surface the denial');
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('continuation request that returns no new cards is a terminal boundary with no grace retry', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = await serveContinuationFixture(page, 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; io.disconnect(); fetch("/api/posts", { method: "POST", body: "{}" }).then(r => r.json()).then(d => window.appendBatch(d.count)); }, { rootMargin: "200px" }); io.observe(window.sentinel);', jsonRoute({ count: 0 }));
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const before = await lib.getRenderedCardState(page);
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 30000, growthWaitMs: 900, graceWaitMs: 5000, inFlightSettleMs: 5000, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      assert.equal(after.grew, false);
+      assert.equal(after.continuationRequests, 1, 'the provider answered this window');
+      assert.equal(after.graceAttemptsUsed, 0, 'a served continuation with no new cards is a real boundary');
+      assert.equal(after.blocked, null);
+      assert.equal(after.count, 9);
+      assert.ok(elapsed < 3000, 'no extra window is spent on a terminal boundary; elapsed=' + elapsed);
+      assert.equal(seen.api, 1);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});

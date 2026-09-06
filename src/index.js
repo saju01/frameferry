@@ -701,9 +701,67 @@ async function installPaginationSentinelProbe(page) {
     return true;
   }, PAGINATION_SENTINEL_ATTR);
 }
-async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000, settleMs = 1200, recenterEveryMs = 1000, maxRecenters = 3, targetUniqueCount = null } = {}) {
-  const waitBudget = Math.max(1, Math.min(growthWaitMs, remainingTimeout(started, maxTimeMs)));
-  const deadline = Date.now() + waitBudget;
+const CONTINUATION_REQUEST_PATH = '/api/posts';
+const CONTINUATION_DENIAL_STATUSES = new Set([403, 429]);
+const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="challenge" i], iframe[title*="challenge" i], .g-recaptcha, .h-captcha, #challenge-form, #cf-challenge-running, [data-captcha]';
+// The provider continuation is a single POST to /api/posts with no cursor in either direction, so
+// the only thing that can be observed about it is whether it was issued, whether it is still in
+// flight, and whether it came back denied. That is exactly what the pagination stop decision needs:
+// a window with no request at all is not evidence of a terminal boundary, a window whose request
+// was answered is, and a denial must never be retried into.
+function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUEST_PATH } = {}) {
+  let startedCount = 0;
+  let denial = null;
+  const pending = new Set();
+  const wanted = String(pathname).replace(/\/+$/, '');
+  const matches = request => {
+    try { return new URL(request.url()).pathname.replace(/\/+$/, '') === wanted; } catch { return false; }
+  };
+  const onRequest = request => { if (!matches(request)) return; startedCount++; pending.add(request); };
+  const onSettled = request => { pending.delete(request); };
+  const onResponse = response => {
+    let request;
+    try { request = response.request(); } catch { return; }
+    if (!matches(request)) return;
+    const status = response.status();
+    if (!CONTINUATION_DENIAL_STATUSES.has(status) || denial) return;
+    let retryAfter = null;
+    try { retryAfter = response.headers()['retry-after'] ?? null; } catch { retryAfter = null; }
+    denial = { reason: 'provider denied continuation with HTTP ' + status, status, retryAt: parseRetryAfter(retryAfter) };
+  };
+  let attached = false;
+  if (page && typeof page.on === 'function') {
+    page.on('request', onRequest);
+    page.on('response', onResponse);
+    page.on('requestfinished', onSettled);
+    page.on('requestfailed', onSettled);
+    attached = true;
+  }
+  return {
+    count: () => startedCount,
+    inFlight: () => pending.size,
+    denial: () => denial,
+    detach() {
+      if (!attached) return;
+      attached = false;
+      page.off('request', onRequest);
+      page.off('response', onResponse);
+      page.off('requestfinished', onSettled);
+      page.off('requestfailed', onSettled);
+      pending.clear();
+    }
+  };
+}
+async function detectContinuationDenial(page, continuationMonitor) {
+  const denial = typeof continuationMonitor?.denial === 'function' ? continuationMonitor.denial() : null;
+  if (denial) return denial;
+  const challenged = await page.locator(CHALLENGE_SELECTOR).first().isVisible().catch(() => false);
+  if (challenged) return { reason: 'provider challenge or captcha is visible', status: null, retryAt: null };
+  return null;
+}
+const MIN_GRACE_WINDOW_MS = 250;
+const REARM_SETTLE_MS = 250;
+async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000, settleMs = 1200, recenterEveryMs = 1000, maxRecenters = 3, targetUniqueCount = null, continuationMonitor = null, graceAttempts = 1, graceWaitMs = 4000, inFlightSettleMs = 4000 } = {}) {
   let bestState = beforeState;
   let bestCount = beforeState.count || 0;
   let bestIds = new Set(beforeState.ids || []);
@@ -712,7 +770,14 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   let lastGrowthAt = 0;
   let nextRecenterAt = 0;
   let recenterCount = 0;
+  let waitedMs = 0;
+  let graceAttemptsUsed = 0;
+  let blocked = null;
   let sentinel = null;
+  const monitorCount = () => (typeof continuationMonitor?.count === 'function' ? continuationMonitor.count() : 0);
+  const requestsBefore = monitorCount();
+  const continuationRequests = () => monitorCount() - requestsBefore;
+  const decorate = state => ({ ...state, grew, sawLoading, waitedMs, recenterCount, ...sentinel, graceAttemptsUsed, continuationRequests: continuationRequests(), blocked });
   // The provider hangs its pagination IntersectionObserver (rootMargin 200px) on the TOP-LEVEL
   // card of the last post, then appends that post's carousel slides as sibling .post-cards
   // after it. Centering the final DOM card parks the real sentinel several card heights above
@@ -746,37 +811,105 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
     sentinel = found;
     return true;
   }
-  if (!await recenterPaginationSentinel()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0, sentinelIndex: null, sentinelId: null, sentinelSource: null };
-  recenterCount++;
-  nextRecenterAt = Date.now() + recenterEveryMs;
-  while (Date.now() < deadline && Date.now() - started < maxTimeMs) {
-    const now = Date.now();
-    if (now >= nextRecenterAt && recenterCount < maxRecenters) {
-      if (await recenterPaginationSentinel()) recenterCount++;
-      nextRecenterAt = now + recenterEveryMs;
-    }
-    const state = await getRenderedCardState(page);
-    const stateIds = new Set(state.ids || []);
-    const uniqueGrew = [...stateIds].some(id => !bestIds.has(id));
-    const countGrew = state.count > bestCount;
-    const loading = await page.locator('.loading, .spinner, [aria-busy="true"], [data-loading="true"]').count().catch(() => 0);
-    sawLoading = sawLoading || loading > 0;
-    if (countGrew || uniqueGrew) {
-      grew = true;
-      lastGrowthAt = Date.now();
-      bestState = state;
-      bestCount = Math.max(bestCount, state.count);
-      bestIds = stateIds;
-      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount, ...sentinel };
-    }
-    if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
-      const finalState = await getRenderedCardState(page);
-      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount, ...sentinel };
-    }
-    await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
+  // Re-centering an element that is already intersecting produces no IntersectionObserver
+  // callback, so the in-window recenters cannot wake a provider observer that stayed silent.
+  // A re-arm scrolls fully away first, lets the browser deliver the leave, and then centers the
+  // sentinel again, which is a genuine fresh enter transition.
+  async function rearmPaginationSentinel() {
+    const observedStillConnected = await page.evaluate(attr => {
+      const observed = document.querySelector('[' + attr + ']');
+      if (!observed || !observed.isConnected) return false;
+      const top = document.querySelector('#post-container .post-card') || document.querySelector('#post-container') || document.body;
+      if (top && typeof top.scrollIntoView === 'function') top.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
+      else window.scrollTo(0, 0);
+      return true;
+    }, PAGINATION_SENTINEL_ATTR).catch(() => false);
+    if (!observedStillConnected) return false;
+    await page.waitForTimeout(Math.min(REARM_SETTLE_MS, remainingTimeout(started, maxTimeMs)));
+    return recenterPaginationSentinel();
   }
-  const finalState = await getRenderedCardState(page);
-  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount, ...sentinel };
+  // One bounded observation window. The primary window, the in-flight settlement extension and
+  // every grace window run through here, so they cannot drift apart. Returns a finished result
+  // when growth settled (or the target was reached) and null when the window simply expired.
+  async function runWaitWindow(windowMs) {
+    const windowBudget = Math.max(1, Math.min(windowMs, remainingTimeout(started, maxTimeMs)));
+    const deadline = Date.now() + windowBudget;
+    nextRecenterAt = Date.now() + recenterEveryMs;
+    while (Date.now() < deadline && Date.now() - started < maxTimeMs) {
+      const now = Date.now();
+      if (now >= nextRecenterAt && recenterCount < maxRecenters) {
+        if (await recenterPaginationSentinel()) recenterCount++;
+        nextRecenterAt = now + recenterEveryMs;
+      }
+      const state = await getRenderedCardState(page);
+      const stateIds = new Set(state.ids || []);
+      const uniqueGrew = [...stateIds].some(id => !bestIds.has(id));
+      const countGrew = state.count > bestCount;
+      const loading = await page.locator('.loading, .spinner, [aria-busy="true"], [data-loading="true"]').count().catch(() => 0);
+      sawLoading = sawLoading || loading > 0;
+      if (countGrew || uniqueGrew) {
+        grew = true;
+        lastGrowthAt = Date.now();
+        bestState = state;
+        bestCount = Math.max(bestCount, state.count);
+        bestIds = stateIds;
+        if (targetUniqueCount && bestIds.size >= targetUniqueCount) {
+          waitedMs += windowBudget - Math.max(0, deadline - Date.now());
+          return decorate(state);
+        }
+      }
+      if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
+        waitedMs += windowBudget - Math.max(0, deadline - Date.now());
+        return decorate(await getRenderedCardState(page));
+      }
+      await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
+    }
+    waitedMs += windowBudget;
+    return null;
+  }
+  if (!await recenterPaginationSentinel()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0, sentinelIndex: null, sentinelId: null, sentinelSource: null, graceAttemptsUsed: 0, continuationRequests: continuationRequests(), blocked: null };
+  recenterCount++;
+  const settled = await runWaitWindow(growthWaitMs);
+  if (settled) return settled;
+  if (grew) return decorate(await getRenderedCardState(page));
+
+  // The primary window ended with no growth. Before calling that a terminal boundary, spend a
+  // bounded, request-aware grace budget: the Sydney trace shows a first bounded trigger that
+  // issued no continuation request at all followed by a second that returned HTTP 200 with 19
+  // items, so one silent window is not evidence that the provider has nothing left.
+  blocked = await detectContinuationDenial(page, continuationMonitor);
+  if (blocked) return decorate(await getRenderedCardState(page));
+
+  // Settlement, not a retry: a continuation request that is still in flight has not had its
+  // chance to render yet. This happens at most once and never spends a grace attempt.
+  if (typeof continuationMonitor?.inFlight === 'function' && continuationMonitor.inFlight() > 0) {
+    const extended = await runWaitWindow(inFlightSettleMs);
+    if (extended) return extended;
+    if (grew) return decorate(await getRenderedCardState(page));
+    blocked = await detectContinuationDenial(page, continuationMonitor);
+    if (blocked) return decorate(await getRenderedCardState(page));
+  }
+
+  // Grace is deliberately narrow: only an authoritative observed sentinel that is still
+  // connected, only when the monitor saw no continuation request at all in this call (a request
+  // that fired and produced no cards is a real boundary), and only inside the global deadline.
+  while (
+    graceAttemptsUsed < graceAttempts
+    && sentinel?.sentinelSource === 'observed'
+    && continuationMonitor
+    && continuationRequests() === 0
+    && remainingTimeout(started, maxTimeMs) > MIN_GRACE_WINDOW_MS
+  ) {
+    graceAttemptsUsed++;
+    if (!await rearmPaginationSentinel()) break;
+    recenterCount++;
+    const regrew = await runWaitWindow(graceWaitMs);
+    if (regrew) return regrew;
+    if (grew) break;
+    blocked = await detectContinuationDenial(page, continuationMonitor);
+    if (blocked) break;
+  }
+  return decorate(await getRenderedCardState(page));
 }
 async function cleanupScrapeBrowser(page, browser) {
   if (page) await page.close().catch(() => {});
@@ -857,7 +990,7 @@ async function extractItemsFromPage(page, maybeOptions = {}, maybeFlags = {}) {
   const norm = normalizeItems(raw, { category: options.category || 'posts', mediaTypes: options.mediaTypes || DEFAULT_MEDIA_TYPES, highlightGroup: options.highlightGroup || null });
   return { items: norm.items, reportedTotal: options.reportedTotal ?? null, uniquePostCount: norm.uniquePostCount, noGrowth: !!options.noGrowth, hitLimit: !!options.hitLimit };
 }
-async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, started, maxTimeMs, maxPages }) {
+async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, started, maxTimeMs, maxPages, continuationMonitor = null }) {
   let noGrowth = false;
   let hitLimit = false;
   let exhaustedPageBudget = maxPages <= 0;
@@ -866,8 +999,11 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
     if (before.count === 0) { exhaustedPageBudget = false; break; }
     if (reportedTotal && before.ids.length >= reportedTotal) { exhaustedPageBudget = false; break; }
     if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
-    const after = await scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs, targetUniqueCount: reportedTotal });
+    const after = await scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs, targetUniqueCount: reportedTotal, continuationMonitor });
     if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
+    // A provider denial is a bounded stop, not an exhausted section: report PARTIAL, not a
+    // no-growth boundary that would look like the profile has nothing more to give.
+    if (after.blocked) hitLimit = true;
     if (!after.grew) { noGrowth = true; break; }
     exhaustedPageBudget = i === maxPages - 1;
   }
@@ -909,12 +1045,14 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>');
   }
   const { chromium } = await require('playwright');
-  let browser, page;
+  let browser, page, continuationMonitor = null;
   const started = Date.now();
   try {
     if (attachCdp) { browser = await chromium.connectOverCDP(attachCdp, { timeout: remainingTimeout(started, maxTimeMs) }); page = await browser.newPage(); }
     else { browser = await chromium.launch({ headless: true, executablePath: browserExecutable, channel: browserChannel, timeout: remainingTimeout(started, maxTimeMs) }); page = await browser.newPage(); }
     page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
+    // Attached before the first navigation so no continuation request can be missed.
+    continuationMonitor = attachContinuationRequestMonitor(page);
     await page.goto(PROVIDER_PHOTO_URL, { waitUntil: 'domcontentloaded', timeout: remainingTimeout(started, maxTimeMs) });
     // Must run after navigation and before the search click: the provider only builds its
     // pagination observer once results render, so this is the last safe moment to wrap it.
@@ -940,10 +1078,11 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
         continue;
       }
       if (category === 'highlights') sections.push(await scrapeHighlightsSection(page, { mediaTypes, started, maxTimeMs }));
-      else sections.push(await scrapeCardSection(page, { category, mediaTypes, reportedTotal: category === 'posts' ? profile.reportedPostCount : null, started, maxTimeMs, maxPages }));
+      else sections.push(await scrapeCardSection(page, { category, mediaTypes, reportedTotal: category === 'posts' ? profile.reportedPostCount : null, started, maxTimeMs, maxPages, continuationMonitor }));
     }
     return { profile, sections };
   } finally {
+    if (continuationMonitor) continuationMonitor.detach();
     await cleanupScrapeBrowser(page, browser);
   }
 }
@@ -1273,6 +1412,7 @@ module.exports = {
   getRenderedCardState,
   PAGINATION_SENTINEL_ATTR,
   installPaginationSentinelProbe,
+  attachContinuationRequestMonitor,
   scrollLastCardCenterAndWaitForGrowth,
   scrapeWithPlaywright,
   extractReportedTotalFromPage,
