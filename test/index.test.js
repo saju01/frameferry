@@ -1133,6 +1133,59 @@ test('incomplete and impossible calendar dates never become authoritative timest
   assert.equal(lib.resolveItemDate('2023-02-29').dateResolved, null, 'a leap day in a non-leap year does not');
 });
 
+test('impossible calendar dates are refused in every ISO form, not just date-only', () => {
+  // Date.parse is strict for a bare ISO date but LENIENT for a date-time, so an impossible day
+  // in a time-bearing form was silently rolled over into a real instant and then asserted as an
+  // authoritative capture timestamp. The calendar is now validated arithmetically.
+  for (const text of [
+    '2024-02-31T00:00:00Z', '2024-02-31T00:00:00', '2024-02-31 00:00', '2024-02-31',
+    '2023-02-29T12:00:00Z', '2023-02-29', '2024-04-31T00:00:00Z', '2024-06-31T23:59:59Z',
+    '2024-13-01T00:00:00Z', '2024-00-10T00:00:00Z', '2024-08-32T00:00:00Z', '2024-08-00T00:00:00Z',
+    '1900-02-29', '2100-02-29T00:00:00Z', '2024-08-23T25:00:00Z', '2024-08-23T10:61:00Z',
+    '2024-08-23T10:00:61Z', '2024-02-30T10:00:00+02:00'
+  ]) {
+    const got = lib.resolveItemDate(text);
+    assert.equal(got.dateStatus, 'unresolved', text + ' must not resolve');
+    assert.equal(got.dateResolved, null, text + ' must not carry a timestamp, got ' + got.dateResolved);
+    assert.equal(got.dateRaw, text, 'the raw label is preserved');
+    // The same validator backs caller proofs, so an impossible proof must be refused too.
+    assert.throws(() => lib.resolveItemDate(null, { dateProven: text, dateEvidence: { kind: 'operator-attested' } }), err => err.code === 'BAD_DATE_PROOF', 'proof accepted for ' + text);
+  }
+
+  // Real dates in every accepted ISO form still resolve, so the guard is not simply refusing all
+  // time-bearing input. Leap days that genuinely exist are the sharp edge in both directions.
+  const valid = [
+    ['2024-02-29', '2024-02-29T00:00:00.000Z'],
+    ['2024-02-29T12:00:00Z', '2024-02-29T12:00:00.000Z'],
+    ['2000-02-29', '2000-02-29T00:00:00.000Z'],
+    ['2024-08-23', '2024-08-23T00:00:00.000Z'],
+    ['2024-08-23T10:00:00', '2024-08-23T10:00:00.000Z'],
+    ['2024-08-23T10:00:00Z', '2024-08-23T10:00:00.000Z'],
+    ['2024-08-23T10:00:00.250Z', '2024-08-23T10:00:00.250Z'],
+    ['2024-08-23T10:00:00+02:00', '2024-08-23T08:00:00.000Z'],
+    ['2024-12-31T23:59:59Z', '2024-12-31T23:59:59.000Z']
+  ];
+  for (const [text, expected] of valid) {
+    assert.equal(lib.resolveItemDate(text).dateResolved, expected, text + ' must still resolve');
+  }
+});
+
+test('persisted caller-proven records cannot smuggle a normalized impossible date', () => {
+  // validatedDateFields reuses the ISO validator, so a receipt or manifest edited by hand or
+  // written by a third party cannot assert a day that never existed and have it reach an export.
+  for (const resolved of ['2024-02-31T00:00:00Z', '2023-02-29T12:00:00Z', '2024-04-31T00:00:00Z', '2024-08-23T25:00:00Z', '2024-08', '2024']) {
+    const forged = { dateRaw: '23 August', dateStatus: 'resolved', dateProvenance: 'caller-proven', dateResolved: resolved, dateEvidence: { kind: 'operator-attested' } };
+    assert.throws(() => lib.requireCaptureTimestamp(forged, 'timeline write'), err => err.code === 'DATE_UNRESOLVED', 'accepted forged dateResolved ' + resolved);
+    const fields = lib.receiptDateFields(forged);
+    assert.equal(fields.dateStatus, 'unresolved', 'forged dateResolved survived into a receipt: ' + resolved);
+    assert.equal(fields.dateResolved, null);
+  }
+  // A real leap-day proof still round-trips, so the check is not vacuous.
+  const honest = { dateRaw: '29 February', dateStatus: 'resolved', dateProvenance: 'caller-proven', dateResolved: '2024-02-29T12:00:00.000Z', dateEvidence: { kind: 'provider-permalink' } };
+  assert.equal(lib.requireCaptureTimestamp(honest, 'timeline write'), '2024-02-29T12:00:00.000Z');
+  assert.equal(lib.receiptDateFields(honest).dateProvenance, 'caller-proven');
+});
+
 test('forged date records are refused rather than laundered into authority', () => {
   // Every provider-* provenance is reproducible from dateRaw, so a record that claims one it
   // cannot reproduce is rejected and recomputed. Forging a date now requires forging dateRaw too.

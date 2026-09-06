@@ -236,8 +236,10 @@ const DATE_PROVENANCES = new Set([
 const EXPLICIT_YEAR_RE = /\b((?:19|20)\d{2})\b/;
 // A full calendar date is required. YYYY-MM is a valid ISO string but names a month, not a day,
 // and promoting it would assert a day the provider never published.
-const ISO_DATE_RE = /^(?:19|20)\d{2}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
-const ISO_DATE_ONLY_RE = /^(?:19|20)\d{2}-\d{2}-\d{2}$/;
+// Captured rather than merely matched, so the spelled calendar fields can be validated
+// arithmetically instead of being handed to Date.parse, which silently rolls an impossible date
+// over (2024-02-31T00:00:00Z becomes 2 March) for every time-bearing form.
+const ISO_PARTS_RE = /^((?:19|20)\d{2})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?(Z|[+-]\d{2}:?\d{2})?$/i;
 // Anything written in ISO shape must clear the strict ISO check or stay unresolved. Date.parse
 // falls back to a lenient legacy parser when strict ISO parsing fails, which rescues impossible
 // dates like 2024-02-31 as 2 March; the explicit-year path must never see them.
@@ -271,16 +273,41 @@ function pinnedInstant(text, t, alreadyUtc) {
 // Only promote text whose parsed instant expresses exactly the calendar date the text spelled
 // out. Date.parse silently normalizes impossible dates and accepts month-precision input; both
 // must stay unresolved rather than become an asserted capture timestamp.
+function isRealCalendarDate(year, month, day) {
+  if (month < 1 || month > 12 || day < 1) return false;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+}
 function resolveIsoInstant(text) {
-  if (typeof text !== 'string' || !ISO_DATE_RE.test(text)) return null;
+  if (typeof text !== 'string') return null;
+  const parts = ISO_PARTS_RE.exec(text);
+  if (!parts) return null;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, msText, zone] = parts;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  // Validate the calendar ourselves. Date.parse is strict for a bare ISO date but lenient for a
+  // date-time, so an impossible day would otherwise be normalized into a real instant and then
+  // asserted as an authoritative capture timestamp.
+  if (!isRealCalendarDate(year, month, day)) return null;
+  const hour = hourText === undefined ? 0 : Number(hourText);
+  const minute = minuteText === undefined ? 0 : Number(minuteText);
+  const second = secondText === undefined ? 0 : Number(secondText);
+  const ms = msText === undefined ? 0 : Number(msText.padEnd(3, '0'));
+  if (hour > 23 || minute > 59 || second > 59) return null;
   const t = Date.parse(text);
   if (!Number.isFinite(t)) return null;
-  // A bare ISO calendar date is UTC by specification; a date-time is local unless it names a zone.
-  const dateOnly = ISO_DATE_ONLY_RE.test(text);
-  const iso = pinnedInstant(text, t, dateOnly || EXPLICIT_ZONE_RE.test(text));
-  // A bare calendar date must round-trip byte for byte, so a value the engine silently
-  // normalized cannot become an asserted timestamp.
-  if (dateOnly && iso.slice(0, 10) !== text) return null;
+  // A bare ISO date is UTC by specification; a date-time is local unless it names a zone.
+  const dateOnly = hourText === undefined;
+  const iso = pinnedInstant(text, t, dateOnly || Boolean(zone));
+  // Without a zone the value is pinned to the fields the text spelled, so it must round-trip
+  // exactly. With a zone the instant is unambiguous and the calendar check above is the guard.
+  if (!zone) {
+    const back = new Date(iso);
+    if (back.getUTCFullYear() !== year || back.getUTCMonth() + 1 !== month || back.getUTCDate() !== day
+      || back.getUTCHours() !== hour || back.getUTCMinutes() !== minute
+      || back.getUTCSeconds() !== second || back.getUTCMilliseconds() !== ms) return null;
+  }
   return iso;
 }
 function resolveExplicitYearInstant(text, year) {
