@@ -2725,3 +2725,60 @@ test('R2-8 a latched denial is checked before the coverage exit, not bypassed by
     await browser.close();
   }
 });
+
+// --- independent review 3 counterexamples ------------------------------------------------------
+
+test('R3-1 owed work is scheduled fairly across sections, not drained section by section', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const card = (shortcode, id) => ({ shortcode, href: 'https://instacognito.com/media?id=' + id });
+  const bothSections = () => [
+    { category: 'posts', status: 'COMPLETE', items: [card('P1', 'P1'), card('P2', 'P2')] },
+    { category: 'reels', status: 'COMPLETE', items: [card('R1', 'R1')] }
+  ];
+  const failing = async () => res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } });
+  const common = { handle: 'example', output: out, categories: 'posts,reels', dnsLookup: publicDns, delayMs: 0, reportedTotal: 2 };
+
+  await lib.archiveProfile({ ...common, sections: bothSections(), fetchImpl: failing });
+  // Only the posts section is re-observed, so its ids burn a second attempt while the reel's
+  // outstanding id sits untouched on one.
+  await lib.archiveProfile({ ...common, sections: [bothSections()[0]], fetchImpl: failing });
+  const owed = await readManifest(out);
+  assert.ok(owed.failed['P1-0'] && owed.failed['P2-0'], 'both post ids must be owed');
+  assert.ok(owed.failed['reels__R1-0'], 'the reel id must be owed too');
+  assert.ok(owed.failed['P1-0'].attempts > owed.failed['reels__R1-0'].attempts, 'the posts backlog must have consumed more attempts');
+
+  const order = [];
+  await lib.archiveProfile({
+    ...common, sections: bothSections(),
+    fetchImpl: async url => { order.push(new URL(url).searchParams.get('id')); return res(); }
+  });
+  assert.equal(order[0], 'R1', 'lower-attempt owed work in a later section must not wait behind a failing earlier section, got ' + order.join(','));
+});
+
+test('R3-2 a crashed takeover claim is recovered, and a live one still admits no second writer', async () => {
+  const d = await tmp();
+  const root = await lib.safeOutputRoot(path.join(d, 'out'));
+  const paths = lib.profilePaths(root, 'example');
+  await fsp.mkdir(paths.stateDir, { recursive: true });
+  await fsp.writeFile(paths.lock, JSON.stringify({ pid: 99999999, host: os.hostname(), runId: 'dead', token: 'dead-token' }));
+  const claimPath = paths.lock + '.claim-' + fs.statSync(paths.lock).ino;
+
+  // A taker that was killed between creating its claim and releasing it. Nothing may be permanently
+  // blocked by a claim whose owner is gone.
+  await fsp.writeFile(claimPath, JSON.stringify({ pid: 99999998, host: os.hostname(), runId: 'crashed', createdAt: new Date().toISOString() }));
+  assert.equal(await lib.withLock(paths, 'recovering', async () => 'ok'), 'ok', 'an abandoned takeover claim must be recoverable');
+  assert.equal(fs.existsSync(paths.lock), false, 'and the lock must be released afterwards');
+
+  // A claim naming a live process is genuine contention and must still fail closed.
+  await fsp.writeFile(paths.lock, JSON.stringify({ pid: 99999999, host: os.hostname(), runId: 'dead2', token: 'dead-token-2' }));
+  const livePath = paths.lock + '.claim-' + fs.statSync(paths.lock).ino;
+  await fsp.writeFile(livePath, JSON.stringify({ pid: process.pid, host: os.hostname(), runId: 'live', createdAt: new Date().toISOString() }));
+  await assert.rejects(() => lib.withLock(paths, 'second', async () => {}), /lock|taking over/i, 'a live takeover claim must not admit a second writer');
+  await fsp.unlink(livePath);
+
+  // A claim from another host cannot be judged from here, so it stays fail-closed.
+  const foreignPath = paths.lock + '.claim-' + fs.statSync(paths.lock).ino;
+  await fsp.writeFile(foreignPath, JSON.stringify({ pid: 4242, host: 'somewhere-else', runId: 'foreign', createdAt: new Date().toISOString() }));
+  await assert.rejects(() => lib.withLock(paths, 'third', async () => {}), /lock|taking over/i, 'a foreign-host claim must fail closed');
+});

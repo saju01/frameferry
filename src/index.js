@@ -29,6 +29,8 @@ const DEFAULT_CHECKPOINT_EVERY_ITEMS = 25;
 const DISCOVERY_BUDGET_RATIO = 0.5;
 const MAX_AUDIT_ENTRIES = 20;
 const LOCK_TAKEOVER_MAX_ATTEMPTS = 3;
+// A claim whose owner cannot be identified at all is only recoverable once it is clearly not live.
+const LOCK_CLAIM_MAX_AGE_MS = 15 * 60 * 1000;
 // An entry carrying one of these is work that was never attempted, not a download that failed.
 // Conflating the two is what reported 1514 "failures" for 1085 genuinely outstanding ids.
 const PENDING_MARKERS = new Set(['pending fresh scan retry', 'awaiting rediscovery', 'acquisition budget reached', 'discovery budget reached', 'awaiting acquisition', 'provider deferred acquisition', 'carousel slide mapping unproven', 'time budget reached']);
@@ -180,6 +182,16 @@ async function readJson(file, fallback = null) {
   try { return JSON.parse(await fsp.readFile(file, 'utf8')); }
   catch (err) { if (err.code === 'ENOENT') return fallback; throw err; }
 }
+// A takeover claim is abandoned when it names a dead process on this host, or when it carries no
+// usable owner at all and is old enough that no live taker could still be behind it. A claim naming
+// a live pid, or one from another host, is never abandoned: it is contention, and it fails closed.
+function claimIsAbandoned(claim, stat) {
+  const ageMs = stat ? Date.now() - stat.mtimeMs : 0;
+  if (!claim || !Number.isInteger(claim.pid)) return !!stat && ageMs > LOCK_CLAIM_MAX_AGE_MS;
+  if (claim.host && claim.host !== os.hostname()) return false;
+  if (!claim.host) return ageMs > LOCK_CLAIM_MAX_AGE_MS;
+  return !isPidAlive(claim.pid);
+}
 function isPidAlive(pid) { try { process.kill(pid, 0); return true; } catch (err) { if (err && err.code === 'EPERM') return true; return false; } }
 function profilePaths(root, handle) {
   validateHandle(handle);
@@ -223,8 +235,19 @@ async function withLock(paths, runId, fn, attempt = 0) {
     try { claimFd = await fsp.open(claimPath, 'wx', 0o600); }
     catch (claimErr) {
       if (claimErr.code !== 'EEXIST') throw claimErr;
-      throw new ArchiveError('LOCKED', 'another run is already taking over this stale lock; failing closed', { lock });
+      // An empty, anonymous claim was permanent: a taker killed between creating it and releasing
+      // it blocked the handle for good. The claim now says who holds it, so an abandoned one can be
+      // told apart from a live one and recovered -- while a live or unjudgeable claim still fails
+      // closed, because recovering one of those is exactly how a second writer gets in.
+      const claim = await readJson(claimPath, null).catch(() => null);
+      const abandoned = claimIsAbandoned(claim, await fsp.stat(claimPath).catch(() => null));
+      if (!abandoned) throw new ArchiveError('LOCKED', 'another run is already taking over this stale lock; failing closed', { lock, claim: claim ? { runId: claim.runId ?? null, pid: claim.pid ?? null, host: claim.host ?? null } : null });
+      // Removing it does not itself grant the takeover: whoever wins the exclusive create below is
+      // the single holder, and every loser sees a live claim and stops.
+      await fsp.unlink(claimPath).catch(() => {});
+      return withLock(paths, runId, fn, attempt + 1);
     }
+    await claimFd.writeFile(JSON.stringify({ runId, token, pid: process.pid, host: os.hostname(), lockInode: staleStat.ino, createdAt: new Date().toISOString() }) + '\n').catch(() => {});
     try {
       const recheck = await fsp.stat(paths.lock).catch(() => null);
       if (recheck && recheck.ino === staleStat.ino) {
@@ -1775,106 +1798,118 @@ async function archiveProfile(opts = {}) {
     // The whole discovered queue reaches disk before a single item is acquired. Waiting for the
     // first checkpoint meant a crash early in acquisition left no manifest at all, and everything
     // this scan had already discovered was lost with it.
-    await checkpoint(finalSections, 'queue-settled');
+    await checkpoint(plannedSections.map(planned => planned.section), 'queue-settled');
     await writeOwner('acquiring');
     for (const planned of plannedSections) {
-      const section = planned.section;
-      if (!planned.acquirable) {
-        finalSections.push(section);
+      if (!planned.acquirable) continue;
+      planned.section.downloadedCount = 0;
+      planned.section.reusedCount = 0;
+      planned.section.failedCount = 0;
+      planned.section.pendingCount = 0;
+    }
+    // One queue across every requested section, not one per section drained in turn. Per-section
+    // draining meant a posts backlog that fails on every run could hold the shared deadline
+    // indefinitely and a reel owed far fewer attempts would never be reached at all.
+    // Owed ids first, then fewest attempts; section and discovery order only break ties, so
+    // per-section grouping no longer decides who gets budget.
+    const owedRank = key => (resumeTargets.has(key) ? 0 : 1);
+    const workQueue = [];
+    plannedSections.forEach((planned, sectionOrder) => {
+      if (!planned.acquirable) return;
+      for (const entry of planned.entries) workQueue.push({ ...entry, section: planned.section, sectionOrder });
+    });
+    workQueue.sort((a, b) =>
+      owedRank(a.key) - owedRank(b.key)
+      || priorAttempts(a.key) - priorAttempts(b.key)
+      || a.sectionOrder - b.sectionOrder
+      || a.index - b.index);
+    for (const entry of workQueue) {
+      const section = entry.section;
+      const item = entry.item;
+      const i = entry.index;
+      const failureKey = entry.key;
+      freshKeys.add(failureKey);
+      // Reuse is decided before the budget: an id with a verified receipt is already acquired,
+      // and calling it owed because the clock ran out would report completed work as missing.
+      const priorReceipt = item.stableId ? completed[item.stableId] : null;
+      if (priorReceipt && receiptResolvesItem(item, priorReceipt) && await verifyReceipt(paths, priorReceipt)) {
+        reused++;
+        section.reusedCount++;
+        delete failed[failureKey];
+        delete failed[item.stableId];
+        delete pending[failureKey];
+        delete pending[item.stableId];
+        acquiredKeys.add(failureKey);
+        if (item.stableId) acquiredKeys.add(item.stableId);
+        processed++;
+        if (processed % checkpointEveryItems === 0) await checkpoint(plannedSections.map(planned => planned.section), 'acquiring');
         continue;
       }
-      section.downloadedCount = 0;
-      section.reusedCount = 0;
-      section.failedCount = 0;
-      section.pendingCount = 0;
-      // Ids already owed are served before newly discovered ones. First-seen order meant a scan
-      // that surfaced fresh work spent the budget on it and starved the backlog run after run.
-      // sort is stable, so relative order inside each group is untouched.
-      // Owed ids first, and within them the ones that have consumed the fewest attempts. Owed-first
-      // alone still starved the backlog: an id that fails every run sorted first every run and
-      // spent the budget before anything behind it was ever tried.
-      const owedRank = key => (resumeTargets.has(key) ? 0 : 1);
-      const ordered = [...planned.entries].sort((a, b) => owedRank(a.key) - owedRank(b.key) || priorAttempts(a.key) - priorAttempts(b.key));
-      for (const entry of ordered) {
-        const item = entry.item;
-        const i = entry.index;
-        const failureKey = entry.key;
-        freshKeys.add(failureKey);
-        // Reuse is decided before the budget: an id with a verified receipt is already acquired,
-        // and calling it owed because the clock ran out would report completed work as missing.
-        const priorReceipt = item.stableId ? completed[item.stableId] : null;
-        if (priorReceipt && receiptResolvesItem(item, priorReceipt) && await verifyReceipt(paths, priorReceipt)) {
-          reused++;
-          section.reusedCount++;
-          delete failed[failureKey];
-          delete failed[item.stableId];
-          delete pending[failureKey];
-          delete pending[item.stableId];
-          acquiredKeys.add(failureKey);
-          if (item.stableId) acquiredKeys.add(item.stableId);
-          processed++;
-          if (processed % checkpointEveryItems === 0) await checkpoint([...finalSections, section], 'acquiring');
-          continue;
+      // Out of acquisition budget is work not attempted. It is pending, never a download failure.
+      if (acquisitionRemaining() <= 0) {
+        section.pendingCount++;
+        pendingCount++;
+        pending[failureKey] = sanitizeFailedItem(item, 'acquisition budget reached', i, priorAttempts(failureKey));
+        continue;
+      }
+      if (!item.href) {
+        section.failedCount++;
+        failedCount++;
+        failed[failureKey] = sanitizeFailedItem(item, 'missing media href', i, priorAttempts(failureKey) + 1);
+        continue;
+      }
+      try {
+        const result = await downloadOne(item, paths, { fetchImpl: opts.fetchImpl, maxBytes: opts.maxBytes || DEFAULT_MAX_BYTES, runId, remainingMs: Math.max(1, acquisitionRemaining()), dnsLookup: opts.dnsLookup, timeoutMs: Math.min(opts.networkTimeoutMs || DEFAULT_NETWORK_TIMEOUT_MS, Math.max(1, acquisitionRemaining())), completedMap: completed, handle });
+        completed[result.receipt.stableId] = result.receipt;
+        delete failed[failureKey];
+        delete failed[result.receipt.stableId];
+        delete pending[failureKey];
+        delete pending[result.receipt.stableId];
+        if (result.conflict) {
+          // Held, not applied: the verified receipt stands and the conflicting observation is
+          // recorded for review rather than overwriting content that still proves out.
+          conflicts[result.receipt.stableId] = { ...result.conflict, stableId: result.receipt.stableId, shortcode: item.shortcode || null, carouselIndex: item.carouselIndex ?? 0, runId };
         }
-        // Out of acquisition budget is work not attempted. It is pending, never a download failure.
-        if (acquisitionRemaining() <= 0) {
+        if (result.fetchedButReused) { reused++; section.reusedCount++; }
+        else { downloaded++; section.downloadedCount++; }
+        acquiredKeys.add(failureKey);
+        acquiredKeys.add(result.receipt.stableId);
+        processed++;
+        if (processed % checkpointEveryItems === 0) await checkpoint(plannedSections.map(planned => planned.section), 'acquiring');
+        if ((opts.delayMs ?? DEFAULT_DELAY_MS) && acquisitionRemaining() > 0) await delay(Math.min(opts.delayMs ?? DEFAULT_DELAY_MS, 5000, Math.max(1, acquisitionRemaining())));
+      } catch (err) {
+        if (err instanceof DeferredError) {
+          // The provider refused this specific item. It is fresh, so carried state no longer
+          // covers it, and without filing it here the deferral would drop it entirely.
           section.pendingCount++;
           pendingCount++;
-          pending[failureKey] = sanitizeFailedItem(item, 'acquisition budget reached', i, priorAttempts(failureKey));
-          continue;
+          pending[failureKey] = sanitizeFailedItem(item, 'provider deferred acquisition', i, priorAttempts(failureKey) + 1);
+          mergeCarried();
+          await atomicWriteJson(paths.manifest, buildManifest(plannedSections.map(planned => planned.section), 'DEFERRED', 'deferred'));
+          await writeOwner('deferred', { status: 'DEFERRED', terminal: true });
+          await writeStatus(paths, { status: 'DEFERRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, stage: 'deferred', requestedCategories: categories, mediaTypes, sections: plannedSections.map(planned => statusSectionRecord(planned.section)), downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount, pendingCount, outstandingCount: Object.keys(failed).length + Object.keys(pending).length, resume: resumeRecord(), updatedAt: new Date().toISOString() });
+          throw err;
         }
-        if (!item.href) {
-          section.failedCount++;
-          failedCount++;
-          failed[failureKey] = sanitizeFailedItem(item, 'missing media href', i, priorAttempts(failureKey) + 1);
-          continue;
-        }
-        try {
-          const result = await downloadOne(item, paths, { fetchImpl: opts.fetchImpl, maxBytes: opts.maxBytes || DEFAULT_MAX_BYTES, runId, remainingMs: Math.max(1, acquisitionRemaining()), dnsLookup: opts.dnsLookup, timeoutMs: Math.min(opts.networkTimeoutMs || DEFAULT_NETWORK_TIMEOUT_MS, Math.max(1, acquisitionRemaining())), completedMap: completed, handle });
-          completed[result.receipt.stableId] = result.receipt;
-          delete failed[failureKey];
-          delete failed[result.receipt.stableId];
-          delete pending[failureKey];
-          delete pending[result.receipt.stableId];
-          if (result.conflict) {
-            // Held, not applied: the verified receipt stands and the conflicting observation is
-            // recorded for review rather than overwriting content that still proves out.
-            conflicts[result.receipt.stableId] = { ...result.conflict, stableId: result.receipt.stableId, shortcode: item.shortcode || null, carouselIndex: item.carouselIndex ?? 0, runId };
-          }
-          if (result.fetchedButReused) { reused++; section.reusedCount++; }
-          else { downloaded++; section.downloadedCount++; }
-          acquiredKeys.add(failureKey);
-          acquiredKeys.add(result.receipt.stableId);
-          processed++;
-          if (processed % checkpointEveryItems === 0) await checkpoint([...finalSections, section], 'acquiring');
-          if ((opts.delayMs ?? DEFAULT_DELAY_MS) && acquisitionRemaining() > 0) await delay(Math.min(opts.delayMs ?? DEFAULT_DELAY_MS, 5000, Math.max(1, acquisitionRemaining())));
-        } catch (err) {
-          if (err instanceof DeferredError) {
-            // The provider refused this specific item. It is fresh, so carried state no longer
-            // covers it, and without filing it here the deferral would drop it entirely.
-            section.pendingCount++;
-            pendingCount++;
-            pending[failureKey] = sanitizeFailedItem(item, 'provider deferred acquisition', i, priorAttempts(failureKey) + 1);
-            mergeCarried();
-            await atomicWriteJson(paths.manifest, buildManifest([...finalSections, section], 'DEFERRED', 'deferred'));
-            await writeOwner('deferred', { status: 'DEFERRED', terminal: true });
-            await writeStatus(paths, { status: 'DEFERRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, stage: 'deferred', requestedCategories: categories, mediaTypes, sections: [...finalSections, section].map(statusSectionRecord), downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount, pendingCount, outstandingCount: Object.keys(failed).length + Object.keys(pending).length, resume: resumeRecord(), updatedAt: new Date().toISOString() });
-            throw err;
-          }
-          section.failedCount++;
-          failedCount++;
-          failed[failureKey] = sanitizeFailedItem(item, err.message, i, priorAttempts(failureKey) + 1);
-          processed++;
-          if (processed % checkpointEveryItems === 0) await checkpoint([...finalSections, section], 'acquiring');
-        }
+        section.failedCount++;
+        failedCount++;
+        failed[failureKey] = sanitizeFailedItem(item, err.message, i, priorAttempts(failureKey) + 1);
+        processed++;
+        if (processed % checkpointEveryItems === 0) await checkpoint(plannedSections.map(planned => planned.section), 'acquiring');
       }
-      const settled = sectionOutcomeForCompleted(section, Object.values(completed), { mode });
-      section.status = settled.status;
-      section.reason = settled.reason;
-      if (settled.uniquePostCount != null) section.uniquePostCount = settled.uniquePostCount;
-      finalSections.push(section);
-      await checkpoint(finalSections, 'section-settled');
     }
+    // Sections settle once the whole queue is drained, so each one is judged against the final
+    // completed set rather than whatever happened to be done when its own turn ended.
+    for (const planned of plannedSections) {
+      const section = planned.section;
+      if (planned.acquirable) {
+        const settled = sectionOutcomeForCompleted(section, Object.values(completed), { mode });
+        section.status = settled.status;
+        section.reason = settled.reason;
+        if (settled.uniquePostCount != null) section.uniquePostCount = settled.uniquePostCount;
+      }
+      finalSections.push(section);
+    }
+    await checkpoint(finalSections, 'sections-settled');
     mergeCarried();
     let outstandingCount = Object.keys(failed).length + Object.keys(pending).length;
     let global = finalGlobalOutcome(finalSections, failedCount, pendingCount, outstandingCount, Object.keys(conflicts).length);
