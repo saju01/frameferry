@@ -555,6 +555,31 @@ async function reconcileAgainstReceipts(paths, completed, entries, handle = null
   }
   return { retained, resolved: resolved.sort(), unverifiable: unverifiable.sort() };
 }
+// The three outcome maps answer one question each -- acquired, failed, owed -- and an id can only
+// have one answer. A live run finished with 684 ids recorded as both completed and pending, so the
+// invariant is now asserted on the way to disk rather than trusted.
+function outcomeMapOverlaps(completed, failed, pending) {
+  const completedIds = new Set(Object.keys(completed || {}));
+  const failedIds = Object.keys(failed || {});
+  const failedSet = new Set(failedIds);
+  return {
+    completedFailed: failedIds.filter(id => completedIds.has(id)).sort(),
+    completedPending: Object.keys(pending || {}).filter(id => completedIds.has(id)).sort(),
+    failedPending: Object.keys(pending || {}).filter(id => failedSet.has(id)).sort()
+  };
+}
+function assertDisjointOutcomes(completed, failed, pending, stage) {
+  const overlaps = outcomeMapOverlaps(completed, failed, pending);
+  const total = overlaps.completedFailed.length + overlaps.completedPending.length + overlaps.failedPending.length;
+  if (!total) return;
+  throw new ArchiveError('INVARIANT', 'outcome maps must be pairwise disjoint before persisting (' + stage + ')', {
+    stage,
+    completedFailed: overlaps.completedFailed.slice(0, 20),
+    completedPending: overlaps.completedPending.slice(0, 20),
+    failedPending: overlaps.failedPending.slice(0, 20),
+    overlapCount: total
+  });
+}
 // Receipt files are committed to disk before the manifest learns about them, so a crash in between
 // leaves a verifiable receipt the next run would otherwise re-download as an orphan.
 async function adoptOrphanReceipts(paths, completed, handle) {
@@ -1725,6 +1750,8 @@ async function archiveProfile(opts = {}) {
     const pending = {};
     const freshKeys = new Set();
     const acquiredKeys = new Set();
+    const sweptResolved = [];
+    const sweptDemoted = [];
     const finalSections = [];
     let downloaded = 0;
     let reused = 0;
@@ -1790,10 +1817,49 @@ async function archiveProfile(opts = {}) {
       // re-checked byte for byte. They are different claims and must not be conflated.
       cumulative: { completedCount: Object.keys(completed).length, verifiedThisRunCount: downloaded + reused, failedCount: Object.keys(view.failedOut).length, pendingCount: Object.keys(view.pendingOut).length },
       resume: resumeRecord(),
+      // What the disjointness sweep had to settle. Resolutions are routine bookkeeping; a demotion
+      // means a receipt this manifest called completed could not be proved, which is worth naming.
+      integritySweep: {
+        resolvedByReceiptCount: new Set(sweptResolved).size,
+        demotedFromCompletedCount: new Set(sweptDemoted).size,
+        demotedFromCompleted: [...new Set(sweptDemoted)].sort().slice(0, 50)
+      },
       runs: [...(prior.runs || []), { runId, mode, status: runStatus, downloadedCount: downloaded, reusedCount: reused, failedCount, pendingCount, completedCount: downloaded + reused }]
       };
     };
-    const checkpoint = async (sectionList, stageName) => { await atomicWriteJson(paths.manifest, buildManifest(sectionList, 'RUNNING', stageName)); };
+    // An id can be recorded as acquired or as owed, never both. The reuse gate can decline to
+    // resolve a slide it cannot prove, and the budget or a failed retry then files that same id as
+    // owed while its earlier receipt still stands -- which is exactly how the live run finished
+    // with 684 ids in both maps. The sweep settles each such id by evidence: a receipt that passes
+    // positive identity and byte verification means the id is acquired and stops being owed, and
+    // anything that cannot be proved stops counting as completed and stays owed. No outstanding
+    // work is ever discarded to satisfy the invariant.
+    const sweepOutcomeOverlaps = async () => {
+      const view = carriedView();
+      for (const id of new Set([...Object.keys(view.failedOut), ...Object.keys(view.pendingOut)])) {
+        const receipt = completed[id];
+        if (!receipt) continue;
+        if (receiptMatchesIdentity(receipt, id, handle) && await verifyReceipt(paths, receipt)) {
+          sweptResolved.push(id);
+          delete failed[id];
+          delete pending[id];
+          delete carriedFailed[id];
+          delete carriedPending[id];
+          acquiredKeys.add(id);
+          continue;
+        }
+        sweptDemoted.push(id);
+        delete completed[id];
+      }
+    };
+    const persistManifest = async (sectionList, runStatus, stageName) => {
+      await sweepOutcomeOverlaps();
+      const manifest = buildManifest(sectionList, runStatus, stageName);
+      assertDisjointOutcomes(manifest.completed, manifest.failed, manifest.pending, stageName);
+      await atomicWriteJson(paths.manifest, manifest);
+      return manifest;
+    };
+    const checkpoint = async (sectionList, stageName) => { await persistManifest(sectionList, 'RUNNING', stageName); };
 
     // The whole discovered queue reaches disk before a single item is acquired. Waiting for the
     // first checkpoint meant a crash early in acquisition left no manifest at all, and everything
@@ -1885,7 +1951,7 @@ async function archiveProfile(opts = {}) {
           pendingCount++;
           pending[failureKey] = sanitizeFailedItem(item, 'provider deferred acquisition', i, priorAttempts(failureKey) + 1);
           mergeCarried();
-          await atomicWriteJson(paths.manifest, buildManifest(plannedSections.map(planned => planned.section), 'DEFERRED', 'deferred'));
+          await persistManifest(plannedSections.map(planned => planned.section), 'DEFERRED', 'deferred');
           await writeOwner('deferred', { status: 'DEFERRED', terminal: true });
           await writeStatus(paths, { status: 'DEFERRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, stage: 'deferred', requestedCategories: categories, mediaTypes, sections: plannedSections.map(planned => statusSectionRecord(planned.section)), downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount, pendingCount, outstandingCount: Object.keys(failed).length + Object.keys(pending).length, resume: resumeRecord(), updatedAt: new Date().toISOString() });
           throw err;
@@ -1927,7 +1993,7 @@ async function archiveProfile(opts = {}) {
     }
     const postSection = finalSections.find(section => section.category === 'posts');
     const uniquePostCount = new Set(Object.values(completed).filter(receipt => receiptCategory(receipt) === 'posts' && receiptShortcode(receipt)).map(receipt => receiptShortcode(receipt))).size;
-    await atomicWriteJson(paths.manifest, buildManifest(finalSections, global.status, 'finished'));
+    await persistManifest(finalSections, global.status, 'finished');
     await writeOwner('finished', { status: global.status, terminal: true });
     return writeStatus(paths, {
       status: global.status,

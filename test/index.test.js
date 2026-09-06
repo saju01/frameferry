@@ -2782,3 +2782,116 @@ test('R3-2 a crashed takeover claim is recovered, and a live one still admits no
   await fsp.writeFile(foreignPath, JSON.stringify({ pid: 4242, host: 'somewhere-else', runId: 'foreign', createdAt: new Date().toISOString() }));
   await assert.rejects(() => lib.withLock(paths, 'third', async () => {}), /lock|taking over/i, 'a foreign-host claim must fail closed');
 });
+
+// --- live finding: outcome maps must be pairwise disjoint in every persisted view ---------------
+// Reproduces the shape observed on the first bounded Sydney run at 0fa0eb9: 1243 receipts written
+// before providerMediaFingerprint existed, so every carousel slide failed the reuse gate, fell
+// through to the budget check, and was filed as pending while still recorded as completed.
+
+async function stripFingerprints(out) {
+  const manifest = await readManifest(out);
+  for (const receipt of Object.values(manifest.completed)) delete receipt.providerMediaFingerprint;
+  await writeManifestRaw(out, manifest);
+  return manifest;
+}
+
+test('R4-1 a completed id is never left in pending when the budget runs out', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const slides = [
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s0' },
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s1' }
+  ];
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  await stripFingerprints(out);
+
+  const s = await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: slides, dnsLookup: publicDns, delayMs: 0,
+    maxTimeMs: 5000, acquisitionMaxTimeMs: 0, fetchImpl: async () => res()
+  });
+  const manifest = await readManifest(out);
+  const completedIds = new Set(Object.keys(manifest.completed));
+  const overlapPending = Object.keys(manifest.pending || {}).filter(id => completedIds.has(id));
+  const overlapFailed = Object.keys(manifest.failed || {}).filter(id => completedIds.has(id));
+  assert.deepEqual(overlapPending, [], 'completed ids must not also be pending');
+  assert.deepEqual(overlapFailed, [], 'completed ids must not also be failed');
+  // Non-destructive: the verified receipts are what resolves the overlap, so they must survive.
+  assert.ok(manifest.completed['CAR-0'] && manifest.completed['CAR-1'], 'verified receipts must be preserved, not dropped to force disjointness');
+  assert.equal(s.coverage.outstandingMediaCount, 0);
+});
+
+test('R4-2 a completed id is never left in failed when a fresh attempt fails', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const slides = [
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s0' },
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s1' }
+  ];
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  await stripFingerprints(out);
+
+  await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: slides, dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async () => { throw new Error('provider connection reset'); }
+  });
+  const manifest = await readManifest(out);
+  const completedIds = new Set(Object.keys(manifest.completed));
+  assert.deepEqual(Object.keys(manifest.failed || {}).filter(id => completedIds.has(id)), [], 'a failed retry must not leave the id both completed and failed');
+  assert.deepEqual(Object.keys(manifest.pending || {}).filter(id => completedIds.has(id)), []);
+  assert.ok(manifest.completed['CAR-0'] && manifest.completed['CAR-1'], 'the previously verified content still stands');
+});
+
+test('R4-3 an unverifiable receipt loses its completed claim and stays owed', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const slides = [
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s0' },
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s1' }
+  ];
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  await stripFingerprints(out);
+  // CAR-1's bytes rot, so it cannot be the thing that resolves its own outstanding entry.
+  await fsp.writeFile(path.join(out, 'media', 'example', 'CAR-1.jpg'), Buffer.from('rotted'));
+
+  await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: slides, dnsLookup: publicDns, delayMs: 0,
+    maxTimeMs: 5000, acquisitionMaxTimeMs: 0, fetchImpl: async () => res()
+  });
+  const manifest = await readManifest(out);
+  const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
+  assert.ok(outstanding['CAR-1'], 'unresolved work must be preserved, never cleared to satisfy the invariant');
+  assert.equal(manifest.completed['CAR-1'], undefined, 'and it must stop claiming to be completed');
+  assert.ok(manifest.completed['CAR-0'], 'the slide that still verifies is untouched');
+  assert.deepEqual(Object.keys(outstanding).filter(id => manifest.completed[id]), []);
+});
+
+test('R4-4 every persisted checkpoint holds pairwise disjoint outcome maps', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const mk = s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s });
+  const slides = [mk('CAR'), { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s1' }];
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  await stripFingerprints(out);
+
+  const seen = [];
+  await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 4, items: [...slides, mk('N1'), mk('N2')], dnsLookup: publicDns, delayMs: 0, checkpointEveryItems: 1,
+    fetchImpl: async url => {
+      const onDisk = await readJson(path.join(out, '.frameferry', 'example', 'manifest.json')).catch(() => null);
+      if (onDisk) seen.push(onDisk);
+      // The first slide fails its retry, so a checkpoint is written while it is both completed
+      // from the earlier run and freshly failed in this one.
+      if (url.includes('id=CAR')) throw new Error('provider connection reset');
+      return res();
+    }
+  });
+  assert.ok(seen.length >= 2, 'the run must have written checkpoints to inspect');
+  for (const manifest of seen) {
+    const completedIds = new Set(Object.keys(manifest.completed || {}));
+    const failedIds = Object.keys(manifest.failed || {});
+    const pendingIds = Object.keys(manifest.pending || {});
+    assert.deepEqual(failedIds.filter(id => completedIds.has(id)), [], 'checkpoint left completed and failed overlapping');
+    assert.deepEqual(pendingIds.filter(id => completedIds.has(id)), [], 'checkpoint left completed and pending overlapping');
+    assert.deepEqual(pendingIds.filter(id => failedIds.includes(id)), [], 'checkpoint left failed and pending overlapping');
+  }
+});
