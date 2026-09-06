@@ -8,7 +8,7 @@ const net = require('node:net');
 const { setTimeout: delay } = require('node:timers/promises');
 const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -672,6 +672,35 @@ async function getRenderedCardState(page) {
     ids: [...new Set(cards.map(card => card.querySelector('.likes-trigger[data-id], .comments-trigger[data-id], [data-id]')?.getAttribute('data-id')).filter(Boolean))]
   }));
 }
+const PAGINATION_SENTINEL_ATTR = 'data-ff-pagination-sentinel';
+// The provider creates exactly one IntersectionObserver, in `Te`, and re-creates it for every
+// rendered batch to watch the top-level card of the newest last post. Wrapping the constructor
+// after goto but before the search click means no observer can be created before the probe is
+// in place, so the marked element is always the live pagination sentinel -- no inference from
+// card markup, and correct even when that post carries no data-id at all.
+async function installPaginationSentinelProbe(page) {
+  return page.evaluate(attr => {
+    if (window.__ffPaginationSentinelProbe) return true;
+    const Native = window.IntersectionObserver;
+    if (typeof Native !== 'function') return false;
+    function Probed(callback, options) {
+      const observer = new Native(callback, options);
+      const nativeObserve = observer.observe.bind(observer);
+      observer.observe = function (target) {
+        try {
+          for (const marked of document.querySelectorAll('[' + attr + ']')) marked.removeAttribute(attr);
+          if (target && typeof target.setAttribute === 'function') target.setAttribute(attr, '1');
+        } catch { /* marking is best effort; never break the provider's own pagination */ }
+        return nativeObserve(target);
+      };
+      return observer;
+    }
+    Probed.prototype = Native.prototype;
+    window.IntersectionObserver = Probed;
+    window.__ffPaginationSentinelProbe = true;
+    return true;
+  }, PAGINATION_SENTINEL_ATTR);
+}
 async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000, settleMs = 1200, recenterEveryMs = 1000, maxRecenters = 3, targetUniqueCount = null } = {}) {
   const waitBudget = Math.max(1, Math.min(growthWaitMs, remainingTimeout(started, maxTimeMs)));
   const deadline = Date.now() + waitBudget;
@@ -683,20 +712,47 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   let lastGrowthAt = 0;
   let nextRecenterAt = 0;
   let recenterCount = 0;
-  async function recenterLastCard() {
-    const cards = page.locator('#post-container .post-card');
-    const count = await cards.count();
-    if (count === 0) return false;
-    await cards.nth(count - 1).evaluate(el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }));
+  let sentinel = null;
+  // The provider hangs its pagination IntersectionObserver (rootMargin 200px) on the TOP-LEVEL
+  // card of the last post, then appends that post's carousel slides as sibling .post-cards
+  // after it. Centering the final DOM card parks the real sentinel several card heights above
+  // the viewport, outside the observer's margin, and pagination stalls with no growth.
+  //
+  // installPaginationSentinelProbe marks whichever element the provider is actually observing,
+  // which is authoritative and needs no inference from card markup. The two heuristics below it
+  // are fail-closed fallbacks for pages where the probe was never installed (a caller driving
+  // this function directly, or an attached page navigated outside our control).
+  async function recenterPaginationSentinel() {
+    const found = await page.evaluate(attr => {
+      const scroll = el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+      const cards = [...document.querySelectorAll('#post-container .post-card')];
+      const idOf = card => card.querySelector('.likes-trigger[data-id], .comments-trigger[data-id], [data-id]')?.getAttribute('data-id') || '';
+      const observed = document.querySelector('[' + attr + ']');
+      if (observed && observed.isConnected) {
+        scroll(observed);
+        return { sentinelIndex: cards.indexOf(observed), sentinelId: idOf(observed) || null, sentinelSource: 'observed' };
+      }
+      if (!cards.length) return null;
+      let index = cards.length - 1;
+      const lastId = idOf(cards[index]);
+      // Carousel slides inherit the parent's data-id, so the first card of the trailing same-id
+      // run is that post's top-level card. Cards with no data-id at all (stories, highlight
+      // stories, zero-engagement posts) carry no identity: fall back to the last card.
+      if (lastId) while (index > 0 && idOf(cards[index - 1]) === lastId) index--;
+      scroll(cards[index]);
+      return { sentinelIndex: index, sentinelId: lastId || null, sentinelSource: lastId ? 'id-run' : 'last-card' };
+    }, PAGINATION_SENTINEL_ATTR);
+    if (!found) return false;
+    sentinel = found;
     return true;
   }
-  if (!await recenterLastCard()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0 };
+  if (!await recenterPaginationSentinel()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0, sentinelIndex: null, sentinelId: null, sentinelSource: null };
   recenterCount++;
   nextRecenterAt = Date.now() + recenterEveryMs;
   while (Date.now() < deadline && Date.now() - started < maxTimeMs) {
     const now = Date.now();
     if (now >= nextRecenterAt && recenterCount < maxRecenters) {
-      if (await recenterLastCard()) recenterCount++;
+      if (await recenterPaginationSentinel()) recenterCount++;
       nextRecenterAt = now + recenterEveryMs;
     }
     const state = await getRenderedCardState(page);
@@ -711,16 +767,16 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
       bestState = state;
       bestCount = Math.max(bestCount, state.count);
       bestIds = stateIds;
-      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount, ...sentinel };
     }
     if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
       const finalState = await getRenderedCardState(page);
-      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount, ...sentinel };
     }
     await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
   }
   const finalState = await getRenderedCardState(page);
-  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount };
+  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount, ...sentinel };
 }
 async function cleanupScrapeBrowser(page, browser) {
   if (page) await page.close().catch(() => {});
@@ -860,6 +916,9 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     else { browser = await chromium.launch({ headless: true, executablePath: browserExecutable, channel: browserChannel, timeout: remainingTimeout(started, maxTimeMs) }); page = await browser.newPage(); }
     page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
     await page.goto(PROVIDER_PHOTO_URL, { waitUntil: 'domcontentloaded', timeout: remainingTimeout(started, maxTimeMs) });
+    // Must run after navigation and before the search click: the provider only builds its
+    // pagination observer once results render, so this is the last safe moment to wrap it.
+    await installPaginationSentinelProbe(page).catch(() => false);
     await page.fill('input#search-input', handle, { timeout: remainingTimeout(started, maxTimeMs) });
     await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
     await page.waitForTimeout(Math.min(500, remainingTimeout(started, maxTimeMs)));
@@ -1212,6 +1271,8 @@ module.exports = {
   archiveProfile,
   exportProfile,
   getRenderedCardState,
+  PAGINATION_SENTINEL_ATTR,
+  installPaginationSentinelProbe,
   scrollLastCardCenterAndWaitForGrowth,
   scrapeWithPlaywright,
   extractReportedTotalFromPage,

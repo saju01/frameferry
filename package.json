@@ -1,6 +1,6 @@
 {
   "name": "frameferry",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenClaw skill and CLI for bounded, verifiable FrameFerry archives using the InstaCognito public provider.",
   "bin": {
     "frameferry": "./bin/frameferry.js"
