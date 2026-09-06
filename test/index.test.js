@@ -946,6 +946,8 @@ async function serveContinuationFixture(page, providerScript, apiHandler, extraH
 
 const jsonRoute = (body, extra = {}) => route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body), ...extra });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// The helper's fixed pause between scrolling away and re-centering the sentinel.
+const REARM_PAUSE_BUDGET_MS = 250;
 
 test('continuation grace re-arms the observed sentinel when the first trigger fires no request', async (t) => {
   let chromium;
@@ -1273,7 +1275,9 @@ test('a continuation request pending since before entry blocks grace instead of 
       assert.equal(after.continuationRequests, 0, 'the pending request predates this call');
       assert.equal(after.grew, false);
       assert.equal(after.blocked, null);
-      assert.equal(await page.evaluate(() => window.intersections), 1, 'no second trigger while a request is in flight');
+      // The opening recenter used to fire here, harmless only because this fixture needs two
+      // intersections before it fetches; an unanswered entry request now suppresses it outright.
+      assert.equal(await page.evaluate(() => window.intersections), 0, 'nothing may be triggered while the entry request is unanswered, not even the opening recenter');
       assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
       await drainContinuation(page, monitor);
     } finally {
@@ -1440,4 +1444,797 @@ test('the opening recenter waits for a continuation already pending at entry', a
   } finally {
     await browser.close();
   }
+});
+
+// --- race windows between a decision and the scroll it authorises ------------------------------
+// A guard is only as good as the instant it runs in. Each test below lets the world change in the
+// gap between a check and the pagination trigger that check permitted, and asserts the trigger
+// does not happen anyway.
+
+test('a challenge that appears during the re-arm pause stops the grace recenter', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // The re-arm scrolls fully away, pauses for the browser to deliver the leave, then centers
+    // the sentinel again. That second scroll is a real pagination trigger, and the pre-re-arm
+    // block check is already stale by the time it happens: the challenge here is rendered by the
+    // scroll-to-top itself, which is the only scroll to the document origin in the whole call.
+    const challenge = '<form id="challenge-form" style="display:none;width:320px;height:90px">verify you are human</form>';
+    const provider = 'window.armedAt = null;'
+      + 'window.addEventListener("scroll", function(){ if (window.intersections >= 1 && window.scrollY < 5 && window.armedAt === null) { window.armedAt = Date.now(); document.getElementById("challenge-form").style.display = "block"; } });'
+      // The Sydney shape: the first bounded trigger issues no request, so the call reaches grace.
+      + 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; if (window.intersections < 2) return; io.disconnect(); fetch("/api/posts", { method: "POST", body: "{}" }).then(function(r){ return r.json(); }).then(function(d){ window.appendBatch(d.count); }); }, { rootMargin: "200px" }); io.observe(window.sentinel);';
+    const seen = await serveContinuationFixture(page, provider, jsonRoute({ count: 3 }), challenge);
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const before = await lib.getRenderedCardState(page);
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 30000, growthWaitMs: 700, graceWaitMs: 4000, inFlightSettleMs: 4000, graceAttempts: 1, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const revealed = await page.evaluate(() => ({ armedAt: window.armedAt, shown: document.getElementById('challenge-form').getBoundingClientRect().height }));
+      assert.ok(revealed.armedAt, 'the fixture must have revealed the challenge during the re-arm pause');
+      assert.ok(revealed.shown > 0, 'the challenge must really be visible');
+      assert.equal(seen.api, 0, 'no continuation request may be issued after a challenge appears mid-re-arm');
+      assert.equal(await page.evaluate(() => window.intersections), 1, 'the re-arm must not complete a fresh intersection into a challenge');
+      assert.equal(after.recenterCount, 1, 'only the opening recenter may have scrolled');
+      assert.equal(after.graceAttemptsUsed, 1, 'the attempt was spent, then abandoned before triggering');
+      assert.equal(after.grew, false);
+      assert.ok(after.blocked, 'a challenge seen during the re-arm pause must be reported');
+      assert.match(after.blocked.reason, /challenge|captcha/);
+      assert.equal(after.continuationRequests, 0);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('an entry settlement that expires with the request still pending must not open the recenter', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // The provider paginates on its FIRST intersection, so the opening recenter is a trigger.
+    const provider = 'window.startContinuation = function(){ fetch("/api/posts", { method: "POST", body: "{}" }).then(function(r){ return r.json(); }).then(function(d){ window.appendBatch(d.count); }); };'
+      + 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; io.disconnect(); window.startContinuation(); }, { rootMargin: "200px" }); io.observe(window.sentinel);';
+    // Far slower than the settlement window: the request is still unanswered when it expires.
+    const seen = await serveContinuationFixture(page, provider, async route => { await sleep(3000); try { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 0 }) }); } catch { /* page may already be gone */ } });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      await page.evaluate(() => window.startContinuation());
+      await page.waitForTimeout(200);
+      assert.equal(monitor.inFlight(), 1, 'one continuation is pending before the helper is entered');
+      const before = await lib.getRenderedCardState(page);
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 30000, growthWaitMs: 400, graceWaitMs: 400, inFlightSettleMs: 400, graceAttempts: 1, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      // An elapsed settlement window is not evidence that the request is stale, and it is not
+      // permission to put a second continuation on the wire beside the first.
+      assert.equal(seen.api, 1, 'an expired settlement must not authorise a second continuation request');
+      assert.equal(monitor.inFlight(), 1, 'the original request is still pending at return');
+      assert.equal(await page.evaluate(() => window.intersections), 0, 'nothing may be scrolled while the entry request is unanswered');
+      assert.equal(after.recenterCount, 0, 'a still-pending entry request must not be raced by the opening recenter');
+      assert.equal(after.sentinelSource, 'observed', 'the sentinel is still reported, read without scrolling');
+      assert.equal(after.grew, false);
+      assert.equal(after.blocked, null, 'nothing was denied; the pending request alone is the reason');
+      assert.equal(after.graceAttemptsUsed, 0);
+      assert.equal(after.continuationRequests, 0, 'the pending request predates this call');
+      assert.ok(elapsed < 2500, 'the call returns on the expired settlement, not after the pending request; elapsed=' + elapsed);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+      await drainContinuation(page, monitor);
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a global deadline that elapses during the entry wait must not open the recenter', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const provider = 'window.startContinuation = function(){ fetch("/api/posts", { method: "POST", body: "{}" }).then(function(r){ return r.json(); }).then(function(d){ window.appendBatch(d.count); }); };'
+      + 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; io.disconnect(); window.startContinuation(); }, { rootMargin: "200px" }); io.observe(window.sentinel);';
+    // This one answers inside the settlement window and brings back nothing, so the request is
+    // settled and undenied when the window ends: the only thing left to stop a trigger is the
+    // global deadline, which the wait itself consumed.
+    const seen = await serveContinuationFixture(page, provider, async route => { await sleep(300); try { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 0 }) }); } catch { /* page may already be gone */ } });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      await page.evaluate(() => window.startContinuation());
+      await page.waitForTimeout(200);
+      assert.equal(monitor.inFlight(), 1, 'one continuation is pending before the helper is entered');
+      const before = await lib.getRenderedCardState(page);
+      const maxTimeMs = 1200;
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs, growthWaitMs: 5000, graceWaitMs: 5000, inFlightSettleMs: 5000, graceAttempts: 1, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed >= maxTimeMs - 100, 'the entry wait must have consumed the whole deadline; elapsed=' + elapsed);
+      assert.equal(seen.api, 1, 'an expired deadline must not authorise a continuation with no window left to observe it');
+      assert.equal(monitor.inFlight(), 0, 'the entry request was answered, so only the deadline can stop the trigger');
+      assert.equal(await page.evaluate(() => window.intersections), 0, 'nothing may be scrolled once the deadline is gone');
+      assert.equal(after.recenterCount, 0);
+      assert.equal(after.sentinelSource, 'observed');
+      assert.equal(after.grew, false);
+      assert.equal(after.blocked, null);
+      assert.equal(after.graceAttemptsUsed, 0);
+      assert.ok(elapsed < maxTimeMs + 2000, 'the call still returns promptly after the deadline; elapsed=' + elapsed);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+      await drainContinuation(page, monitor);
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a continuation started by the re-arm scroll-to-top is settled, not abandoned as no growth', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // Refusing to recenter over a request the re-arm pause woke is correct; concluding from that
+    // refusal that the provider has nothing left is not. The request here returns real cards, so
+    // reporting no growth would truncate the backfill with time still on the clock.
+    const provider = 'window.armedAt = null;'
+      + 'window.startContinuation = function(){ fetch("/api/posts", { method: "POST", body: "{}" }).then(function(r){ return r.json(); }).then(function(d){ window.appendBatch(d.count); }); };'
+      // The re-arm scroll-to-top is the only scroll to the document origin in the whole call.
+      + 'window.addEventListener("scroll", function(){ if (window.intersections >= 1 && window.scrollY < 5 && window.armedAt === null) { window.armedAt = Date.now(); window.startContinuation(); } });'
+      // The first bounded trigger is silent, so the call reaches grace; the observer stays
+      // connected, so any further recenter would be visible as another intersection.
+      + 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; }, { rootMargin: "200px" }); io.observe(window.sentinel);';
+    const seen = await serveContinuationFixture(page, provider, async route => { await sleep(1000); try { await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 2 }) }); } catch { /* page may already be gone */ } });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const before = await lib.getRenderedCardState(page);
+      assert.equal(before.count, 9);
+      const maxTimeMs = 30000;
+      const growthWaitMs = 700;
+      const graceWaitMs = 4000;
+      const inFlightSettleMs = 4000;
+      const started = Date.now();
+      const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs, growthWaitMs, graceWaitMs, inFlightSettleMs, graceAttempts: 1, settleMs: 300, maxRecenters: 1, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      assert.ok(await page.evaluate(() => window.armedAt), 'the fixture must have started the continuation during the re-arm pause');
+      assert.equal(after.grew, true, 'a live continuation is not a terminal boundary');
+      assert.equal(after.count, 11, 'the batch the re-arm woke must be observed, not abandoned');
+      assert.ok(after.ids.includes('PNEXT1') && after.ids.includes('PNEXT2'), 'both new cards must be reported: ' + JSON.stringify(after.ids));
+      assert.equal(monitor.inFlight(), 0, 'the settlement must not return over a still-pending request');
+      assert.equal(seen.api, 1, 'exactly one continuation: the settlement must never issue a second');
+      assert.equal(await page.evaluate(() => window.intersections), 1, 'the settlement observes only; nothing may be scrolled by it');
+      assert.equal(after.recenterCount, 1, 'only the opening recenter may have scrolled');
+      assert.equal(after.graceAttemptsUsed, 1);
+      assert.equal(after.continuationRequests, 1);
+      assert.equal(after.blocked, null);
+      // The settlement draws on the same capped budget, and the abandoned grace window is not
+      // spent, so the documented worst case is unchanged.
+      const bound = growthWaitMs + REARM_PAUSE_BUDGET_MS + inFlightSettleMs;
+      assert.ok(elapsed < bound + 2000, 'the new settlement stays bounded (' + bound + 'ms); elapsed=' + elapsed);
+      assert.ok(elapsed < maxTimeMs, 'never exceeds the global deadline; elapsed=' + elapsed);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+// --- full-backfill correctness: late profile and page-replacing DOM ----------------------------
+// Both fixtures are served entirely from page.route, like the continuation fixtures above.
+const PROFILE_FIXTURE_URL = 'https://instacognito.com/en/photo';
+
+// A provider page whose #post-container is REPLACED on each continuation, which is what the posts
+// trace recorded (22 -> 56 -> 83 -> 22 cards, every request 200).
+function pagedFixtureHtml(pages) {
+  const card = p => '<article class="post-card"><img class="post-image" data-type="' + p.type + '">'
+    + '<div class="post-content"><p>' + p.caption + '</p></div>'
+    + '<span class="likes-trigger" data-id="' + p.id + '"><span>5</span></span>'
+    + '<span class="comments-trigger" data-id="' + p.id + '"><span>1</span></span>'
+    + '<div class="post-footer"><div class="icon-group"><span>' + p.date + '</span></div></div>'
+    + '<a class="content-download-btn" href="https://instacognito.com/media?id=' + p.media + '&sig=' + Math.random().toString(36).slice(2) + '">d</a></article>';
+  return '<!doctype html><style>body{margin:0}.post-card{display:block;height:300px}</style>'
+    + '<div id="profile-section"><span class="username-text">@pagedhandle</span><div>24 posts 10k followers</div></div>'
+    + '<div id="post-container"></div>'
+    + '<script>(function(){'
+    + 'const attr = "data-ff-pagination-sentinel";'
+    + 'const Native = window.IntersectionObserver;'
+    + 'function Probed(cb, opts){ const o = new Native(cb, opts); const nat = o.observe.bind(o); o.observe = function(t){ for (const m of document.querySelectorAll("[" + attr + "]")) m.removeAttribute(attr); t.setAttribute(attr, "1"); return nat(t); }; return o; }'
+    + 'Probed.prototype = Native.prototype; window.IntersectionObserver = Probed;'
+    + 'window.pages = ' + JSON.stringify(pages) + ';'
+    + 'window.pageIndex = 0; window.intersections = 0; window.maxConcurrent = 0; window.inFlight = 0;'
+    + 'window.cardHtml = ' + card.toString() + ';'
+    + 'window.arm = function(){ const cards = document.querySelectorAll("#post-container .post-card"); if (!cards.length) return;'
+    + '  if (window.io) window.io.disconnect();'
+    + '  window.io = new IntersectionObserver(function(e){ if (!e[0].isIntersecting) return; window.intersections++; window.loadNext(); }, { rootMargin: "200px" });'
+    + '  window.io.observe(cards[cards.length - 1]); };'
+    + 'window.render = function(items){ document.getElementById("post-container").innerHTML = items.map(window.cardHtml).join(""); window.arm(); };'
+    + 'window.loadNext = function(){ if (window.pageIndex >= window.pages.length - 1) return;'
+    + '  window.inFlight++; window.maxConcurrent = Math.max(window.maxConcurrent, window.inFlight);'
+    + '  fetch("/api/posts", { method: "POST", body: "{}" }).then(function(r){ return r.json(); }).then(function(d){ window.inFlight--; window.pageIndex++; window.render(window.pages[window.pageIndex]); }); };'
+    + 'window.render(window.pages[0]);'
+    + '})();</script>';
+}
+
+function pageOfPosts(prefix, n, opts = {}) {
+  return Array.from({ length: n }, (_, i) => ({ id: prefix + (i + 1), media: prefix + (i + 1) + '-0', type: 'image', caption: 'caption ' + prefix + (i + 1), date: '2026-01-0' + ((i % 9) + 1), ...opts }));
+}
+
+test('a profile that answers after the old fixed wait is still read, with its real total', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // The readiness trace: /api/posts lands first and renders cards, /api/profile answers 1058ms
+    // after the click. The old fixed 500ms read saw cards, an empty username and no total.
+    const html = '<!doctype html><div id="profile-section"></div><div id="post-container"><article class="post-card"><span class="likes-trigger" data-id="P1"><span>1</span></span></article></div>'
+      + '<script>setTimeout(function(){ document.getElementById("profile-section").innerHTML = \'<span class="username-text">@syrn</span><div>253 posts 505.4k followers</div>\'; }, 1200);</script>';
+    const seen = { unexpected: [] };
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/en/photo') return route.fulfill({ status: 200, contentType: 'text/html', body: html });
+      if (url.pathname === '/favicon.ico') return route.fulfill({ status: 204, body: '' });
+      seen.unexpected.push(url.href);
+      return route.abort();
+    });
+    await page.goto(PROFILE_FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+
+    // What the old fixed 500ms wait produced: cards on screen, profile not yet answered.
+    await page.waitForTimeout(500);
+    const early = await lib.extractProfileFromPage(page, 'syrn');
+    assert.equal(early.reportedPostCount, null, 'the fixture must really be unready at 500ms');
+
+    const started = Date.now();
+    const ready = await lib.waitForProfileReady(page, 'syrn', { started, maxTimeMs: 30000 });
+    assert.equal(ready.ready, true, 'the bounded wait must see the late profile');
+    assert.equal(ready.matched, true, 'readiness requires the requested username, not just any profile');
+    assert.equal(ready.blocked, null);
+    const profile = await lib.extractProfileFromPage(page, 'syrn');
+    assert.equal(profile.reportedPostCount, 253, 'the real total must be read, never invented and never null');
+    assert.equal(profile.handle, 'syrn');
+    assert.ok(Date.now() - started < 30000);
+    assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a profile that never arrives stays unknown within bounds instead of faking a total', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = { unexpected: [] };
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      // A profile for a DIFFERENT handle must never be accepted as the requested one.
+      if (url.pathname === '/en/photo') return route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><div id="profile-section"><span class="username-text">@someoneelse</span><div>99 posts</div></div><div id="post-container"></div>' });
+      if (url.pathname === '/favicon.ico') return route.fulfill({ status: 204, body: '' });
+      seen.unexpected.push(url.href);
+      return route.abort();
+    });
+    await page.goto(PROFILE_FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+    const started = Date.now();
+    const ready = await lib.waitForProfileReady(page, 'syrn', { started, maxTimeMs: 30000, waitMs: 900 });
+    const elapsed = Date.now() - started;
+    assert.equal(ready.ready, false, 'a mismatched profile is not readiness');
+    assert.equal(ready.matched, false);
+    assert.equal(ready.blocked, null);
+    assert.ok(elapsed >= 800 && elapsed < 4000, 'the wait stays bounded; elapsed=' + elapsed);
+    assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a page-replacing provider retains every observed batch instead of only the last DOM', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // Page A then page B, each 12 posts, the second REPLACING the first in the DOM.
+    const pageA = pageOfPosts('A', 12);
+    const pageB = pageOfPosts('B', 12);
+    const seen = { api: 0, unexpected: [] };
+    await page.route('**/*', async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/en/photo') return route.fulfill({ status: 200, contentType: 'text/html', body: pagedFixtureHtml([pageA, pageB]) });
+      if (url.pathname === '/api/posts') { seen.api++; await sleep(300); try { return await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }); } catch { return; } }
+      if (url.pathname === '/favicon.ico') return route.fulfill({ status: 204, body: '' });
+      seen.unexpected.push(url.href);
+      return route.abort();
+    });
+    await page.goto(PROFILE_FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const started = Date.now();
+      const section = await lib.scrapeCardSection(page, { category: 'posts', mediaTypes: ['image', 'video'], reportedTotal: 24, started, maxTimeMs: 30000, maxPages: 4, continuationMonitor: monitor });
+      const finalDom = await lib.getRenderedCardState(page);
+      assert.equal(finalDom.count, 12, 'the fixture must really replace the DOM, leaving one page visible');
+      assert.equal(section.uniquePostCount, 24, 'both batches must be retained, not just the visible one');
+      assert.equal(section.itemCount, 24);
+      const ids = section.items.map(i => i.shortcode);
+      for (const p of [...pageA, ...pageB]) assert.ok(ids.includes(p.id), 'lost post ' + p.id);
+      assert.equal(ids[0], 'A1', 'the first batch must be kept, in first-seen order');
+      // Archive data is preserved verbatim, and no signed URL is ever surfaced in the record.
+      const a1 = section.items.find(i => i.shortcode === 'A1');
+      assert.equal(a1.captionTruncated, 'caption A1');
+      assert.equal(a1.dateRaw, '2026-01-01');
+      assert.equal(a1.carouselIndex, 0);
+      assert.ok(section.items.every(i => i.carouselIndex === 0), 'single-slide posts must not be renumbered by re-observation');
+      assert.equal(new Set(section.items.map(i => i.stableId)).size, 24, 'stable ids must stay unique across batches');
+      assert.equal(await page.evaluate(() => window.maxConcurrent), 1, 'continuations must stay serialized');
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('page-replacing scans keep carousel slides distinct and stay inside maxPages and the deadline', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // Page A carries one carousel post as two distinct slides; page B re-shows that same post
+    // with ROTATED signed URLs plus its third slide. The repeat must not duplicate, and the new
+    // slide must not be collapsed into it.
+    const carouselA = [
+      { id: 'CAR', media: 'CAR-0', type: 'image', caption: 'car', date: '2026-02-01' },
+      { id: 'CAR', media: 'CAR-1', type: 'image', caption: 'car', date: '2026-02-01' }
+    ];
+    const carouselB = [
+      { id: 'CAR', media: 'CAR-0', type: 'image', caption: 'car', date: '2026-02-01' },
+      { id: 'CAR', media: 'CAR-1', type: 'image', caption: 'car', date: '2026-02-01' },
+      { id: 'CAR', media: 'CAR-2', type: 'image', caption: 'car', date: '2026-02-01' }
+    ];
+    const pageA = [...carouselA, ...pageOfPosts('A', 3)];
+    const pageB = [...carouselB, ...pageOfPosts('B', 3)];
+    const pageC = pageOfPosts('C', 3);
+    const seen = { api: 0, unexpected: [] };
+    await page.route('**/*', async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === '/en/photo') return route.fulfill({ status: 200, contentType: 'text/html', body: pagedFixtureHtml([pageA, pageB, pageC, pageC]) });
+      if (url.pathname === '/api/posts') { seen.api++; await sleep(200); try { return await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }); } catch { return; } }
+      if (url.pathname === '/favicon.ico') return route.fulfill({ status: 204, body: '' });
+      seen.unexpected.push(url.href);
+      return route.abort();
+    });
+    await page.goto(PROFILE_FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const maxPages = 3;
+      const started = Date.now();
+      const section = await lib.scrapeCardSection(page, { category: 'posts', mediaTypes: ['image', 'video'], reportedTotal: 99, started, maxTimeMs: 6000, maxPages, continuationMonitor: monitor });
+      // Pages A, B and C were all observed even though only C is on screen.
+      assert.equal((await lib.getRenderedCardState(page)).count, 3, 'only the last page remains in the DOM');
+      const elapsed = Date.now() - started;
+      const car = section.items.filter(i => i.shortcode === 'CAR');
+      assert.equal(car.length, 3, 'three distinct slides, no duplicate from the repeated page: ' + JSON.stringify(car.map(c => c.href)));
+      assert.deepEqual(car.map(c => c.carouselIndex), [0, 1, 2], 'slide indices are assigned once, in first-seen order');
+      assert.equal(new Set(car.map(c => c.stableId)).size, 3, 'each slide keeps its own stable id');
+      assert.equal(section.uniquePostCount, 10, 'CAR plus A1-A3 plus B1-B3 plus C1-C3');
+      // Bounds are unchanged by the accumulation.
+      assert.equal(await page.evaluate(() => window.maxConcurrent), 1, 'no parallel continuations');
+      assert.ok(elapsed < 6000 + 2000, 'the hard deadline still ends the scan; elapsed=' + elapsed);
+      assert.ok(section.hitLimit || section.noGrowth, 'a bounded stop is reported, never silently completed');
+      assert.notEqual(section.status, 'COMPLETE_WITHOUT_BOUND');
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+// --- profile readiness is enforced, not merely awaited -----------------------------------------
+// These drive the real post-search orchestration (readiness gate, tab switch, section loop)
+// against a fully routed offline page, which is as close to end-to-end as it gets with no network.
+async function serveProfilePage(page, body, extraRoutes = {}) {
+  const seen = { api: 0, unexpected: [] };
+  await page.route('**/*', async route => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/en/photo') return route.fulfill({ status: 200, contentType: 'text/html', body });
+    if (extraRoutes[url.pathname]) { seen.api++; return extraRoutes[url.pathname](route, seen); }
+    if (url.pathname === '/favicon.ico') return route.fulfill({ status: 204, body: '' });
+    seen.unexpected.push(url.href);
+    return route.abort();
+  });
+  await page.goto(PROFILE_FIXTURE_URL, { waitUntil: 'domcontentloaded' });
+  return seen;
+}
+
+// A provider page showing SOMEONE ELSE with a small total that the visible cards already satisfy:
+// consuming it would let the section claim it had everything.
+const STALE_PROFILE_HTML = '<!doctype html>'
+  + '<div id="profile-section"><span class="username-text">@someoneelse</span><div>2 posts 10k followers</div></div>'
+  + '<div id="menu-wrapper"><div class="menu-item" data-id="POSTS">Posts</div></div>'
+  + '<div id="post-container">'
+  + '<article class="post-card"><img class="post-image" data-type="image"><span class="likes-trigger" data-id="X1"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=X1">d</a></article>'
+  + '<article class="post-card"><img class="post-image" data-type="image"><span class="likes-trigger" data-id="X2"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=X2">d</a></article>'
+  + '</div>';
+
+test('a stale mismatched profile is never consumed and no section is scraped from it', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = await serveProfilePage(page, STALE_PROFILE_HTML);
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      // The trap: 2 visible cards against @someoneelse's total of 2 would look complete.
+      const stale = await lib.extractProfileFromPage(page, 'syrn');
+      assert.equal(stale.reportedPostCount, 2, 'the fixture must really offer a satisfiable foreign total');
+
+      const started = Date.now();
+      const scan = await lib.scanReadyProfilePage(page, { handle: 'syrn', maxPages: 4, maxTimeMs: 20000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor, });
+      assert.equal(scan.profile.reportedPostCount, null, 'a foreign total must never become this handle’s total');
+      assert.equal(scan.profile.rawProfileText, null, 'no profile text may be carried from a mismatched page');
+      assert.equal(scan.profile.handle, 'syrn');
+      assert.equal(scan.sections.length, 1);
+      const posts = scan.sections[0];
+      assert.equal(posts.status, 'ACTION_REQUIRED', 'unproven readiness is action-required, never COMPLETE');
+      assert.equal(posts.itemCount, 0, 'no cards may be consumed from a profile that was never confirmed');
+      assert.deepEqual(posts.items, []);
+      assert.equal(posts.uniquePostCount, null);
+      assert.equal(posts.evidence.matchedRequestedHandle, false, 'the evidence names the actual failure');
+      assert.equal(posts.evidence.blocked, null);
+      assert.match(posts.reason, /did not render the requested profile/);
+      assert.equal(seen.api, 0, 'no continuation may be issued for an unconfirmed profile');
+      assert.ok(Date.now() - started < 20000);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('readiness stopped by a visible challenge reports BLOCKED and scrapes nothing', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // A live challenge over a page that otherwise looks scrapeable.
+    const html = '<!doctype html><form id="challenge-form" style="display:block;width:320px;height:90px">verify you are human</form>' + STALE_PROFILE_HTML.replace('<!doctype html>', '');
+    const seen = await serveProfilePage(page, html);
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const started = Date.now();
+      const scan = await lib.scanReadyProfilePage(page, { handle: 'syrn', maxPages: 4, maxTimeMs: 20000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
+      const elapsed = Date.now() - started;
+      const posts = scan.sections[0];
+      assert.equal(posts.status, 'BLOCKED', 'a challenge during readiness is blocked evidence, not a timeout');
+      assert.match(posts.reason, /challenge|captcha/);
+      assert.equal(posts.evidence.blocked.status, null, 'a DOM challenge carries no HTTP status');
+      assert.match(posts.evidence.blocked.reason, /challenge|captcha/);
+      assert.equal(posts.itemCount, 0);
+      assert.equal(scan.profile.reportedPostCount, null);
+      assert.equal(seen.api, 0, 'nothing may be triggered while a challenge is up');
+      assert.ok(elapsed < 3000, 'a challenge ends the wait at once rather than burning the budget; elapsed=' + elapsed);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a matching ready profile still scrapes its section end to end', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // The gate must not become a wall: a confirmed profile scrapes exactly as before.
+    const html = STALE_PROFILE_HTML.replace('@someoneelse', '@syrn').replace('2 posts', '2 posts');
+    const seen = await serveProfilePage(page, html);
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const started = Date.now();
+      const scan = await lib.scanReadyProfilePage(page, { handle: 'syrn', maxPages: 2, maxTimeMs: 15000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
+      const posts = scan.sections[0];
+      assert.equal(scan.profile.reportedPostCount, 2, 'a confirmed profile keeps its real total');
+      assert.equal(scan.profile.handle, 'syrn');
+      assert.equal(posts.itemCount, 2, 'the visible cards are scraped once the profile is confirmed');
+      assert.equal(posts.uniquePostCount, 2);
+      assert.deepEqual(posts.items.map(i => i.shortcode), ['X1', 'X2']);
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+// --- reliable bounded resume: overlap, pending, checkpoints, ownership, starvation -------------
+// Every case below is synthetic and offline: fetchImpl is injected, no provider is contacted, and
+// no canonical state is touched. They encode the six defects observed in the live manifests.
+
+async function readOwnerFile(out) { return readJson(path.join(out, '.frameferry', 'example', 'current-owner.json')); }
+async function writeManifestRaw(out, manifest) {
+  await fsp.writeFile(path.join(out, '.frameferry', 'example', 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+}
+
+test('a failure is cleared only by a verified matching receipt, and an unresolved one is retained', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const good = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  const bad = { shortcode: 'B', href: 'https://instacognito.com/media?id=b' };
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 2, items: [good, bad], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => url.includes('id=b') ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
+  });
+  let manifest = await readManifest(out);
+  assert.ok(manifest.completed['A-0'], 'A must have a receipt');
+  assert.ok(manifest.failed['B-0'], 'B must be a real failure');
+
+  // The observed Sydney state: an ID that really was downloaded is ALSO listed as failed, and the
+  // next scan does not rediscover it. 429 of 1514 "failures" were of exactly this shape.
+  manifest.failed['A-0'] = { stableId: 'A-0', category: 'posts', shortcode: 'A', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
+  await writeManifestRaw(out, manifest);
+
+  const other = { shortcode: 'C', href: 'https://instacognito.com/media?id=c' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 3, items: [other], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  manifest = await readManifest(out);
+  const stillFailed = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
+  assert.equal(stillFailed['A-0'], undefined, 'a failure with a verified matching receipt must be resolved, not carried forever');
+  assert.ok(stillFailed['B-0'], 'a failure with no receipt must be retained, never cleared blindly');
+  assert.ok((manifest.audit || []).some(entry => (entry.resolvedByReceipt || []).includes('A-0')), 'resolution must be auditable');
+
+  // Presence of a completed entry is not enough: the bytes must still verify.
+  manifest = await readManifest(out);
+  manifest.failed['A-0'] = { stableId: 'A-0', category: 'posts', shortcode: 'A', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
+  await writeManifestRaw(out, manifest);
+  await fsp.writeFile(path.join(out, 'media', 'example', 'A-0.jpg'), Buffer.from('corrupted'));
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 3, items: [other], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  manifest = await readManifest(out);
+  const afterCorruption = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
+  assert.ok(afterCorruption['A-0'], 'a corrupted receipt must not count as verified resolution');
+});
+
+test('an interrupted run has already persisted the progress it made, and the next run reuses it', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const items = ['A', 'B', 'C', 'D', 'E'].map(s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s }));
+  let calls = 0;
+  const midRun = [];
+  const fetchImpl = async () => {
+    calls++;
+    if (calls === 5) {
+      // What a crash at this instant would leave behind on disk.
+      const onDisk = await readJson(path.join(out, '.frameferry', 'example', 'manifest.json')).catch(() => null);
+      midRun.push(onDisk ? Object.keys(onDisk.completed || {}).length : 0);
+    }
+    return res();
+  };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 5, items, dnsLookup: publicDns, fetchImpl, delayMs: 0, checkpointEveryItems: 2 });
+  assert.ok(midRun[0] >= 2, 'progress must be checkpointed durably during the run, not only at the end; saw ' + midRun[0]);
+
+  let fetches = 0;
+  const rotated = items.map(i => ({ shortcode: i.shortcode, href: 'https://instacognito.com/media?id=' + i.shortcode + '-rotated' }));
+  const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 5, items: rotated, dnsLookup: publicDns, fetchImpl: async () => { fetches++; return res(); }, delayMs: 0 });
+  assert.equal(fetches, 0, 'a resumed run must reuse every verified receipt');
+  assert.equal(s.reusedCount, 5);
+});
+
+test('work never attempted is pending, not a download failure, at section and outcome', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const items = ['A', 'B'].map(s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s }));
+  let fetches = 0;
+  const s = await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 2, items, dnsLookup: publicDns, delayMs: 0,
+    maxTimeMs: 5000, acquisitionMaxTimeMs: 0,
+    fetchImpl: async () => { fetches++; return res(); }
+  });
+  assert.equal(fetches, 0, 'no item can be acquired once the acquisition budget is spent');
+  assert.equal(s.failedCount, 0, 'unattempted work is not a download failure');
+  assert.equal(s.pendingCount, 2, 'unattempted work must be reported as pending');
+  assert.equal(/downloads failed/.test(s.reason), false, 'the outcome must not call pending work a download failure: ' + s.reason);
+  assert.match(s.reason, /pending/i);
+  const posts = s.sections.find(section => section.category === 'posts');
+  assert.equal(posts.failedCount, 0);
+  assert.equal(posts.pendingCount, 2);
+  const manifest = await readManifest(out);
+  assert.equal(Object.keys(manifest.failed || {}).length, 0, 'the manifest must not record pending work as failures');
+  assert.equal(Object.keys(manifest.pending || {}).length, 2);
+
+  // Per-run truth and cumulative truth are different facts and must be recorded as different fields.
+  const run = manifest.runs.at(-1);
+  assert.equal(run.downloadedCount, 0);
+  assert.equal(run.pendingCount, 2);
+  assert.equal(run.failedCount, 0);
+  assert.equal(run.completedCount, 0, 'a per-run entry must hold this run\'s own count, not the cumulative total');
+  assert.equal(manifest.cumulative.completedCount, 0);
+});
+
+test('no id is ever both completed and outstanding, and carousel slides stay distinct', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const slides = [
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s0' },
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s1' },
+    { shortcode: 'SOLO', href: 'https://instacognito.com/media?id=solo' }
+  ];
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 2, items: slides, dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => url.includes('id=s1') ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
+  });
+  let manifest = await readManifest(out);
+  assert.ok(manifest.completed['CAR-0'], 'slide 0 downloaded');
+  assert.ok(manifest.failed['CAR-1'], 'slide 1 failed and stays its own distinct entry');
+  assert.equal(manifest.failed['CAR-1'].carouselIndex, 1, 'a failed slide must keep its own carousel index');
+  assert.equal(manifest.completed['CAR-0'].carouselIndex, 0);
+
+  // Inject the overlap for both a completed slide and a completed solo post, then run a scan that
+  // rediscovers neither: the invariant must hold without the ids being re-seen.
+  manifest.failed['CAR-0'] = { ...manifest.failed['CAR-1'], stableId: 'CAR-0', carouselIndex: 0, error: 'pending fresh scan retry' };
+  manifest.failed['SOLO-0'] = { stableId: 'SOLO-0', category: 'posts', shortcode: 'SOLO', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
+  await writeManifestRaw(out, manifest);
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [{ shortcode: 'NEW', href: 'https://instacognito.com/media?id=new' }], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  manifest = await readManifest(out);
+  const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
+  for (const id of Object.keys(outstanding)) {
+    assert.equal(manifest.completed[id], undefined, 'id ' + id + ' is recorded as both completed and outstanding');
+  }
+  assert.ok(outstanding['CAR-1'], 'the genuinely missing slide must survive the reconciliation');
+  assert.equal(new Set(Object.keys(manifest.completed)).size, Object.keys(manifest.completed).length);
+});
+
+test('a known total with missing items reports an exact coverage shortfall, and an unknown total says so', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const items = [{ shortcode: 'A', href: 'https://instacognito.com/media?id=a' }, { shortcode: 'B', href: 'https://instacognito.com/media?id=b' }];
+  const s = await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 5, items, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.equal(s.status, 'PARTIAL');
+  assert.ok(s.coverage, 'a partial outcome must state exactly what is missing');
+  assert.equal(s.coverage.reportedTotalKnown, true);
+  assert.equal(s.coverage.reportedTotal, 5);
+  assert.equal(s.coverage.uniquePostCount, 2);
+  assert.equal(s.coverage.missingPostCount, 3);
+  assert.equal(s.coverage.outstandingMediaCount, 0);
+
+  const d2 = await tmp();
+  const out2 = path.join(d2, 'out');
+  const s2 = await lib.archiveProfile({ handle: 'example', output: out2, items, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.equal(s2.coverage.reportedTotalKnown, false, 'an unknown total must be reported as unknown, never as satisfied');
+  assert.equal(s2.coverage.missingPostCount, null, 'an unknown total cannot yield a missing count');
+});
+
+test('a stale owner record is reconciled instead of trusted, and a live one refuses a second writer', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+
+  const owner = await readOwnerFile(out);
+  assert.equal(owner.terminal, true, 'a finished run must leave a terminal owner record, not a running claim');
+  assert.equal(owner.stage, 'finished');
+  assert.equal(lib.evaluateOwnerRecord(owner).state, 'TERMINAL');
+
+  // The observed CURRENT-OWNER.json defect: a claim that says RUNNING long after the pass ended.
+  const ownerPath = path.join(out, '.frameferry', 'example', 'current-owner.json');
+  await fsp.writeFile(ownerPath, JSON.stringify({ ...owner, runId: 'ghost', pid: 99999999, stage: 'acquiring', terminal: false, status: 'RUNNING' }, null, 2));
+  assert.equal(lib.evaluateOwnerRecord(await readOwnerFile(out)).state, 'STALE', 'a dead pid claiming to run is stale metadata, not a running owner');
+  const resumed = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.equal(resumed.status, 'COMPLETE', 'a stale claim must be reconciled, not treated as a live owner');
+  const takeover = (await readManifest(out)).audit.some(entry => entry.ownerTakeover && entry.ownerTakeover.runId === 'ghost');
+  assert.ok(takeover, 'taking over a stale claim must be auditable');
+
+  // A live claim from a different run is a second writer and must be refused outright.
+  await fsp.writeFile(ownerPath, JSON.stringify({ runId: 'live-other', pid: process.pid, host: os.hostname(), stage: 'acquiring', terminal: false, status: 'RUNNING', startedAt: new Date().toISOString() }, null, 2));
+  assert.equal(lib.evaluateOwnerRecord(await readOwnerFile(out)).state, 'ACTIVE');
+  await assert.rejects(
+    () => lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 }),
+    err => err.code === 'LOCKED_OWNER',
+    'a live owner from another run must not get a second writer'
+  );
+});
+
+test('discovery does not stop on the post total while known media are still missing', () => {
+  // The starvation: coverage was measured in unique POSTS, but the outstanding work is MEDIA.
+  // With every post already on the cached first page the scan exited immediately, so the missing
+  // carousel slides were never rediscovered and waited forever for a "fresh scan".
+  const allPostsSeen = { reportedTotal: 598, uniquePostCount: 598, resumeTargets: new Set(['P1-1', 'P2-3']), discoveredIds: new Set(['P1-0', 'P2-0']) };
+  assert.equal(lib.discoveryCoverageSatisfied(allPostsSeen), false, 'known missing media must keep discovery running');
+  assert.equal(lib.discoveryCoverageSatisfied({ ...allPostsSeen, discoveredIds: new Set(['P1-0', 'P1-1', 'P2-3']) }), true, 'once every target is covered the post total may stop discovery');
+  assert.equal(lib.discoveryCoverageSatisfied({ reportedTotal: 598, uniquePostCount: 598, resumeTargets: new Set(), discoveredIds: new Set() }), true, 'with no outstanding targets the post total is the only condition');
+  assert.equal(lib.discoveryCoverageSatisfied({ reportedTotal: 598, uniquePostCount: 12, resumeTargets: new Set(), discoveredIds: new Set() }), false, 'an unmet post total still stops nothing');
+  assert.equal(lib.discoveryCoverageSatisfied({ reportedTotal: null, uniquePostCount: 12, resumeTargets: new Set(), discoveredIds: new Set() }), false, 'an unknown total never satisfies coverage');
+});
+
+test('a resumed run targets the ids it is still missing and reports what discovery covered', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const good = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  const bad = { shortcode: 'B', href: 'https://instacognito.com/media?id=b' };
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 2, items: [good, bad], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => url.includes('id=b') ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
+  });
+  // A scan that rediscovers neither outstanding id: the run must say so rather than silently
+  // reusing whatever the first page happened to hold.
+  const s = await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [good], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.ok(s.resume, 'a resumed run must report its own resume coverage');
+  assert.equal(s.resume.targeted, 1, 'B-0 is the one outstanding id');
+  assert.equal(s.resume.rediscovered, 0);
+  assert.deepEqual(s.resume.stillMissing, ['B-0']);
+
+  const s2 = await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [good, bad], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.equal(s2.resume.targeted, 1);
+  assert.equal(s2.resume.rediscovered, 1, 'a rediscovered target must be counted as recovered');
+  assert.deepEqual(s2.resume.stillMissing, []);
+  assert.equal(s2.status, 'COMPLETE');
+});
+
+test('a mid-run checkpoint still carries outstanding work the scan has not re-seen', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const bad = { shortcode: 'B', href: 'https://instacognito.com/media?id=b' };
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 1, items: [bad], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async () => res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } })
+  });
+  assert.ok((await readManifest(out)).failed['B-0'], 'B-0 must start out outstanding');
+
+  // A later scan that never re-sees B-0. If a checkpoint wrote only this run's own maps, a crash
+  // here would erase B-0 and the next run would never know it was owed.
+  const items = ['P', 'Q', 'R', 'S'].map(s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s }));
+  let calls = 0;
+  const midRun = [];
+  const fetchImpl = async () => {
+    calls++;
+    if (calls === 3) {
+      const onDisk = await readJson(path.join(out, '.frameferry', 'example', 'manifest.json')).catch(() => null);
+      midRun.push(onDisk ? { ...(onDisk.failed || {}), ...(onDisk.pending || {}) } : {});
+    }
+    return res();
+  };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 5, items, dnsLookup: publicDns, fetchImpl, delayMs: 0, checkpointEveryItems: 2 });
+  assert.ok(midRun[0]['B-0'], 'a checkpoint must not drop outstanding work that this scan did not re-see');
+  assert.ok((await readManifest(out)).failed['B-0'], 'and it must still be owed at the end of the run');
 });
