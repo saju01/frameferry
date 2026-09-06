@@ -868,7 +868,9 @@ test('date provenance resolves only explicit-year and ISO input, never yearless 
   const explicit = lib.resolveItemDate(['views', '23 August 2024'].join('\n'));
   assert.equal(explicit.dateStatus, 'resolved');
   assert.equal(explicit.dateProvenance, 'provider-explicit-year');
-  assert.equal(new Date(explicit.dateResolved).getFullYear(), 2024);
+  // Asserted in UTC, which is what gets persisted. Reading it back with a local-time accessor is
+  // exactly the mistake that let a wrong year ship, so the whole timestamp is pinned here.
+  assert.equal(explicit.dateResolved, '2024-08-23T00:00:00.000Z');
 
   // The whole point of the contract: a label with no year stays unresolved. No year is ever
   // inferred from a neighbouring item, from scrape order, or from the wall clock.
@@ -893,21 +895,49 @@ test('date provenance resolves only explicit-year and ISO input, never yearless 
 });
 
 test('caller date proof is accepted only with evidence and fails closed otherwise', () => {
-  const proven = lib.resolveItemDate('23 August', { dateProven: '2024-08-23T10:00:00.000Z', dateEvidence: 'per-item permalink page shows 23 August 2024' });
+  const proven = lib.resolveItemDate('23 August', { dateProven: '2024-08-23T10:00:00.000Z', dateEvidence: { kind: 'provider-permalink', note: 'permalink page shows 23 August 2024' } });
   assert.equal(proven.dateStatus, 'resolved');
   assert.equal(proven.dateProvenance, 'caller-proven');
   assert.equal(proven.dateResolved, '2024-08-23T10:00:00.000Z');
   assert.equal(proven.dateRaw, '23 August', 'the raw provider label is still preserved');
-  assert.match(proven.dateEvidence, /permalink page/);
+  assert.equal(proven.dateEvidence.kind, 'provider-permalink');
+  assert.match(proven.dateEvidence.note, /permalink page/);
+  // A bare allowlisted kind is enough; free text alone is not evidence.
+  assert.deepEqual(lib.resolveItemDate(null, { dateProven: '2024-08-23', dateEvidence: 'operator-attested' }).dateEvidence, { kind: 'operator-attested', note: null });
+  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: '2024-08-23', dateEvidence: 'I checked it myself' }), err => err.code === 'BAD_DATE_PROOF' && /allowlisted|kind must be/.test(err.message));
 
   assert.throws(() => lib.resolveItemDate('23 August', { dateProven: '2024-08-23' }), err => err.code === 'BAD_DATE_PROOF' && /dateEvidence/.test(err.message));
-  assert.throws(() => lib.resolveItemDate('23 August', { dateEvidence: 'trust me' }), err => err.code === 'BAD_DATE_PROOF');
-  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: '23 August', dateEvidence: 'no year in the proof' }), err => err.code === 'BAD_DATE_PROOF' && /four-digit year/.test(err.message));
-  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: 'not a date 2024 at all!!', dateEvidence: 'unparseable' }), err => err.code === 'BAD_DATE_PROOF');
+  assert.throws(() => lib.resolveItemDate('23 August', { dateEvidence: { kind: 'operator-attested' } }), err => err.code === 'BAD_DATE_PROOF' && /dateProven/.test(err.message));
+  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: '23 August', dateEvidence: { kind: 'operator-attested' } }), err => err.code === 'BAD_DATE_PROOF' && /four-digit year/.test(err.message));
+  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: 'not a date 2024 at all!!', dateEvidence: { kind: 'operator-attested' } }), err => err.code === 'BAD_DATE_PROOF' && /complete, valid calendar date/.test(err.message));
+  // An incomplete or impossible proof is refused just like an unparseable one.
+  for (const bad of ['2024-08', '2024', 'August 2024', '2024-02-31', '31 February 2024']) {
+    assert.throws(() => lib.resolveItemDate('23 August', { dateProven: bad, dateEvidence: { kind: 'operator-attested' } }), err => err.code === 'BAD_DATE_PROOF', 'must refuse proof ' + bad);
+  }
 
   // Evidence is caller free text that lands in receipts and the exported ZIP.
-  const redacted = lib.resolveItemDate(null, { dateProven: '2024-08-23', dateEvidence: 'seen at https://instacognito.com/media?id=SIGNEDTOKEN' });
-  assert.ok(!redacted.dateEvidence.includes('SIGNEDTOKEN'), 'signed provider URLs must not survive in evidence: ' + redacted.dateEvidence);
+  // Adversarial: every equivalent spelling of a signed provider URL, plus unrelated URLs, must be
+  // gone from anything persisted. Evidence notes are caller-controlled and reach the public ZIP.
+  const leaky = [
+    'seen at https://instacognito.com/media?id=SIGNEDTOKEN',
+    'seen at https://instacognito.com:443/media?id=SIGNEDTOKEN',
+    'seen at HTTPS://INSTACOGNITO.COM/media?id=SIGNEDTOKEN',
+    'seen at https://instacognito.com/media?sig=x&id=SIGNEDTOKEN',
+    'seen at //instacognito.com/media?id=SIGNEDTOKEN',
+    'seen at https://cdn.instacognito.com/media?id=SIGNEDTOKEN',
+    'seen at https://user:pw@instacognito.com/media?id=SIGNEDTOKEN',
+    'seen at http://example.net/leak?token=SIGNEDTOKEN'
+  ];
+  for (const note of leaky) {
+    const got = lib.resolveItemDate(null, { dateProven: '2024-08-23', dateEvidence: { kind: 'provider-permalink', note } });
+    assert.ok(!got.dateEvidence.note.includes('SIGNEDTOKEN'), 'token survived sanitisation: ' + got.dateEvidence.note);
+    assert.ok(!/instacognito\.com\/media/i.test(got.dateEvidence.note), 'provider media URL survived: ' + got.dateEvidence.note);
+  }
+  // Notes are length-capped and stripped of control characters so a receipt cannot carry a payload.
+  const huge = lib.resolveItemDate(null, { dateProven: '2024-08-23', dateEvidence: { kind: 'operator-attested', note: 'x'.repeat(5000) } });
+  assert.ok(huge.dateEvidence.note.length <= 210, 'note must be capped, got ' + huge.dateEvidence.note.length);
+  const ctrl = lib.resolveItemDate(null, { dateProven: '2024-08-23', dateEvidence: { kind: 'operator-attested', note: 'a\u0000b\u001fc' } });
+  assert.equal(ctrl.dateEvidence.note, 'a b c');
 });
 
 test('legacy dateParsed input can never promote an item to resolved', () => {
@@ -1072,6 +1102,130 @@ test('pending import holds conflicts and malformed entries without discarding re
   assert.ok(reasons.includes('category-disagrees-with-stable-id'), JSON.stringify(reasons));
   assert.ok(reasons.some(r => r.includes('unsafe-stable-id')), JSON.stringify(reasons));
   for (const err of bad.errors) assert.ok(err.reference, 'the offending reference is retained on the error');
+});
+
+test('resolved dates are the calendar date the provider showed, on every host timezone', () => {
+  // Date.parse reads a zone-less label as LOCAL midnight while toISOString() renders UTC, so a
+  // host east of UTC would otherwise persist "1 January 2019" as 2018-12-31T13:00:00.000Z -- the
+  // wrong YEAR, in the field that claims to be authoritative. Asserted in a child process because
+  // TZ is read once at startup.
+  const probe = 'const l = require(' + JSON.stringify(path.join(__dirname, '..', 'src', 'index.js')) + ');'
+    + 'console.log(JSON.stringify(["1 January 2019", "January 1, 2021", "23 August 2024", "2024-08-23", "2024-08-23T10:00:00Z"].map(t => l.resolveItemDate(t).dateResolved)));';
+  const expected = ['2019-01-01T00:00:00.000Z', '2021-01-01T00:00:00.000Z', '2024-08-23T00:00:00.000Z', '2024-08-23T00:00:00.000Z', '2024-08-23T10:00:00.000Z'];
+  for (const tz of ['UTC', 'Pacific/Auckland', 'Pacific/Kiritimati', 'America/Los_Angeles', 'Asia/Kolkata']) {
+    const out = spawnSync(process.execPath, ['-e', probe], { encoding: 'utf8', env: { ...process.env, TZ: tz } });
+    assert.equal(out.status, 0, tz + ': ' + out.stderr);
+    assert.deepEqual(JSON.parse(out.stdout), expected, 'resolved dates must not shift with host timezone ' + tz);
+  }
+});
+
+test('incomplete and impossible calendar dates never become authoritative timestamps', () => {
+  // Date.parse accepts month-precision input and silently normalises impossible dates; both would
+  // assert a day the provider never published.
+  for (const text of ['2024-08', '2024', 'August 2024', 'May 2023', '2024-02-31', '2024-13-01', '31 February 2024', '30 February 2024']) {
+    const got = lib.resolveItemDate(text);
+    assert.equal(got.dateStatus, 'unresolved', text + ' must not resolve');
+    assert.equal(got.dateResolved, null, text + ' must not carry a timestamp, got ' + got.dateResolved);
+    assert.equal(got.dateRaw, text, 'the raw label is preserved');
+  }
+  // A complete, valid date still resolves, so the guard is not simply refusing everything.
+  assert.equal(lib.resolveItemDate('2024-02-29').dateResolved, '2024-02-29T00:00:00.000Z', 'a real leap day resolves');
+  assert.equal(lib.resolveItemDate('2023-02-29').dateResolved, null, 'a leap day in a non-leap year does not');
+});
+
+test('forged date records are refused rather than laundered into authority', () => {
+  // Every provider-* provenance is reproducible from dateRaw, so a record that claims one it
+  // cannot reproduce is rejected and recomputed. Forging a date now requires forging dateRaw too.
+  const forgeries = [
+    { dateRaw: '23 August', dateStatus: 'resolved', dateProvenance: 'provider-iso', dateResolved: '2024-01-01T00:00:00.000Z' },
+    { dateRaw: '2d ago', dateStatus: 'resolved', dateProvenance: 'provider-relative-label', dateResolved: '2019-01-01T00:00:00.000Z' },
+    { dateRaw: null, dateStatus: 'resolved', dateProvenance: 'none', dateResolved: '2019-01-01T00:00:00.000Z' },
+    { dateRaw: '23 August', dateStatus: 'resolved', dateProvenance: 'provider-explicit-year', dateResolved: '2024-08-23T00:00:00.000Z' },
+    // caller-proven cannot be re-derived, so it must carry well-formed allowlisted evidence.
+    { dateRaw: '23 August', dateStatus: 'resolved', dateProvenance: 'caller-proven', dateResolved: '2019-01-01T00:00:00.000Z' },
+    { dateRaw: '23 August', dateStatus: 'resolved', dateProvenance: 'caller-proven', dateResolved: '2019-01-01T00:00:00.000Z', dateEvidence: 'just trust me' },
+    { dateRaw: '23 August', dateStatus: 'resolved', dateProvenance: 'caller-proven', dateResolved: '2019-01', dateEvidence: { kind: 'operator-attested' } }
+  ];
+  for (const forged of forgeries) {
+    assert.throws(() => lib.requireCaptureTimestamp(forged, 'timeline write'), err => err.code === 'DATE_UNRESOLVED', 'forgery accepted: ' + JSON.stringify(forged));
+    const fields = lib.receiptDateFields(forged);
+    assert.equal(fields.dateStatus, 'unresolved', 'forgery survived into a receipt: ' + JSON.stringify(fields));
+    assert.equal(fields.dateResolved, null);
+  }
+  // A genuine caller-proven record still round-trips through both helpers.
+  const honest = { dateRaw: '23 August', dateStatus: 'resolved', dateProvenance: 'caller-proven', dateResolved: '2024-08-23T10:00:00.000Z', dateEvidence: { kind: 'provider-permalink', note: 'permalink page' } };
+  assert.equal(lib.requireCaptureTimestamp(honest, 'timeline write'), '2024-08-23T10:00:00.000Z');
+  assert.equal(lib.receiptDateFields(honest).dateProvenance, 'caller-proven');
+  // And a genuine provider record does too, so validation is not vacuous.
+  const real = lib.resolveItemDate('2024-08-23');
+  assert.equal(lib.requireCaptureTimestamp(real, 'timeline write'), '2024-08-23T00:00:00.000Z');
+});
+
+test('pending import preserves caller metadata and reports malformed categories', () => {
+  const shaA = 'a'.repeat(64);
+  const entry = {
+    stableId: 'P1-0', sha256: shaA, category: 'posts', shortcode: 'P1', carouselIndex: 0, mediaType: 'image',
+    captionTruncated: 'a caption', permalink: 'https://example.com/p/P1', highlightGroup: 'trip', likes: '12',
+    comments: '3', contentType: 'image/jpeg', bytes: 1234, dateRaw: '2024-08-23',
+    href: 'https://instacognito.com/media?id=SIGNEDTOKEN'
+  };
+  const ref = lib.planPendingImport([entry]).staged[0].references[0];
+  // Dedup must not be a lossy transform: everything the caller supplied comes back...
+  for (const key of ['captionTruncated', 'permalink', 'highlightGroup', 'likes', 'comments', 'contentType', 'bytes', 'dateRaw', 'mediaType', 'carouselIndex', 'shortcode']) {
+    assert.deepEqual(ref[key], entry[key], 'reference must preserve ' + key);
+  }
+  // ...except the signed provider URL, which never reaches persisted or reported JSON.
+  assert.ok(!('href' in ref), 'href must not be carried into the plan');
+  assert.ok(!JSON.stringify(lib.planPendingImport([entry])).includes('SIGNEDTOKEN'), 'no signed URL may survive anywhere in the plan');
+  // Date provenance is validated on the way through rather than echoed from the caller.
+  assert.equal(ref.dateStatus, 'resolved');
+  assert.equal(ref.dateResolved, '2024-08-23T00:00:00.000Z');
+  const echoed = lib.planPendingImport([{ ...entry, dateRaw: '23 August', dateStatus: 'resolved', dateResolved: '2024-01-01T00:00:00.000Z', dateProvenance: 'provider-iso' }]).staged[0].references[0];
+  assert.equal(echoed.dateStatus, 'unresolved', 'a forged date must not be echoed by the planner');
+
+  // An invalid or missing category is reported, never silently rewritten to posts.
+  const bad = lib.planPendingImport([
+    { stableId: 'P2-0', sha256: shaA, category: 'bogus', shortcode: 'P2' },
+    { stableId: 'P3-0', sha256: shaA, shortcode: 'P3' }
+  ]);
+  assert.equal(bad.staged.length, 0);
+  assert.equal(bad.counts.erroredReferences, 2);
+  for (const err of bad.errors) assert.ok(err.reasons.includes('invalid-category'), JSON.stringify(err.reasons));
+  assert.equal(bad.errors[0].reference.category, 'bogus', 'the offending value is retained, not coerced');
+});
+
+test('pending import accounts for array holes, refuses non-iterables, and guards known ids', () => {
+  const shaA = 'a'.repeat(64);
+  // forEach skips array holes while length still counts them, which would silently drop
+  // references and break the documented invariant.
+  const sparse = new Array(3);
+  sparse[2] = { stableId: 'P1-0', sha256: shaA, category: 'posts', shortcode: 'P1' };
+  const plan = lib.planPendingImport(sparse);
+  assert.equal(plan.counts.references, 3);
+  assert.equal(plan.counts.erroredReferences, 2, 'holes must surface as errors, not vanish');
+  assert.equal(plan.counts.references, plan.counts.stagedReferences + plan.counts.conflictedReferences + plan.counts.erroredReferences);
+
+  // A non-iterable is a caller bug, not an empty batch: returning an empty plan would read as
+  // "nothing to import" and skip real media.
+  assert.throws(() => lib.planPendingImport(42), err => err.code === 'BAD_ARGS');
+  assert.throws(() => lib.planPendingImport({ stableId: 'P1-0' }), err => err.code === 'BAD_ARGS');
+  assert.equal(lib.planPendingImport(new Set([{ stableId: 'P2-0', sha256: shaA, category: 'posts', shortcode: 'P2' }])).counts.references, 1, 'other iterables are accepted');
+  assert.equal(lib.planPendingImport(null).counts.references, 0);
+
+  // canonicalStableId is what a consumer uses as a filename or registry key, so an id arriving
+  // through `known` must clear the same guard as one arriving in the batch.
+  const traversal = lib.planPendingImport([{ stableId: 'posts__X-0', sha256: shaA, category: 'posts', shortcode: 'X' }], { known: { '../../../../etc/cron.d/evil': shaA } });
+  assert.equal(traversal.staged[0].canonicalStableId, 'posts__X-0');
+  assert.equal(traversal.staged[0].knownStableId, null, 'an unsafe known id must not be adopted');
+
+  // Bare dot segments and a leading dash are filenames too.
+  const unsafe = lib.planPendingImport([
+    { stableId: '..', sha256: shaA, category: 'posts' },
+    { stableId: '.', sha256: 'b'.repeat(64), category: 'posts' },
+    { stableId: '-lead', sha256: 'c'.repeat(64), category: 'posts' }
+  ]);
+  assert.equal(unsafe.staged.length, 0);
+  for (const err of unsafe.errors) assert.ok(err.reasons.includes('unsafe-stable-id'), JSON.stringify(err.reasons));
 });
 
 test('content-export branch retains at least the baseline test inventory plus new coverage', async () => {

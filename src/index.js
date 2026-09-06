@@ -45,9 +45,13 @@ function validateHandle(handle) {
   }
   return handle;
 }
+// Matches every spelling of a signed provider URL, not just the canonical one: scheme and host
+// are case-insensitive, an explicit port or userinfo may be present, subdomains are allowed, the
+// query may order its parameters any way, and a protocol-relative form still counts.
+const SIGNED_URL_RE = /(?:https?:)?\/\/(?:[^\s/@]*@)?(?:[a-z0-9-]+\.)*instacognito\.com(?::\d+)?\/(?:media\b[^\s"'<>]*|[^\s"'<>]*\?[^\s"'<>]*)/gi;
 function redactSignedUrls(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return text.replace(/https:\/\/instacognito\.com\/media\?id=[A-Za-z0-9._~!$&'()*+,;=:@%\/-]+/g, '[REDACTED instacognito media URL]');
+  return text.replace(SIGNED_URL_RE, '[REDACTED instacognito media URL]');
 }
 function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
 function jsonText(data) { return JSON.stringify(data, null, 2) + '\n'; }
@@ -230,12 +234,98 @@ const DATE_PROVENANCES = new Set([
   'none'                     // no date text at all
 ]);
 const EXPLICIT_YEAR_RE = /\b((?:19|20)\d{2})\b/;
-const ISO_DATE_RE = /^(?:19|20)\d{2}-\d{2}(?:-\d{2})?(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?$/;
-const RELATIVE_DATE_RE = /\bago\b|\byesterday\b|\btoday\b|\bjust now\b|\blast (?:week|month|year)\b|^\d+\s*(?:s|m|h|d|w|min|mins|hr|hrs)$/i;
+// A full calendar date is required. YYYY-MM is a valid ISO string but names a month, not a day,
+// and promoting it would assert a day the provider never published.
+const ISO_DATE_RE = /^(?:19|20)\d{2}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+const ISO_DATE_ONLY_RE = /^(?:19|20)\d{2}-\d{2}-\d{2}$/;
+// Anything written in ISO shape must clear the strict ISO check or stay unresolved. Date.parse
+// falls back to a lenient legacy parser when strict ISO parsing fails, which rescues impossible
+// dates like 2024-02-31 as 2 March; the explicit-year path must never see them.
+const ISO_SHAPED_RE = /^(?:19|20)\d{2}-\d{1,2}(?:-\d{1,2})?(?:[T ]|$)/;
+const EXPLICIT_ZONE_RE = /(?:Z|UTC|GMT|[+-]\d{2}:?\d{2})\s*$/i;
+const RELATIVE_DATE_RE = /\bago\b|\byesterday\b|\btoday\b|\bjust now\b|\blast\b|^\d+\s*(?:s|m|h|d|w|min|mins|hr|hrs|sec|secs|day|days|week|weeks|month|months|year|years)$|^\d+\s*(?:day|days|week|weeks|month|months|year|years)\b/i;
+const MONTH_NAMES = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+// Evidence for a caller-proven date is a closed vocabulary plus an optional sanitized note, not
+// free text: arbitrary caller strings are persisted into receipts and copied into the public ZIP.
+const DATE_EVIDENCE_KINDS = new Set(['provider-permalink', 'provider-listing', 'operator-attested', 'external-record']);
+const URLISH_RE = /(?:[a-z][a-z0-9+.-]*:\/\/|\bwww\.)\S+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/\S*)/gi;
+const CONTROL_CHAR_RE = new RegExp('[\\u0000-\\u001f\\u007f]+', 'g');
+const EVIDENCE_NOTE_MAX = 200;
 function cleanDateText(value) {
   if (value == null) return null;
   const text = String(value);
   return text.split('\n').map(s => s.trim()).filter(Boolean).at(-1) || text.trim() || null;
+}
+// Date.parse reads a zone-less label as LOCAL midnight while toISOString() renders UTC, so on a
+// host east of UTC "1 January 2019" would otherwise persist as 2018-12-31T13:00:00.000Z -- the
+// wrong year, in the one field that claims to be authoritative. When the text carries no zone,
+// re-read the calendar fields it actually spelled out and pin them to UTC, so the resolved value
+// is the date the provider displayed regardless of where the archive ran.
+function utcFromLocalParts(d) {
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds())).toISOString();
+}
+function pinnedInstant(text, t, alreadyUtc) {
+  const d = new Date(t);
+  return alreadyUtc ? d.toISOString() : utcFromLocalParts(d);
+}
+// Only promote text whose parsed instant expresses exactly the calendar date the text spelled
+// out. Date.parse silently normalizes impossible dates and accepts month-precision input; both
+// must stay unresolved rather than become an asserted capture timestamp.
+function resolveIsoInstant(text) {
+  if (typeof text !== 'string' || !ISO_DATE_RE.test(text)) return null;
+  const t = Date.parse(text);
+  if (!Number.isFinite(t)) return null;
+  // A bare ISO calendar date is UTC by specification; a date-time is local unless it names a zone.
+  const dateOnly = ISO_DATE_ONLY_RE.test(text);
+  const iso = pinnedInstant(text, t, dateOnly || EXPLICIT_ZONE_RE.test(text));
+  // A bare calendar date must round-trip byte for byte, so a value the engine silently
+  // normalized cannot become an asserted timestamp.
+  if (dateOnly && iso.slice(0, 10) !== text) return null;
+  return iso;
+}
+function resolveExplicitYearInstant(text, year) {
+  const t = Date.parse(text);
+  if (!Number.isFinite(t)) return null;
+  const iso = pinnedInstant(text, t, EXPLICIT_ZONE_RE.test(text));
+  const final = new Date(iso);
+  // Compare against the UTC fields of the value actually persisted, not the local ones, so the
+  // guard cannot pass while the stored string says a different year.
+  if (final.getUTCFullYear() !== Number(year)) return null;
+  // The label must actually name a day of month, and the parsed day must be that day. This
+  // rejects month-precision labels ("August 2024"), year-only labels, and dates the engine
+  // rolled over ("31 February 2024" parses to 2 March).
+  const dayTokens = (text.match(/\b\d{1,2}\b/g) || []).map(Number);
+  if (!dayTokens.includes(final.getUTCDate())) return null;
+  const lower = text.toLowerCase();
+  // If a month was named in words, it must be the month that was parsed.
+  if (MONTH_NAMES.some(name => lower.includes(name.slice(0, 3))) && !lower.includes(MONTH_NAMES[final.getUTCMonth()].slice(0, 3))) return null;
+  return iso;
+}
+function strictInstant(text) {
+  const iso = resolveIsoInstant(text);
+  if (iso) return iso;
+  if (typeof text !== 'string' || ISO_SHAPED_RE.test(text)) return null;
+  const year = text.match(EXPLICIT_YEAR_RE);
+  return year ? resolveExplicitYearInstant(text, year[1]) : null;
+}
+// Notes are optional colour on an allowlisted evidence kind, never a place to park a URL: every
+// URL-shaped token is removed outright rather than pattern-matched against one provider spelling.
+function sanitizeEvidenceNote(value) {
+  if (typeof value !== 'string') return null;
+  const stripped = redactSignedUrls(value)
+    .replace(URLISH_RE, '[url removed]')
+    .replace(CONTROL_CHAR_RE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!stripped) return null;
+  return stripped.length > EVIDENCE_NOTE_MAX ? stripped.slice(0, EVIDENCE_NOTE_MAX).trim() + '...' : stripped;
+}
+function normalizeDateEvidence(value, where = '') {
+  const source = typeof value === 'string' ? { kind: value } : (value && typeof value === 'object' && !Array.isArray(value) ? value : null);
+  if (!source) throw new ArchiveError('BAD_DATE_PROOF', 'dateEvidence must be an allowlisted kind, or { kind, note }' + where);
+  const kind = typeof source.kind === 'string' ? source.kind.trim() : '';
+  if (!DATE_EVIDENCE_KINDS.has(kind)) throw new ArchiveError('BAD_DATE_PROOF', 'dateEvidence.kind must be one of ' + [...DATE_EVIDENCE_KINDS].join(', ') + where);
+  return { kind, note: sanitizeEvidenceNote(source.note) };
 }
 function unresolvedDate(dateRaw, dateParsed, provenance) {
   return { dateRaw, dateParsed, dateResolved: null, dateStatus: 'unresolved', dateProvenance: provenance, dateEvidence: null };
@@ -250,68 +340,70 @@ function resolveItemDate(value, opts = {}) {
   const hasProof = options.dateProven != null || options.dateEvidence != null;
   if (hasProof) {
     const where = options.itemRef ? ' for ' + options.itemRef : '';
-    const evidence = typeof options.dateEvidence === 'string' ? options.dateEvidence.trim() : '';
-    if (!evidence) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven requires dateEvidence describing the per-item proof' + where);
+    if (options.dateEvidence == null) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven requires dateEvidence describing the per-item proof' + where);
     if (options.dateProven == null) throw new ArchiveError('BAD_DATE_PROOF', 'dateEvidence supplied without dateProven' + where);
+    const evidence = normalizeDateEvidence(options.dateEvidence, where);
     const proven = String(options.dateProven).trim();
-    const year = proven.match(EXPLICIT_YEAR_RE);
-    if (!year) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven must carry an explicit four-digit year' + where);
-    const t = Date.parse(proven);
-    if (!Number.isFinite(t)) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven is not a parseable timestamp' + where);
-    const iso = new Date(t).toISOString();
-    // Evidence is caller-supplied free text that lands in receipts and the exported ZIP.
-    return { dateRaw, dateParsed: iso, dateResolved: iso, dateStatus: 'resolved', dateProvenance: 'caller-proven', dateEvidence: redactSignedUrls(evidence) };
+    if (!EXPLICIT_YEAR_RE.test(proven)) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven must carry an explicit four-digit year' + where);
+    const iso = strictInstant(proven);
+    if (!iso) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven must be a complete, valid calendar date' + where);
+    return { dateRaw, dateParsed: iso, dateResolved: iso, dateStatus: 'resolved', dateProvenance: 'caller-proven', dateEvidence: evidence };
   }
   const clean = cleanDateText(value);
   if (!clean) return { dateRaw, dateParsed, dateResolved: null, dateStatus: 'unresolved', dateProvenance: 'none', dateEvidence: null };
-  if (ISO_DATE_RE.test(clean)) {
-    const t = Date.parse(clean);
-    if (Number.isFinite(t)) return { dateRaw, dateParsed, dateResolved: new Date(t).toISOString(), dateStatus: 'resolved', dateProvenance: 'provider-iso', dateEvidence: null };
-  }
+  const iso = resolveIsoInstant(clean);
+  if (iso) return { dateRaw, dateParsed, dateResolved: iso, dateStatus: 'resolved', dateProvenance: 'provider-iso', dateEvidence: null };
   const year = clean.match(EXPLICIT_YEAR_RE);
   if (year) {
-    const t = Date.parse(clean);
-    // Date.parse is lenient enough to mint a timestamp out of text like "1999 likes"; require the
-    // instant it produced to actually land in the year the label spelled out.
-    if (Number.isFinite(t) && new Date(t).getFullYear() === Number(year[1])) {
-      return { dateRaw, dateParsed, dateResolved: new Date(t).toISOString(), dateStatus: 'resolved', dateProvenance: 'provider-explicit-year', dateEvidence: null };
-    }
+    const explicit = ISO_SHAPED_RE.test(clean) ? null : resolveExplicitYearInstant(clean, year[1]);
+    if (explicit) return { dateRaw, dateParsed, dateResolved: explicit, dateStatus: 'resolved', dateProvenance: 'provider-explicit-year', dateEvidence: null };
     return unresolvedDate(dateRaw, dateParsed, 'provider-unparsed-label');
   }
   if (RELATIVE_DATE_RE.test(clean)) return unresolvedDate(dateRaw, dateParsed, 'provider-relative-label');
   return unresolvedDate(dateRaw, dateParsed, 'provider-yearless-label');
 }
-// Fail closed: anything that needs a real capture instant must refuse an unresolved item rather
-// than substitute a guess. Returns the ISO string so callers can use it directly.
-function requireCaptureTimestamp(record, context = 'operation') {
-  const status = record?.dateStatus;
-  const resolved = record?.dateResolved;
-  const ok = status === 'resolved' && typeof resolved === 'string' && ISO_DATE_RE.test(resolved) && Number.isFinite(Date.parse(resolved));
-  if (!ok) {
-    throw new ArchiveError('DATE_UNRESOLVED', context + ' requires a proven capture timestamp; date is ' + (status || 'unknown') + ' (provenance ' + (record?.dateProvenance || 'none') + ')');
-  }
-  return resolved;
-}
-// Stored fields win when they are internally consistent; otherwise recompute from dateRaw so a
-// legacy receipt written before this contract degrades to unresolved instead of to a fabricated
-// timestamp. Used at every site that surfaces a receipt, so index.json and receipts/*.json agree.
-function receiptDateFields(record) {
+// Never trust stored or caller-supplied provenance on its own. Every provider-* provenance is
+// reproducible from the raw label, so re-derive it and require the record to agree; a record
+// forged as {dateStatus:'resolved'} over a yearless dateRaw fails here. A caller-proven record
+// cannot be re-derived by definition, so it must instead carry a well-formed allowlisted
+// evidence record and a complete, valid timestamp.
+function validatedDateFields(record) {
   const status = record?.dateStatus;
   const provenance = record?.dateProvenance;
-  if (DATE_STATUSES.has(status) && DATE_PROVENANCES.has(provenance)) {
-    const resolved = record?.dateResolved;
-    const resolvedOk = typeof resolved === 'string' && ISO_DATE_RE.test(resolved) && Number.isFinite(Date.parse(resolved));
-    if (status === 'resolved' ? resolvedOk : resolved == null) {
-      return {
-        dateStatus: status,
-        dateProvenance: provenance,
-        dateResolved: status === 'resolved' ? resolved : null,
-        dateEvidence: provenance === 'caller-proven' && typeof record.dateEvidence === 'string' ? redactSignedUrls(record.dateEvidence) : null
-      };
-    }
+  if (!DATE_STATUSES.has(status) || !DATE_PROVENANCES.has(provenance)) return null;
+  const resolved = record?.dateResolved ?? null;
+  if (provenance === 'caller-proven') {
+    if (status !== 'resolved') return null;
+    const iso = resolveIsoInstant(typeof resolved === 'string' ? resolved : '');
+    if (!iso) return null;
+    let evidence;
+    try { evidence = normalizeDateEvidence(record?.dateEvidence); } catch { return null; }
+    return { dateStatus: 'resolved', dateProvenance: 'caller-proven', dateResolved: iso, dateEvidence: evidence };
   }
   const derived = resolveItemDate(record?.dateRaw ?? null);
-  return { dateStatus: derived.dateStatus, dateProvenance: derived.dateProvenance, dateResolved: derived.dateResolved, dateEvidence: derived.dateEvidence };
+  if (derived.dateStatus !== status || derived.dateProvenance !== provenance || derived.dateResolved !== resolved) return null;
+  return { dateStatus: derived.dateStatus, dateProvenance: derived.dateProvenance, dateResolved: derived.dateResolved, dateEvidence: null };
+}
+// Fail closed: anything that needs a real capture instant must refuse an unresolved item rather
+// than substitute a guess, and must not be satisfied by a record that merely claims to be
+// resolved. Returns the ISO string so callers can use it directly.
+function requireCaptureTimestamp(record, context = 'operation') {
+  const valid = validatedDateFields(record);
+  if (!valid || valid.dateStatus !== 'resolved' || !valid.dateResolved) {
+    const reported = record?.dateStatus === 'resolved' ? 'not verifiable' : (record?.dateStatus || 'unknown');
+    throw new ArchiveError('DATE_UNRESOLVED', context + ' requires a proven capture timestamp; date is ' + reported + ' (provenance ' + (record?.dateProvenance || 'none') + ')');
+  }
+  return valid.dateResolved;
+}
+// Stored fields win only when they survive validation; otherwise recompute from dateRaw so a
+// legacy receipt written before this contract, or a tampered one, degrades to unresolved rather
+// than to a fabricated timestamp. Used at every site that surfaces a receipt, so index.json and
+// receipts/*.json always agree.
+function receiptDateFields(record) {
+  const valid = validatedDateFields(record);
+  if (valid) return valid;
+  const derived = resolveItemDate(record?.dateRaw ?? null);
+  return { dateStatus: derived.dateStatus, dateProvenance: derived.dateProvenance, dateResolved: derived.dateResolved, dateEvidence: null };
 }
 function parseReportedTotal(text) {
   if (!text) return null;
@@ -381,7 +473,10 @@ function normalizeItems(rawItems, opts = {}) {
       nextIndex.set(key, carouselIndex + 1);
     }
     const dateRaw = raw.dateRaw ?? raw.dateText ?? null;
-    const resolvedDate = resolveItemDate(dateRaw, { dateProven: raw.dateProven, dateEvidence: raw.dateEvidence, itemRef: (shortcode || 'item') + '#' + items.length });
+    // Accept our own output as input: a normalized caller-proven item carries dateResolved and
+    // dateEvidence but no dateProven, and must not trip the proof validation on a round trip.
+    const provenIn = raw.dateProven ?? (raw.dateProvenance === 'caller-proven' ? raw.dateResolved : undefined);
+    const resolvedDate = resolveItemDate(dateRaw, { dateProven: provenIn, dateEvidence: raw.dateEvidence, itemRef: (shortcode || 'item') + '#' + items.length });
     const item = {
       category,
       shortcode: shortcode || null,
@@ -417,23 +512,36 @@ function normalizeItems(rawItems, opts = {}) {
 // ZIP entries from the receipt path and would otherwise emit duplicate entry names. The dedup
 // this enables is "do not re-upload bytes we already sent", not "collapse files on disk".
 const SHA256_RE = /^[0-9a-f]{64}$/;
-const STABLE_ID_RE = /^[A-Za-z0-9._-]+$/;
+// A stable ID becomes a filename downstream, so bare dot segments and a leading dash are refused
+// alongside anything outside the safe charset.
+const STABLE_ID_RE = /^(?!\.{1,2}$)(?!-)[A-Za-z0-9._-]+$/;
+const PENDING_IMPORT_DROPPED_FIELDS = new Set(['href']);
+function sanitizeReferenceValue(value) {
+  if (typeof value === 'string') return redactSignedUrls(value);
+  if (Array.isArray(value)) return value.map(sanitizeReferenceValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, sanitizeReferenceValue(inner)]));
+  }
+  return value;
+}
 const SHA_IDENTITY_RE = /(?:^|__)sha256-([0-9a-f]{64})$/;
 function pendingImportReference(entry, index) {
-  // Deliberately field-by-field rather than a spread: signed provider URLs (href) never reach
-  // persisted or reported JSON anywhere else in this codebase, and must not start here.
+  const source = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {};
+  // Preserve every field the caller supplied -- dedup must never be a lossy transform -- minus
+  // the signed provider URL, which never reaches persisted or reported JSON anywhere else. Any
+  // remaining string is redacted, since a caller may carry a signed URL in another field.
+  const preserved = Object.fromEntries(Object.entries(source)
+    .filter(([key]) => !PENDING_IMPORT_DROPPED_FIELDS.has(key))
+    .map(([key, value]) => [key, sanitizeReferenceValue(value)]));
   return {
+    ...preserved,
     sourceIndex: index,
-    stableId: String(entry?.stableId || '').trim(),
-    sha256: typeof entry?.sha256 === 'string' ? entry.sha256.trim().toLowerCase() : '',
-    category: VALID_CATEGORIES.includes(entry?.category) ? entry.category : 'posts',
-    shortcode: typeof entry?.shortcode === 'string' && entry.shortcode.trim() ? entry.shortcode.trim() : null,
-    carouselIndex: Number.isInteger(entry?.carouselIndex) ? entry.carouselIndex : 0,
-    mediaType: entry?.mediaType || 'unknown',
-    identityBasis: entry?.identityBasis || (entry?.shortcode ? 'provider-shortcode' : 'content-sha256'),
-    dateStatus: entry?.dateStatus === 'resolved' ? 'resolved' : 'unresolved',
-    dateProvenance: entry?.dateProvenance || 'none',
-    dateResolved: entry?.dateStatus === 'resolved' ? (entry.dateResolved ?? null) : null
+    stableId: String(source.stableId ?? '').trim(),
+    sha256: typeof source.sha256 === 'string' ? source.sha256.trim().toLowerCase() : '',
+    // Never coerced: an invalid category is reported as a malformed entry, not silently rewritten.
+    category: typeof source.category === 'string' ? source.category.trim() : (source.category ?? null),
+    identityBasis: source.identityBasis || (source.shortcode ? 'provider-shortcode' : 'content-sha256'),
+    ...receiptDateFields(source)
   };
 }
 function knownBySha(known) {
@@ -442,7 +550,9 @@ function knownBySha(known) {
   const bySha = new Map();
   for (const [stableId, value] of pairs) {
     const sha = typeof value === 'string' ? value.trim().toLowerCase() : (typeof value?.sha256 === 'string' ? value.sha256.trim().toLowerCase() : '');
-    if (!SHA256_RE.test(sha)) continue;
+    // The key becomes canonicalStableId, which a consumer uses as a filename or registry key,
+    // so it must clear the same guard as an in-batch id rather than being trusted.
+    if (!SHA256_RE.test(sha) || !STABLE_ID_RE.test(String(stableId))) continue;
     byStableId.set(String(stableId), sha);
     if (!bySha.has(sha)) bySha.set(sha, String(stableId));
   }
@@ -463,7 +573,14 @@ function chooseCanonical(references, knownStableId) {
 function planPendingImport(entries, opts = {}) {
   const options = (opts && typeof opts === 'object' && !Array.isArray(opts)) ? opts : {};
   const known = knownBySha(options.known);
-  const list = Array.isArray(entries) ? entries : [];
+  // Array holes would be skipped by forEach while still counting toward length, breaking the
+  // reference invariant; Array.from materialises them as undefined so they surface as errors.
+  // A non-iterable is a caller bug, not an empty batch.
+  let list;
+  if (entries == null) list = [];
+  else if (Array.isArray(entries)) list = Array.from(entries);
+  else if (typeof entries[Symbol.iterator] === 'function') list = [...entries];
+  else throw new ArchiveError('BAD_ARGS', 'planPendingImport entries must be an array or iterable');
   const errors = [];
   const accepted = [];
   // Errors are removed before grouping so a malformed entry can never masquerade as a conflict.
@@ -479,6 +596,7 @@ function planPendingImport(entries, opts = {}) {
     // with no valid category prefix are legacy post ids and are left alone.
     const prefix = ref.stableId.includes('__') ? ref.stableId.slice(0, ref.stableId.indexOf('__')) : null;
     if (prefix && VALID_CATEGORIES.includes(prefix) && prefix !== ref.category) reasons.push('category-disagrees-with-stable-id');
+    if (!VALID_CATEGORIES.includes(ref.category)) reasons.push('invalid-category');
     if (reasons.length) errors.push({ sourceIndex: index, reasons, reference: ref });
     else accepted.push(ref);
   });
@@ -987,7 +1105,11 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
       scroll(cards[index]);
       return { sentinelIndex: index, sentinelId: lastId || null, sentinelSource: lastId ? 'id-run' : 'last-card' };
     }, PAGINATION_SENTINEL_ATTR);
-    if (!found) return false;
+    if (!found) {
+      // Do not keep reporting a sentinel from an earlier iteration that no longer resolves.
+      sentinel = null;
+      return false;
+    }
     sentinel = found;
     return true;
   }

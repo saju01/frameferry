@@ -8,6 +8,12 @@
 - Add `requireCaptureTimestamp`, which fails closed rather than letting an unresolved date reach anything that needs a real capture instant.
 - Add `planPendingImport`, a pure advisory helper that groups byte-identical media by SHA-256 before a pending import so identical bytes are registered once, while preserving every source reference, category, and stable ID, reporting truthful unique-byte versus reference counts, and holding disputed identities and malformed entries instead of discarding them.
 - `parseDateText` and `dateParsed` are unchanged, so existing callers and receipts written by earlier versions keep working; legacy receipts recompute provenance from `dateRaw` and degrade to unresolved rather than to a fabricated timestamp.
+- Pin resolved dates to UTC from the calendar fields the label spelled. `Date.parse` reads a zone-less label as local midnight while ISO output renders UTC, so on a host east of UTC `1 January 2019` would have been stored as `2018-12-31T13:00:00.000Z` -- the wrong year in the field that claims to be authoritative. `dateResolved` is now identical on every host timezone.
+- Refuse incomplete and impossible dates: `2024-08`, `2024`, `August 2024`, `2024-02-31`, and `31 February 2024` stay unresolved instead of being rescued into an invented day by lenient parsing.
+- Do not trust stored date provenance. Every `provider-*` claim is re-derived from `dateRaw` and must match, and `caller-proven` must carry well-formed allowlisted evidence, so a hand-edited or third-party-written record cannot launder a forged timestamp through `requireCaptureTimestamp` or into an exported ZIP.
+- Make date evidence a closed vocabulary (`{ kind, note }`) instead of free text, with every URL-shaped token stripped, control characters removed, and the note length-capped before it is persisted or exported.
+- Harden signed-provider-URL redaction to cover case variants, explicit ports, userinfo, subdomains, protocol-relative forms, and any query parameter order.
+- `planPendingImport` now preserves every field a caller supplied on each reference, reports invalid or missing categories instead of coercing them to `posts`, validates stable IDs arriving through `known`, rejects bare dot segments and leading dashes, surfaces array holes as errors, and raises `BAD_ARGS` for a non-iterable batch.
 
 ## 0.2.0 - 2026-09-05
 
