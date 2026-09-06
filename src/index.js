@@ -755,7 +755,16 @@ function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUES
 async function detectContinuationDenial(page, continuationMonitor) {
   const denial = typeof continuationMonitor?.denial === 'function' ? continuationMonitor.denial() : null;
   if (denial) return denial;
-  const challenged = await page.locator(CHALLENGE_SELECTOR).first().isVisible().catch(() => false);
+  // CHALLENGE_SELECTOR is a selector list, so .first() is the first DOM match of ANY branch: a
+  // hidden .g-recaptcha sitting above a visible #challenge-form would mask a live challenge.
+  // Ask whether ANY match is visible, in one round trip, and fail open to "not blocked" if the
+  // page cannot be evaluated at all.
+  const challenged = await page.locator(CHALLENGE_SELECTOR).evaluateAll(els => els.some(el => {
+    const style = el.ownerDocument.defaultView.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  })).catch(() => false);
   if (challenged) return { reason: 'provider challenge or captcha is visible', status: null, retryAt: null };
   return null;
 }
@@ -773,11 +782,24 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   let waitedMs = 0;
   let graceAttemptsUsed = 0;
   let blocked = null;
-  let sentinel = null;
+  let settlementsUsed = 0;
+  // One settlement extension before grace plus one per grace attempt, so the worst case stays
+  // growthWaitMs + inFlightSettleMs + graceAttempts * (graceWaitMs + inFlightSettleMs), and every
+  // one of those windows is still clamped by remainingTimeout(started, maxTimeMs).
+  const maxSettlements = graceAttempts + 1;
+  let sentinel = { sentinelIndex: null, sentinelId: null, sentinelSource: null };
   const monitorCount = () => (typeof continuationMonitor?.count === 'function' ? continuationMonitor.count() : 0);
+  const latchedDenial = () => (typeof continuationMonitor?.denial === 'function' ? continuationMonitor.denial() : null);
   const requestsBefore = monitorCount();
   const continuationRequests = () => monitorCount() - requestsBefore;
-  const decorate = state => ({ ...state, grew, sawLoading, waitedMs, recenterCount, ...sentinel, graceAttemptsUsed, continuationRequests: continuationRequests(), blocked });
+  const inFlight = () => (typeof continuationMonitor?.inFlight === 'function' ? continuationMonitor.inFlight() : 0);
+  // A denial recorded at any point in this call has to survive EVERY return path, including the
+  // ones that also grew: a batch can render while the next continuation is refused, and dropping
+  // the denial there would let the caller trigger again into a provider that already said no.
+  const decorate = state => {
+    if (!blocked) blocked = latchedDenial();
+    return { ...state, grew, sawLoading, waitedMs, recenterCount, ...sentinel, graceAttemptsUsed, continuationRequests: continuationRequests(), blocked };
+  };
   // The provider hangs its pagination IntersectionObserver (rootMargin 200px) on the TOP-LEVEL
   // card of the last post, then appends that post's carousel slides as sibling .post-cards
   // after it. Centering the final DOM card parks the real sentinel several card heights above
@@ -867,7 +889,21 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
     waitedMs += windowBudget;
     return null;
   }
-  if (!await recenterPaginationSentinel()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0, sentinelIndex: null, sentinelId: null, sentinelSource: null, graceAttemptsUsed: 0, continuationRequests: continuationRequests(), blocked: null };
+  // Settlement, never a retry: a continuation request that is still in flight has not had its
+  // chance to render yet, so extend the wait rather than declaring a boundary. It triggers
+  // nothing new and never spends a grace attempt, and the maxSettlements cap keeps the total
+  // bounded whether the pending request predates this call or was issued by a grace re-arm.
+  async function settleInFlightRequest() {
+    if (settlementsUsed >= maxSettlements || inFlight() === 0) return null;
+    settlementsUsed++;
+    return runWaitWindow(inFlightSettleMs);
+  }
+  // Never trigger into a denial. The opening recenter is itself a pagination trigger and the
+  // monitor's denial latch outlives a single call, so a 429 recorded by an earlier page
+  // iteration has to stop this one before anything is scrolled.
+  blocked = await detectContinuationDenial(page, continuationMonitor);
+  if (blocked) return decorate(beforeState);
+  if (!await recenterPaginationSentinel()) return decorate(beforeState);
   recenterCount++;
   const settled = await runWaitWindow(growthWaitMs);
   if (settled) return settled;
@@ -880,24 +916,23 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   blocked = await detectContinuationDenial(page, continuationMonitor);
   if (blocked) return decorate(await getRenderedCardState(page));
 
-  // Settlement, not a retry: a continuation request that is still in flight has not had its
-  // chance to render yet. This happens at most once and never spends a grace attempt.
-  if (typeof continuationMonitor?.inFlight === 'function' && continuationMonitor.inFlight() > 0) {
-    const extended = await runWaitWindow(inFlightSettleMs);
-    if (extended) return extended;
-    if (grew) return decorate(await getRenderedCardState(page));
-    blocked = await detectContinuationDenial(page, continuationMonitor);
-    if (blocked) return decorate(await getRenderedCardState(page));
-  }
+  const extended = await settleInFlightRequest();
+  if (extended) return extended;
+  if (grew) return decorate(await getRenderedCardState(page));
+  blocked = await detectContinuationDenial(page, continuationMonitor);
+  if (blocked) return decorate(await getRenderedCardState(page));
 
   // Grace is deliberately narrow: only an authoritative observed sentinel that is still
-  // connected, only when the monitor saw no continuation request at all in this call (a request
-  // that fired and produced no cards is a real boundary), and only inside the global deadline.
+  // connected, only when the monitor saw no continuation request at all in this call AND none is
+  // still pending (a request that fired and produced no cards is a real boundary, and one that
+  // is still running must be settled, not raced by a second trigger), and only inside the
+  // global deadline.
   while (
     graceAttemptsUsed < graceAttempts
-    && sentinel?.sentinelSource === 'observed'
+    && sentinel.sentinelSource === 'observed'
     && continuationMonitor
     && continuationRequests() === 0
+    && inFlight() === 0
     && remainingTimeout(started, maxTimeMs) > MIN_GRACE_WINDOW_MS
   ) {
     graceAttemptsUsed++;
@@ -905,6 +940,12 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
     recenterCount++;
     const regrew = await runWaitWindow(graceWaitMs);
     if (regrew) return regrew;
+    if (grew) break;
+    // A request the re-arm just issued deserves the same bounded settlement as one that was
+    // already running; without it the helper would report a boundary while its own trigger is
+    // still in flight.
+    const graceExtended = await settleInFlightRequest();
+    if (graceExtended) return graceExtended;
     if (grew) break;
     blocked = await detectContinuationDenial(page, continuationMonitor);
     if (blocked) break;
@@ -1002,8 +1043,10 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
     const after = await scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs, targetUniqueCount: reportedTotal, continuationMonitor });
     if (Date.now() - started >= maxTimeMs) { hitLimit = true; break; }
     // A provider denial is a bounded stop, not an exhausted section: report PARTIAL, not a
-    // no-growth boundary that would look like the profile has nothing more to give.
-    if (after.blocked) hitLimit = true;
+    // no-growth boundary that would look like the profile has nothing more to give. It ends the
+    // section immediately even when this window also grew, so the next iteration cannot trigger
+    // again into a provider that has already refused.
+    if (after.blocked) { hitLimit = true; break; }
     if (!after.grew) { noGrowth = true; break; }
     exhaustedPageBudget = i === maxPages - 1;
   }
