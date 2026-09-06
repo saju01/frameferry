@@ -521,8 +521,12 @@ function partitionPriorOutcomes(prior) {
   const failed = {};
   const pending = { ...(prior?.pending || {}) };
   for (const [id, entry] of Object.entries(prior?.failed || {})) {
-    if (isPendingEntry(entry)) pending[id] = entry;
-    else failed[id] = entry;
+    if (isPendingEntry(entry)) { pending[id] = entry; continue; }
+    failed[id] = entry;
+    // An older writer could record the same id in both maps. It is one piece of outstanding work
+    // either way, so it is normalized to the failure record, which carries the real cause, rather
+    // than being returned twice and counted twice downstream.
+    delete pending[id];
   }
   return { failed, pending };
 }
@@ -1755,8 +1759,29 @@ async function archiveProfile(opts = {}) {
     const finalSections = [];
     let downloaded = 0;
     let reused = 0;
-    let failedCount = 0;
-    let pendingCount = 0;
+    // Per-run outcome counts are derived from these sets rather than tallied as the loop goes, so
+    // the integrity sweep removing an entry cannot leave a count describing a state that no longer
+    // exists. A live run settled PARTIAL on two pending ids the sweep had already resolved.
+    const runFailed = new Set();
+    const runPending = new Set();
+    const sectionCounters = new Map();
+    const counterFor = section => {
+      if (!sectionCounters.has(section)) sectionCounters.set(section, { failed: new Set(), pending: new Set() });
+      return sectionCounters.get(section);
+    };
+    const failedCountNow = () => runFailed.size;
+    const pendingCountNow = () => runPending.size;
+    const forgetOutcome = id => {
+      runFailed.delete(id);
+      runPending.delete(id);
+      for (const counter of sectionCounters.values()) { counter.failed.delete(id); counter.pending.delete(id); }
+    };
+    const syncSectionCounts = () => {
+      for (const [section, counter] of sectionCounters) {
+        section.failedCount = counter.failed.size;
+        section.pendingCount = counter.pending.size;
+      }
+    };
     let processed = 0;
 
     // Prior state that this scan did not surface again. Retained rather than dropped: a real
@@ -1824,7 +1849,7 @@ async function archiveProfile(opts = {}) {
         demotedFromCompletedCount: new Set(sweptDemoted).size,
         demotedFromCompleted: [...new Set(sweptDemoted)].sort().slice(0, 50)
       },
-      runs: [...(prior.runs || []), { runId, mode, status: runStatus, downloadedCount: downloaded, reusedCount: reused, failedCount, pendingCount, completedCount: downloaded + reused }]
+      runs: [...(prior.runs || []), { runId, mode, status: runStatus, downloadedCount: downloaded, reusedCount: reused, failedCount: failedCountNow(), pendingCount: pendingCountNow(), completedCount: downloaded + reused }]
       };
     };
     // An id can be recorded as acquired or as owed, never both. The reuse gate can decline to
@@ -1845,15 +1870,25 @@ async function archiveProfile(opts = {}) {
           delete pending[id];
           delete carriedFailed[id];
           delete carriedPending[id];
+          forgetOutcome(id);
           acquiredKeys.add(id);
           continue;
         }
         sweptDemoted.push(id);
         delete completed[id];
       }
+      // An id that reached both maps is still one piece of outstanding work. Keep the failure,
+      // which carries the actual cause, and drop the duplicate rather than failing the run closed.
+      for (const id of Object.keys(pending)) {
+        if (!failed[id]) continue;
+        delete pending[id];
+        runPending.delete(id);
+        for (const counter of sectionCounters.values()) counter.pending.delete(id);
+      }
     };
     const persistManifest = async (sectionList, runStatus, stageName) => {
       await sweepOutcomeOverlaps();
+      syncSectionCounts();
       const manifest = buildManifest(sectionList, runStatus, stageName);
       assertDisjointOutcomes(manifest.completed, manifest.failed, manifest.pending, stageName);
       await atomicWriteJson(paths.manifest, manifest);
@@ -1913,14 +1948,14 @@ async function archiveProfile(opts = {}) {
       }
       // Out of acquisition budget is work not attempted. It is pending, never a download failure.
       if (acquisitionRemaining() <= 0) {
-        section.pendingCount++;
-        pendingCount++;
+        runPending.add(failureKey);
+        counterFor(section).pending.add(failureKey);
         pending[failureKey] = sanitizeFailedItem(item, 'acquisition budget reached', i, priorAttempts(failureKey));
         continue;
       }
       if (!item.href) {
-        section.failedCount++;
-        failedCount++;
+        runFailed.add(failureKey);
+        counterFor(section).failed.add(failureKey);
         failed[failureKey] = sanitizeFailedItem(item, 'missing media href', i, priorAttempts(failureKey) + 1);
         continue;
       }
@@ -1947,22 +1982,27 @@ async function archiveProfile(opts = {}) {
         if (err instanceof DeferredError) {
           // The provider refused this specific item. It is fresh, so carried state no longer
           // covers it, and without filing it here the deferral would drop it entirely.
-          section.pendingCount++;
-          pendingCount++;
+          runPending.add(failureKey);
+          counterFor(section).pending.add(failureKey);
           pending[failureKey] = sanitizeFailedItem(item, 'provider deferred acquisition', i, priorAttempts(failureKey) + 1);
           mergeCarried();
           await persistManifest(plannedSections.map(planned => planned.section), 'DEFERRED', 'deferred');
           await writeOwner('deferred', { status: 'DEFERRED', terminal: true });
-          await writeStatus(paths, { status: 'DEFERRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, stage: 'deferred', requestedCategories: categories, mediaTypes, sections: plannedSections.map(planned => statusSectionRecord(planned.section)), downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount, pendingCount, outstandingCount: Object.keys(failed).length + Object.keys(pending).length, resume: resumeRecord(), updatedAt: new Date().toISOString() });
+          await writeStatus(paths, { status: 'DEFERRED', reason: redactSignedUrls(err.message), retryAt: err.retryAt, runId, handle, mode, stage: 'deferred', requestedCategories: categories, mediaTypes, sections: plannedSections.map(planned => statusSectionRecord(planned.section)), downloadedCount: downloaded, reusedCount: reused, completedCount: Object.keys(completed).length, failedCount: failedCountNow(), pendingCount: pendingCountNow(), outstandingCount: Object.keys(failed).length + Object.keys(pending).length, resume: resumeRecord(), updatedAt: new Date().toISOString() });
           throw err;
         }
-        section.failedCount++;
-        failedCount++;
+        runFailed.add(failureKey);
+        counterFor(section).failed.add(failureKey);
         failed[failureKey] = sanitizeFailedItem(item, err.message, i, priorAttempts(failureKey) + 1);
         processed++;
         if (processed % checkpointEveryItems === 0) await checkpoint(plannedSections.map(planned => planned.section), 'acquiring');
       }
     }
+    // Sweep before any judgement, not after it. Accounting that ran first described a state the
+    // sweep then changed, so a run could persist PARTIAL and a pending count for work it had
+    // already proved was acquired.
+    await sweepOutcomeOverlaps();
+    syncSectionCounts();
     // Sections settle once the whole queue is drained, so each one is judged against the final
     // completed set rather than whatever happened to be done when its own turn ended.
     for (const planned of plannedSections) {
@@ -1978,7 +2018,7 @@ async function archiveProfile(opts = {}) {
     await checkpoint(finalSections, 'sections-settled');
     mergeCarried();
     let outstandingCount = Object.keys(failed).length + Object.keys(pending).length;
-    let global = finalGlobalOutcome(finalSections, failedCount, pendingCount, outstandingCount, Object.keys(conflicts).length);
+    let global = finalGlobalOutcome(finalSections, failedCountNow(), pendingCountNow(), outstandingCount, Object.keys(conflicts).length);
     if (global.status === 'COMPLETE') {
       // COMPLETE is the one claim worth paying to check. Every recorded receipt is re-verified
       // before it is made, and anything that no longer proves out becomes owed again instead of
@@ -1989,7 +2029,7 @@ async function archiveProfile(opts = {}) {
         pending[id] = sanitizeFailedItem({ ...receipt, stableId: id }, 'receipt no longer verifies', 0, priorAttempts(id));
       }
       outstandingCount = Object.keys(failed).length + Object.keys(pending).length;
-      global = finalGlobalOutcome(finalSections, failedCount, pendingCount, outstandingCount, Object.keys(conflicts).length);
+      global = finalGlobalOutcome(finalSections, failedCountNow(), pendingCountNow(), outstandingCount, Object.keys(conflicts).length);
     }
     const postSection = finalSections.find(section => section.category === 'posts');
     const uniquePostCount = new Set(Object.values(completed).filter(receipt => receiptCategory(receipt) === 'posts' && receiptShortcode(receipt)).map(receipt => receiptShortcode(receipt))).size;
@@ -2008,8 +2048,8 @@ async function archiveProfile(opts = {}) {
       uniquePostCount,
       reportedTotal: postSection?.reportedTotal ?? null,
       completedCount: Object.keys(completed).length,
-      failedCount,
-      pendingCount,
+      failedCount: failedCountNow(),
+      pendingCount: pendingCountNow(),
       downloadedCount: downloaded,
       reusedCount: reused,
       // Exactly what is still missing, separated from what actually failed.

@@ -2895,3 +2895,70 @@ test('R4-4 every persisted checkpoint holds pairwise disjoint outcome maps', asy
     assert.deepEqual(pendingIds.filter(id => failedIds.includes(id)), [], 'checkpoint left failed and pending overlapping');
   }
 });
+
+// --- independent review 4: accounting must reflect the swept state ------------------------------
+
+test('R5-1 final status and counts reflect the state after the integrity sweep', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const slides = [
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s0' },
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s1' }
+  ];
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  await stripFingerprints(out);
+
+  // Budget exhaustion files both verified legacy slides as pending; the sweep then resolves them.
+  // Everything reported afterwards must describe the swept state, not the moment before it.
+  const s = await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: slides, dnsLookup: publicDns, delayMs: 0,
+    maxTimeMs: 5000, acquisitionMaxTimeMs: 0, fetchImpl: async () => res()
+  });
+  assert.equal(s.coverage.outstandingMediaCount, 0, 'nothing is owed after the sweep');
+  assert.equal(s.pendingCount, 0, 'the reported pending count must not describe work the sweep resolved');
+  assert.equal(s.failedCount, 0);
+  const posts = s.sections.find(section => section.category === 'posts');
+  assert.equal(posts.pendingCount, 0, 'the section count must be recomputed after the sweep');
+  assert.equal(posts.status, 'COMPLETE', 'the section outcome must be settled from the swept state, got ' + posts.status + ': ' + posts.reason);
+  assert.equal(s.status, 'COMPLETE', 'the run owes nothing and must not report PARTIAL, got ' + s.status + ': ' + s.reason);
+
+  const manifest = await readManifest(out);
+  const run = manifest.runs.at(-1);
+  assert.equal(run.pendingCount, 0, 'the persisted per-run record must agree too');
+  assert.equal(run.status, 'COMPLETE');
+  assert.equal(Object.keys(manifest.pending || {}).length, 0);
+});
+
+test('R5-2 a legacy id recorded as both failed and pending normalizes to one outstanding entry', () => {
+  const split = lib.partitionPriorOutcomes({
+    failed: { 'X-0': { stableId: 'X-0', error: 'provider returned HTML instead of media' } },
+    pending: { 'X-0': { stableId: 'X-0', error: 'pending fresh scan retry' }, 'Y-0': { stableId: 'Y-0', error: 'pending fresh scan retry' } }
+  });
+  const inFailed = !!split.failed['X-0'];
+  const inPending = !!split.pending['X-0'];
+  assert.ok(inFailed !== inPending, 'a duplicated legacy id must land in exactly one map, not both');
+  assert.ok(inFailed || inPending, 'and it must not be dropped');
+  assert.ok(split.pending['Y-0'], 'other pending work is untouched');
+  assert.deepEqual(Object.keys(split.failed).filter(id => split.pending[id]), [], 'the two maps must be disjoint');
+});
+
+test('R5-3 a legacy manifest with a duplicated id round-trips without failing closed', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const other = { shortcode: 'OK', href: 'https://instacognito.com/media?id=ok' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [other], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  const manifest = await readManifest(out);
+  // An id with no receipt at all, recorded in both maps by an older writer.
+  manifest.failed = { 'X-0': { stableId: 'X-0', category: 'posts', shortcode: 'X', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'provider returned HTML instead of media' } };
+  manifest.pending = { 'X-0': { stableId: 'X-0', category: 'posts', shortcode: 'X', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' } };
+  await writeManifestRaw(out, manifest);
+
+  const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [other], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  const after = await readManifest(out);
+  const inFailed = !!(after.failed || {})['X-0'];
+  const inPending = !!(after.pending || {})['X-0'];
+  assert.ok(inFailed !== inPending, 'the duplicated id must be normalized to exactly one map');
+  assert.ok(inFailed || inPending, 'unresolved work must be preserved, not normalized away');
+  assert.equal(s.coverage.outstandingMediaCount, 1, 'and it must still be counted as owed exactly once');
+  assert.notEqual(s.status, 'COMPLETE');
+});
