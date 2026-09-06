@@ -2397,8 +2397,12 @@ test('P1-6 a carousel slide is never resolved by index alone when the provider m
   });
   assert.ok(fetches > 0, 'a slide whose provider media no longer matches its receipt must not be reused by index');
   manifest = await readManifest(out);
-  assert.equal(manifest.completed['CAR-0'].bytes, png.length, 'CAR-0 must now hold the media actually observed at slide 0');
-  assert.equal(manifest.completed['CAR-1'].bytes, jpg.length);
+  // Round 2 corrected this: re-acquiring must not remap a verified slide. The stored content stands
+  // and the conflicting observation is held, because slide position is not evidence about which
+  // media a verified id refers to.
+  assert.equal(manifest.completed['CAR-0'].bytes, jpg.length, 'a verified slide must not be overwritten by a conflicting one');
+  assert.equal(manifest.completed['CAR-1'].bytes, png.length);
+  assert.ok(manifest.conflicts['CAR-0'] && manifest.conflicts['CAR-1'], 'both conflicting observations must be held');
 });
 
 test('P2-7 an unexpected failure still finalizes the owner instead of leaving a live RUNNING claim', async (t) => {
@@ -2496,6 +2500,223 @@ test('P2-9 a provider denial is preserved as evidence and stops the remaining se
       const reels = scan.sections.find(s => s.category === 'reels');
       assert.notEqual(reels.status, 'COMPLETE', 'no section may be scraped after the provider has denied');
       assert.equal(await page.evaluate(() => window.reelsRendered), 0, 'the reels tab must not be clicked after a denial');
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+// --- independent review 2 counterexamples ------------------------------------------------------
+
+test('R2-1 concurrent takeovers of one stale lock admit exactly one writer', async () => {
+  const d = await tmp();
+  const root = await lib.safeOutputRoot(path.join(d, 'out'));
+  const paths = lib.profilePaths(root, 'example');
+  await fsp.mkdir(paths.stateDir, { recursive: true });
+  await fsp.writeFile(paths.lock, JSON.stringify({ pid: 99999999, host: os.hostname(), runId: 'dead', token: 'dead-token' }));
+  let inside = 0;
+  let maxInside = 0;
+  const attempt = async id => lib.withLock(paths, id, async () => {
+    inside++;
+    maxInside = Math.max(maxInside, inside);
+    await new Promise(r => setTimeout(r, 60));
+    inside--;
+    return id;
+  });
+  const settled = await Promise.allSettled([attempt('a'), attempt('b'), attempt('c'), attempt('d')]);
+  const winners = settled.filter(r => r.status === 'fulfilled');
+  assert.equal(maxInside, 1, 'two callers reading the same dead lock must never both hold it');
+  assert.equal(winners.length, 1, 'exactly one takeover may succeed, got ' + winners.length);
+});
+
+test('R2-2 a lone slide of a known carousel is not reused by index, and a conflict never overwrites', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const s0 = { shortcode: 'CAR', href: 'https://instacognito.com/media?id=slideZero' };
+  const s1 = { shortcode: 'CAR', href: 'https://instacognito.com/media?id=slideOne' };
+  const bodyFor = url => url.includes('slideZero') ? jpg : png;
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 1, items: [s0, s1], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } })
+  });
+  assert.equal((await readManifest(out)).completed['CAR-0'].bytes, jpg.length);
+
+  // Only ONE slide of the carousel is visible now, so encounter order calls it CAR-0 even though
+  // the media is the second slide. Slide count 1 must not be enough to resolve it by index.
+  let fetches = 0;
+  await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [s1], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => { fetches++; return res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } }); }
+  });
+  assert.ok(fetches > 0, 'a lone slide of a post known to be a carousel must not resolve by index alone');
+  const manifest = await readManifest(out);
+  assert.equal(manifest.completed['CAR-0'].bytes, jpg.length, 'a verified slide must never be destructively overwritten by a conflicting one');
+  assert.ok(manifest.conflicts && manifest.conflicts['CAR-0'], 'the conflicting content must be held and recorded');
+});
+
+test('R2-3 the discovered queue is persisted before any acquisition starts', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const items = ['A', 'B', 'C'].map(s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s }));
+  const atFirstFetch = [];
+  const fetchImpl = async () => {
+    if (!atFirstFetch.length) {
+      const onDisk = await readJson(path.join(out, '.frameferry', 'example', 'manifest.json')).catch(() => null);
+      atFirstFetch.push(onDisk ? { ...(onDisk.failed || {}), ...(onDisk.pending || {}) } : null);
+    }
+    return res();
+  };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 3, items, dnsLookup: publicDns, fetchImpl, delayMs: 0, checkpointEveryItems: 100 });
+  const owed = atFirstFetch[0];
+  assert.ok(owed, 'a manifest must exist before the first acquisition');
+  for (const id of ['A-0', 'B-0', 'C-0']) assert.ok(owed[id], 'the whole discovered queue must be persisted before acquiring: missing ' + id);
+});
+
+test('R2-4 unverifiable completed entries cannot claim completeness and never overlap owed work', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const mk = s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s });
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [mk('A'), mk('B')], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  // B's bytes rot on disk and no later scan re-observes B.
+  await fsp.writeFile(path.join(out, 'media', 'example', 'B-0.jpg'), Buffer.from('rotted'));
+  const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 2, items: [mk('A')], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.notEqual(s.status, 'COMPLETE', 'a receipt that no longer verifies cannot count toward completeness');
+  const manifest = await readManifest(out);
+  const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
+  assert.ok(outstanding['B-0'], 'the unverifiable id must be owed again');
+  assert.equal(manifest.completed['B-0'], undefined, 'and it must not still be counted as completed');
+  for (const id of Object.keys(outstanding)) assert.equal(manifest.completed[id], undefined, id + ' is both completed and owed');
+});
+
+test('R2-4b a checkpoint never lists a verified completed id as owed', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const mk = s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s });
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [mk('A')], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  const seen = [];
+  await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 3, items: [mk('A'), mk('B'), mk('C')], dnsLookup: publicDns, delayMs: 0, checkpointEveryItems: 100,
+    fetchImpl: async () => {
+      if (!seen.length) {
+        const onDisk = await readJson(path.join(out, '.frameferry', 'example', 'manifest.json')).catch(() => null);
+        seen.push(onDisk ? { ...(onDisk.failed || {}), ...(onDisk.pending || {}) } : {});
+      }
+      return res();
+    }
+  });
+  assert.equal(seen[0]['A-0'], undefined, 'an id with a verified receipt must not be checkpointed as owed');
+  assert.ok(seen[0]['C-0'], 'while genuinely unacquired work still must be');
+});
+
+test('R2-5 identity must be positively proved on every resolution path', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  const root = await lib.safeOutputRoot(out);
+  const paths = lib.profilePaths(root, 'example');
+  const receipt = (await readManifest(out)).completed['A-0'];
+
+  // A receipt missing its identity fields proves nothing.
+  const noId = { ...receipt }; delete noId.stableId; delete noId.id;
+  assert.deepEqual((await lib.reconcileAgainstReceipts(paths, { 'B-0': noId }, { 'B-0': { stableId: 'B-0', error: 'x' } }, 'example')).resolved, [], 'a receipt with no stableId must not resolve anything');
+  const noHandle = { ...receipt }; delete noHandle.profileHandle;
+  assert.deepEqual((await lib.reconcileAgainstReceipts(paths, { 'A-0': noHandle }, { 'A-0': { stableId: 'A-0', error: 'x' } }, 'example')).resolved, [], 'a receipt with no handle must not resolve anything');
+
+  // Content-identical reuse inside downloadOne must check identity too, not just the hash.
+  const foreign = { ...receipt, profileHandle: 'someoneelse' };
+  const got = await lib.downloadOne({ ...item, stableId: 'A-0', carouselIndex: 0, category: 'posts', mediaType: 'image' }, paths, {
+    dnsLookup: publicDns, fetchImpl: async () => res(), runId: 'r', remainingMs: 5000, completedMap: { 'A-0': foreign }, handle: 'example'
+  });
+  assert.notEqual(got.receipt.profileHandle, 'someoneelse', 'a receipt belonging to another handle must never be reused by content match');
+  assert.equal(got.receipt.profileHandle, 'example');
+});
+
+test('R2-6 a failure after the owner claim is written still finalizes it', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  // status.json becomes un-writable, so the RUNNING status write fails right after the claim.
+  const statusPath = path.join(out, '.frameferry', 'example', 'status.json');
+  await fsp.rm(statusPath, { force: true });
+  await fsp.mkdir(statusPath, { recursive: true });
+  try {
+    await assert.rejects(() => lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 }));
+  } finally {
+    await fsp.rm(statusPath, { recursive: true, force: true });
+  }
+  const owner = await readJson(path.join(out, '.frameferry', 'example', 'current-owner.json')).catch(() => null);
+  assert.notEqual(lib.evaluateOwnerRecord(owner).state, 'ACTIVE', 'a failed run must not leave a live claim behind');
+  const root = await lib.safeOutputRoot(out);
+  assert.equal(fs.existsSync(lib.profilePaths(root, 'example').lock), false, 'and it must not leave the lock behind');
+});
+
+test('R2-7 an item that keeps failing does not starve the rest of the backlog', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const mk = s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s });
+  const failing = async () => res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } });
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [mk('B'), mk('C')], dnsLookup: publicDns, fetchImpl: failing, delayMs: 0 });
+  // Only B is re-observed and fails again, so it has burnt more attempts than C.
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [mk('B')], dnsLookup: publicDns, fetchImpl: failing, delayMs: 0 });
+  const order = [];
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 2, items: [mk('B'), mk('C')], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => { order.push(new URL(url).searchParams.get('id')); return res(); }
+  });
+  assert.equal(order[0], 'C', 'the id that has consumed fewer attempts must be served first, got ' + order.join(','));
+});
+
+test('R2-9 a signed media URL is redacted whatever the query order', () => {
+  const first = lib.redactSignedUrls('failed https://instacognito.com/media?signature=SIGVALUE&id=SECRETID more');
+  assert.equal(first.includes('SECRETID'), false, 'id must not survive a signature-first URL: ' + first);
+  assert.equal(first.includes('SIGVALUE'), false, 'the signature must not survive either: ' + first);
+  const second = lib.redactSignedUrls('failed https://instacognito.com/media?id=SECRETID&signature=SIGVALUE more');
+  assert.equal(second.includes('SECRETID'), false);
+  assert.equal(second.includes('SIGVALUE'), false);
+});
+
+test('R2-9b a persisted failure never carries a signature-first media URL', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?signature=SIGVALUE&id=SECRETID' };
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => { throw new Error('upstream exploded for ' + url); }
+  });
+  const manifest = JSON.stringify(await readManifest(out));
+  assert.equal(manifest.includes('SECRETID'), false, 'the media id leaked into the manifest');
+  assert.equal(manifest.includes('SIGVALUE'), false, 'the signature leaked into the manifest');
+});
+
+test('R2-8 a latched denial is checked before the coverage exit, not bypassed by it', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = await serveProfilePage(page, DENIAL_TABS_HTML, {
+      '/api/posts': route => route.fulfill({ status: 429, headers: { 'retry-after': '120' }, contentType: 'application/json', body: '{"error":"slow down"}' })
+    });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      // Latch a real denial first, exactly as an earlier window would have.
+      await page.evaluate(() => fetch('/api/posts', { method: 'POST', body: '{}' }).catch(() => {}));
+      await page.waitForTimeout(200);
+      const apiBefore = seen.api;
+      // Coverage is already satisfied by the three visible posts, so the loop takes its early exit.
+      const section = await lib.scrapeCardSection(page, { category: 'posts', mediaTypes: ['image', 'video'], reportedTotal: 3, started: Date.now(), maxTimeMs: 15000, maxPages: 3, continuationMonitor: monitor });
+      assert.equal(seen.api, apiBefore, 'a satisfied coverage exit must not trigger again');
+      assert.notEqual(section.status, 'COMPLETE', 'a section may not settle COMPLETE while a denial is latched');
+      assert.ok(section.evidence && section.evidence.blocked, 'the latched denial must be reported');
+      assert.equal(section.evidence.blocked.status, 429);
+      assert.ok(Date.parse(section.evidence.blocked.retryAt) > Date.now(), 'Retry-After must be preserved: ' + section.evidence.blocked.retryAt);
       assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
     } finally {
       monitor.detach();

@@ -57,7 +57,9 @@ function validateHandle(handle) {
 }
 function redactSignedUrls(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return text.replace(/https:\/\/instacognito\.com\/media\?id=[A-Za-z0-9._~!$&'()*+,;=:@%\/-]+/g, '[REDACTED instacognito media URL]');
+  // Any media URL, whatever the query order. Keying on "?id=" meant a signature-first URL matched
+  // nothing at all and was persisted verbatim.
+  return text.replace(/https:\/\/instacognito\.com\/media(?:\?[^\s"'\\]*)?/gi, '[REDACTED instacognito media URL]');
 }
 function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
 function jsonText(data) { return JSON.stringify(data, null, 2) + '\n'; }
@@ -210,20 +212,40 @@ async function withLock(paths, runId, fn, attempt = 0) {
     // the profile on nothing more than a partial write.
     if (!Number.isInteger(lock.pid)) throw new ArchiveError('LOCKED', 'profile lock does not name a pid; failing closed rather than assuming it is stale', { lock });
     if (isPidAlive(lock.pid)) throw new ArchiveError('LOCKED', 'profile is locked by alive pid ' + lock.pid, { lock });
-    // Renaming is the atomic claim: of two callers that both saw this stale lock, only one can move
-    // this inode, and the loser finds it already gone rather than displacing the winner's fresh one.
-    const claimed = paths.lock + '.stale-' + (lock.token || lock.runId || 'unknown') + '-' + Date.now();
-    try { await fsp.rename(paths.lock, claimed); }
-    catch (renameErr) { if (renameErr.code !== 'ENOENT') throw renameErr; }
+    // Renaming by path is not a claim: a caller that read this stale lock but acted late could move
+    // the winner's fresh lock aside and become a second writer. The claim is therefore taken on the
+    // exact inode observed. Only one caller can create that claim file, and the inode is re-checked
+    // before anything is moved, so a lock that has already been replaced is left alone.
+    const staleStat = await fsp.stat(paths.lock).catch(() => null);
+    if (!staleStat) return withLock(paths, runId, fn, attempt + 1);
+    const claimPath = paths.lock + '.claim-' + staleStat.ino;
+    let claimFd;
+    try { claimFd = await fsp.open(claimPath, 'wx', 0o600); }
+    catch (claimErr) {
+      if (claimErr.code !== 'EEXIST') throw claimErr;
+      throw new ArchiveError('LOCKED', 'another run is already taking over this stale lock; failing closed', { lock });
+    }
+    try {
+      const recheck = await fsp.stat(paths.lock).catch(() => null);
+      if (recheck && recheck.ino === staleStat.ino) {
+        await fsp.rename(paths.lock, paths.lock + '.stale-' + staleStat.ino + '-' + Date.now()).catch(renameErr => { if (renameErr.code !== 'ENOENT') throw renameErr; });
+      }
+    } finally {
+      await claimFd.close().catch(() => {});
+      await fsp.unlink(claimPath).catch(() => {});
+    }
     return withLock(paths, runId, fn, attempt + 1);
   }
   // Between creating the lock and using it, confirm the file on disk is still the one we wrote.
   const held = await readJson(paths.lock, null);
+  const heldStat = await fsp.stat(paths.lock).catch(() => null);
   if (!held || held.token !== token) throw new ArchiveError('LOCKED', 'profile lock was taken over during acquisition; failing closed', { lock: held });
   try { return await fn(); }
   finally {
+    // Release only what is still, byte for byte and inode for inode, the lock this run created.
+    const currentStat = await fsp.stat(paths.lock).catch(() => null);
     const current = await readJson(paths.lock, null).catch(() => null);
-    if (current && current.token === token) await fsp.unlink(paths.lock).catch(() => {});
+    if (current && currentStat && heldStat && currentStat.ino === heldStat.ino && current.token === token) await fsp.unlink(paths.lock).catch(() => {});
   }
 }
 
@@ -488,21 +510,27 @@ function partitionPriorOutcomes(prior) {
 // another handle, proves nothing about the id being cleared here.
 function receiptMatchesIdentity(receipt, id, handle) {
   if (!receipt) return false;
+  // Positive proof, not absence of contradiction. Treating a missing stableId or handle as "no
+  // objection" let a receipt with no identity at all resolve any id asked of it.
   const receiptId = receiptStableId(receipt);
-  if (id && receiptId && receiptId !== id) return false;
-  if (handle && receipt.profileHandle && receipt.profileHandle !== handle) return false;
+  if (!receiptId || !id || receiptId !== id) return false;
+  if (!receipt.profileHandle || !handle || receipt.profileHandle !== handle) return false;
   return true;
 }
 async function reconcileAgainstReceipts(paths, completed, entries, handle = null) {
   const expectedHandle = handle || (paths && paths.stateDir ? path.basename(paths.stateDir) : null);
   const retained = {};
   const resolved = [];
+  // Ids the manifest calls completed but whose receipt cannot be proved. They are owed, not done,
+  // and must stop being counted as completed so the two maps can never claim the same id.
+  const unverifiable = [];
   for (const [id, entry] of Object.entries(entries || {})) {
     const receipt = (completed || {})[id];
     if (receipt && receiptMatchesIdentity(receipt, id, expectedHandle) && await verifyReceipt(paths, receipt)) { resolved.push(id); continue; }
+    if (receipt) unverifiable.push(id);
     retained[id] = entry;
   }
-  return { retained, resolved: resolved.sort() };
+  return { retained, resolved: resolved.sort(), unverifiable: unverifiable.sort() };
 }
 // Receipt files are committed to disk before the manifest learns about them, so a crash in between
 // leaves a verifiable receipt the next run would otherwise re-download as an orphan.
@@ -565,7 +593,10 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
     const ext = extFor(got.kind);
     const dest = path.join(paths.mediaDir, stableId + '.' + ext);
     const existing = completedMap[stableId];
-    if (existing && existing.sha256 === got.sha256 && existing.bytes === got.bytes && await verifyReceipt(paths, existing)) {
+    // Matching bytes are not an identity. Without this check a receipt belonging to another handle
+    // could be adopted wholesale just because the content happened to hash the same.
+    const existingIsOurs = receiptMatchesIdentity(existing, stableId, handle);
+    if (existingIsOurs && existing.sha256 === got.sha256 && existing.bytes === got.bytes && await verifyReceipt(paths, existing)) {
       await fsp.rm(tempBase, { force: true }).catch(() => {});
       // Same bytes, so the media is the same, but it was just observed under the current provider
       // id. Refreshing the fingerprint keeps the slide mapping provable on the next run instead of
@@ -573,6 +604,13 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
       const refreshed = { ...existing, providerMediaFingerprint: item.providerMediaFingerprint ?? providerMediaFingerprint(item.href) ?? existing.providerMediaFingerprint ?? null, slideCount: Number.isInteger(item.slideCount) ? item.slideCount : (existing.slideCount ?? 1) };
       await atomicWriteJson(path.join(paths.receiptDir, stableId + '.json'), refreshed);
       return { receipt: refreshed, fetchedButReused: true };
+    }
+    // Different bytes for an id whose stored receipt still verifies is a conflict, not an update.
+    // Overwriting would destroy verified content on nothing better than slide position, so the
+    // observation is reported and held instead.
+    if (existingIsOurs && existing.sha256 !== got.sha256 && await verifyReceipt(paths, existing)) {
+      await fsp.rm(tempBase, { force: true }).catch(() => {});
+      return { receipt: existing, fetchedButReused: true, conflict: { expectedSha256: existing.sha256, observedSha256: got.sha256, observedBytes: got.bytes, observedAt: new Date().toISOString() } };
     }
     await fsp.rename(tempBase, dest);
     const receipt = {
@@ -620,8 +658,11 @@ function decideOutcome({ reportedTotal, uniquePostCount, failed, pending = 0, no
   if (reportedTotal != null && uniquePostCount < reportedTotal) return { status: 'PARTIAL', reason: 'advertised shortfall ' + uniquePostCount + '/' + reportedTotal };
   return { status: 'COMPLETE', reason: reusedOnlyComplete ? 'all requested media reused from verified receipts' : 'reported total reached and downloads verified' };
 }
-function sanitizeFailedItem(item, error, index = 0) {
+function sanitizeFailedItem(item, error, index = 0, attempts = null) {
   return {
+    // How much budget this id has already consumed, carried across runs so acquisition can rotate
+    // rather than spending every run on whichever id happens to sort first.
+    attempts: Number.isInteger(attempts) ? attempts : (Number.isInteger(item?.attempts) ? item.attempts : 0),
     stableId: item.stableId || fallbackFailureKey(item, index),
     category: item.category || 'posts',
     shortcode: item.shortcode || null,
@@ -789,8 +830,9 @@ function legacyScanFromItems(opts) {
     })]
   };
 }
-function finalGlobalOutcome(sections, failedCount, pendingCount = 0, outstandingCount = 0) {
+function finalGlobalOutcome(sections, failedCount, pendingCount = 0, outstandingCount = 0, conflictCount = 0) {
   if (sections.some(section => section.status === 'ACTION_REQUIRED')) return { status: 'ACTION_REQUIRED', reason: 'one or more requested sections could not prove completeness' };
+  if (conflictCount > 0) return { status: 'PARTIAL', reason: conflictCount + ' conflicting contents held for review' };
   // Outstanding work carried from earlier runs counts too. Judging completeness on this run's own
   // counts alone let a scan that simply never re-saw an owed id report COMPLETE while owing it.
   if (sections.every(section => section.status === 'COMPLETE') && failedCount === 0 && pendingCount === 0 && outstandingCount === 0) return { status: 'COMPLETE', reason: 'all requested sections completed and downloads verified' };
@@ -1357,11 +1399,17 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
     if (!resumeTargets || !resumeTargets.size) return null;
     return new Set(normalizeItems([...accumulated.values()], { category, mediaTypes }).items.map(item => item.stableId).filter(Boolean));
   };
+  // The monitor latches a denial the moment it is observed. Reading it costs nothing and must
+  // happen before any exit as well as before any trigger: a coverage-satisfied exit that skipped
+  // the latch let a section settle COMPLETE with the provider already refusing.
+  const latchedDenial = () => (typeof continuationMonitor?.denial === 'function' ? continuationMonitor.denial() : null);
   // The first batch is already rendered before anything is triggered.
   await retainVisibleBatch();
   for (let i = 0; i < maxPages; i++) {
     const before = await getRenderedCardState(page);
     if (before.count === 0) { exhaustedPageBudget = false; break; }
+    const latchedBeforeStep = latchedDenial();
+    if (latchedBeforeStep) { hitLimit = true; blocked = latchedBeforeStep; break; }
     // Measured against everything discovered so far, not against whatever page is on screen: the
     // visible DOM is one page and can never reach the reported total on its own.
     if (discoveryCoverageSatisfied({ reportedTotal, uniquePostCount: accumulatedUniquePosts(), resumeTargets, discoveredIds: accumulatedStableIds() })) { exhaustedPageBudget = false; break; }
@@ -1384,6 +1432,11 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
     exhaustedPageBudget = i === maxPages - 1;
   }
   if (exhaustedPageBudget && !noGrowth) hitLimit = true;
+  // Also after the loop, for the paths that never entered it at all.
+  if (!blocked) {
+    const latchedAtExit = latchedDenial();
+    if (latchedAtExit) { blocked = latchedAtExit; hitLimit = true; }
+  }
   const extracted = extractItemsFromRawCards([...accumulated.values()], { category, mediaTypes, reportedTotal, noGrowth, hitLimit });
   const itemCount = extracted.items.length;
   let status = itemCount ? 'COMPLETE' : 'UNAVAILABLE';
@@ -1557,6 +1610,11 @@ async function archiveProfile(opts = {}) {
     const carriedFailed = reconciledFailed.retained;
     const carriedPending = reconciledPending.retained;
     const resolvedByReceipt = [...reconciledFailed.resolved, ...reconciledPending.resolved].sort();
+    // An id the manifest called completed but whose receipt will not verify is owed, not done.
+    // Leaving it in completed let the same id sit in both maps and still count toward completeness.
+    const unverifiableCompleted = [...new Set([...reconciledFailed.unverifiable, ...reconciledPending.unverifiable])].sort();
+    for (const id of unverifiableCompleted) delete completed[id];
+    const conflicts = { ...(prior.conflicts || {}) };
     // What this run is still missing, and therefore what discovery must actually cover. Signed URLs
     // are never persisted, so an outstanding id can only be retried once a scan surfaces it again.
     const resumeTargets = new Set([...Object.keys(carriedFailed), ...Object.keys(carriedPending)]);
@@ -1565,6 +1623,7 @@ async function archiveProfile(opts = {}) {
     const auditEntry = {};
     if (resolvedByReceipt.length) auditEntry.resolvedByReceipt = resolvedByReceipt;
     if (adoptedReceipts.length) auditEntry.adoptedReceipts = adoptedReceipts;
+    if (unverifiableCompleted.length) auditEntry.unverifiableCompleted = unverifiableCompleted;
     if (ownerTakeover) auditEntry.ownerTakeover = ownerTakeover;
     if (Object.keys(auditEntry).length) audit.push({ runId, at: new Date().toISOString(), ...auditEntry });
     while (audit.length > MAX_AUDIT_ENTRIES) audit.shift();
@@ -1574,8 +1633,8 @@ async function archiveProfile(opts = {}) {
       stage = nextStage;
       await atomicWriteJson(paths.owner, ownerRecord({ runId, handle, stage, status, terminal, startedAt: startedAtIso, extra: { mode, requestedCategories: categories } }));
     };
-    await writeOwner('discovery');
     try {
+    await writeOwner('discovery');
     await writeStatus(paths, { status: 'RUNNING', reason: 'scan started', runId, handle, mode, stage, requestedCategories: categories, mediaTypes, startedAt: startedAtIso, priorCompletedCount: Object.keys(completed).length, resumeTargetCount: resumeTargets.size });
 
     // Discovery and acquisition get separate deadlines so a slow scan can never consume the whole
@@ -1617,9 +1676,23 @@ async function archiveProfile(opts = {}) {
     // provider happened to render, so only a matching provider-media fingerprint proves the
     // mapping. Without that proof the slide is re-acquired rather than resolved by position, which
     // is what would otherwise let a reorder silently file one slide's bytes under another's id.
+    // How many slides this post is known to have, from anywhere: what this scan showed, what the
+    // receipt recorded, and how many slide ids are already stored. Judging on the current
+    // observation alone meant a carousel seen one slide at a time looked like a single-slide post
+    // and resolved by index, which is the reorder hazard all over again.
+    const storedSlideCounts = new Map();
+    for (const [id, receipt] of Object.entries(completed)) {
+      const shortcode = receiptShortcode(receipt) || (id.includes('-') ? id.slice(0, id.lastIndexOf('-')) : null);
+      if (shortcode) storedSlideCounts.set(shortcode, (storedSlideCounts.get(shortcode) || 0) + 1);
+    }
+    const knownSlideCount = (item, receipt) => Math.max(
+      Number.isInteger(item.slideCount) ? item.slideCount : 1,
+      Number.isInteger(receipt?.slideCount) ? receipt.slideCount : 1,
+      item.shortcode ? (storedSlideCounts.get(item.shortcode) || 1) : 1
+    );
     const receiptResolvesItem = (item, receipt) => {
       if (!receiptMatchesIdentity(receipt, item.stableId, handle)) return false;
-      if (!(item.slideCount > 1)) return true;
+      if (knownSlideCount(item, receipt) <= 1) return true;
       const observed = item.providerMediaFingerprint || providerMediaFingerprint(item.href);
       if (receipt.providerMediaFingerprint && observed) return receipt.providerMediaFingerprint === observed;
       return false;
@@ -1650,7 +1723,9 @@ async function archiveProfile(opts = {}) {
       // checkpoint describe a queue as if it did not exist, so a crash lost it entirely.
       for (const [key, queued] of discoveredQueue) {
         if (acquiredKeys.has(key) || failedOut[key] || pendingOut[key]) continue;
-        pendingOut[key] = sanitizeFailedItem(queued.item, 'awaiting acquisition', queued.index);
+        // Already recorded as completed under a matching identity, so it is not owed.
+        if (completed[key] && receiptMatchesIdentity(completed[key], key, handle)) continue;
+        pendingOut[key] = sanitizeFailedItem(queued.item, 'awaiting acquisition', queued.index, priorAttempts(key));
       }
       return { failedOut, pendingOut };
     };
@@ -1658,6 +1733,10 @@ async function archiveProfile(opts = {}) {
       const view = carriedView();
       Object.assign(failed, view.failedOut);
       Object.assign(pending, view.pendingOut);
+    };
+    const priorAttempts = key => {
+      const prior = carriedFailed[key] || carriedPending[key];
+      return Number.isInteger(prior?.attempts) ? prior.attempts : 0;
     };
     const rediscoveredCount = () => [...resumeTargets].filter(id => freshKeys.has(id)).length;
     const stillMissingIds = () => {
@@ -1678,6 +1757,7 @@ async function archiveProfile(opts = {}) {
       completed,
       failed: view.failedOut,
       pending: view.pendingOut,
+      conflicts,
       audit,
       // Where this run got to, written atomically as it goes, so an interrupt leaves durable
       // progress rather than a manifest that never learned what was already on disk.
@@ -1692,6 +1772,10 @@ async function archiveProfile(opts = {}) {
     };
     const checkpoint = async (sectionList, stageName) => { await atomicWriteJson(paths.manifest, buildManifest(sectionList, 'RUNNING', stageName)); };
 
+    // The whole discovered queue reaches disk before a single item is acquired. Waiting for the
+    // first checkpoint meant a crash early in acquisition left no manifest at all, and everything
+    // this scan had already discovered was lost with it.
+    await checkpoint(finalSections, 'queue-settled');
     await writeOwner('acquiring');
     for (const planned of plannedSections) {
       const section = planned.section;
@@ -1706,7 +1790,11 @@ async function archiveProfile(opts = {}) {
       // Ids already owed are served before newly discovered ones. First-seen order meant a scan
       // that surfaced fresh work spent the budget on it and starved the backlog run after run.
       // sort is stable, so relative order inside each group is untouched.
-      const ordered = [...planned.entries].sort((a, b) => (resumeTargets.has(b.key) ? 1 : 0) - (resumeTargets.has(a.key) ? 1 : 0));
+      // Owed ids first, and within them the ones that have consumed the fewest attempts. Owed-first
+      // alone still starved the backlog: an id that fails every run sorted first every run and
+      // spent the budget before anything behind it was ever tried.
+      const owedRank = key => (resumeTargets.has(key) ? 0 : 1);
+      const ordered = [...planned.entries].sort((a, b) => owedRank(a.key) - owedRank(b.key) || priorAttempts(a.key) - priorAttempts(b.key));
       for (const entry of ordered) {
         const item = entry.item;
         const i = entry.index;
@@ -1732,13 +1820,13 @@ async function archiveProfile(opts = {}) {
         if (acquisitionRemaining() <= 0) {
           section.pendingCount++;
           pendingCount++;
-          pending[failureKey] = sanitizeFailedItem(item, 'acquisition budget reached', i);
+          pending[failureKey] = sanitizeFailedItem(item, 'acquisition budget reached', i, priorAttempts(failureKey));
           continue;
         }
         if (!item.href) {
           section.failedCount++;
           failedCount++;
-          failed[failureKey] = sanitizeFailedItem(item, 'missing media href', i);
+          failed[failureKey] = sanitizeFailedItem(item, 'missing media href', i, priorAttempts(failureKey) + 1);
           continue;
         }
         try {
@@ -1748,6 +1836,11 @@ async function archiveProfile(opts = {}) {
           delete failed[result.receipt.stableId];
           delete pending[failureKey];
           delete pending[result.receipt.stableId];
+          if (result.conflict) {
+            // Held, not applied: the verified receipt stands and the conflicting observation is
+            // recorded for review rather than overwriting content that still proves out.
+            conflicts[result.receipt.stableId] = { ...result.conflict, stableId: result.receipt.stableId, shortcode: item.shortcode || null, carouselIndex: item.carouselIndex ?? 0, runId };
+          }
           if (result.fetchedButReused) { reused++; section.reusedCount++; }
           else { downloaded++; section.downloadedCount++; }
           acquiredKeys.add(failureKey);
@@ -1761,7 +1854,7 @@ async function archiveProfile(opts = {}) {
             // covers it, and without filing it here the deferral would drop it entirely.
             section.pendingCount++;
             pendingCount++;
-            pending[failureKey] = sanitizeFailedItem(item, 'provider deferred acquisition', i);
+            pending[failureKey] = sanitizeFailedItem(item, 'provider deferred acquisition', i, priorAttempts(failureKey) + 1);
             mergeCarried();
             await atomicWriteJson(paths.manifest, buildManifest([...finalSections, section], 'DEFERRED', 'deferred'));
             await writeOwner('deferred', { status: 'DEFERRED', terminal: true });
@@ -1770,7 +1863,7 @@ async function archiveProfile(opts = {}) {
           }
           section.failedCount++;
           failedCount++;
-          failed[failureKey] = sanitizeFailedItem(item, err.message, i);
+          failed[failureKey] = sanitizeFailedItem(item, err.message, i, priorAttempts(failureKey) + 1);
           processed++;
           if (processed % checkpointEveryItems === 0) await checkpoint([...finalSections, section], 'acquiring');
         }
@@ -1783,8 +1876,20 @@ async function archiveProfile(opts = {}) {
       await checkpoint(finalSections, 'section-settled');
     }
     mergeCarried();
-    const outstandingCount = Object.keys(failed).length + Object.keys(pending).length;
-    const global = finalGlobalOutcome(finalSections, failedCount, pendingCount, outstandingCount);
+    let outstandingCount = Object.keys(failed).length + Object.keys(pending).length;
+    let global = finalGlobalOutcome(finalSections, failedCount, pendingCount, outstandingCount, Object.keys(conflicts).length);
+    if (global.status === 'COMPLETE') {
+      // COMPLETE is the one claim worth paying to check. Every recorded receipt is re-verified
+      // before it is made, and anything that no longer proves out becomes owed again instead of
+      // being counted purely because the manifest still listed it.
+      for (const [id, receipt] of Object.entries({ ...completed })) {
+        if (receiptMatchesIdentity(receipt, id, handle) && await verifyReceipt(paths, receipt)) continue;
+        delete completed[id];
+        pending[id] = sanitizeFailedItem({ ...receipt, stableId: id }, 'receipt no longer verifies', 0, priorAttempts(id));
+      }
+      outstandingCount = Object.keys(failed).length + Object.keys(pending).length;
+      global = finalGlobalOutcome(finalSections, failedCount, pendingCount, outstandingCount, Object.keys(conflicts).length);
+    }
     const postSection = finalSections.find(section => section.category === 'posts');
     const uniquePostCount = new Set(Object.values(completed).filter(receipt => receiptCategory(receipt) === 'posts' && receiptShortcode(receipt)).map(receipt => receiptShortcode(receipt))).size;
     await atomicWriteJson(paths.manifest, buildManifest(finalSections, global.status, 'finished'));
@@ -1815,12 +1920,19 @@ async function archiveProfile(opts = {}) {
         outstandingMediaCount: Object.keys(failed).length + Object.keys(pending).length
       },
       resume: resumeRecord(),
+      conflictCount: Object.keys(conflicts).length,
       updatedAt: new Date().toISOString()
     });
     } catch (err) {
       // However this run ends, its claim ends with it. Leaving a non-terminal record naming a still
       // live process would refuse the next legitimate run as a second writer.
-      await writeOwner(stage, { status: err instanceof DeferredError ? 'DEFERRED' : (err && err.code) || 'FAILED', terminal: true }).catch(() => {});
+      try {
+        await writeOwner(stage, { status: err instanceof DeferredError ? 'DEFERRED' : (err && err.code) || 'FAILED', terminal: true });
+      } catch {
+        // If the claim cannot even be finalized, remove it. No record at all reads as "no owner",
+        // which is recoverable; a record naming this live process would refuse the next run.
+        await fsp.unlink(paths.owner).catch(() => {});
+      }
       throw err;
     }
   });
