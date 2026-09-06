@@ -405,6 +405,160 @@ test('pagination waits for partial batch to settle and recenters current last ca
   }
 });
 
+test('pagination centers the provider top-level sentinel, not a trailing carousel child card', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    // Provider shape: R() appends each post's carousel slides as SIBLING .post-cards that inherit
+    // the parent's data-id, and Te() observes only the last post's TOP-LEVEL card with a 200px
+    // rootMargin. data-marker is test-only and is what distinguishes parent from slide, since the
+    // provider renders byte-identical markup for both.
+    const card = (marker, id, media) => '<article class="post-card" data-marker="' + marker + '"><span class="likes-trigger" data-id="' + id + '"><span>5</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=' + media + '">d</a></article>';
+    const lead = Array.from({ length: 8 }, (_, i) => card('lead', 'P' + (i + 1), 'lead' + i)).join('');
+    const carousel = card('parent', 'PLAST', 'slide0') + Array.from({ length: 6 }, (_, i) => card('slide', 'PLAST', 'slide' + (i + 1))).join('');
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    await page.setContent('<style>body{margin:0}#post-container{display:block}.post-card{display:block;height:300px;box-sizing:border-box;border:1px solid #ccc}</style><div id="post-container">' + lead + carousel + '</div><script>(function(){ const orig = Element.prototype.scrollIntoView; window.scrollCalls = []; Element.prototype.scrollIntoView = function(opts){ const tag = this.querySelector("[data-id]"); window.scrollCalls.push({ block: opts && opts.block, marker: this.getAttribute("data-marker"), id: tag ? tag.getAttribute("data-id") : null, index: Array.prototype.indexOf.call(document.querySelectorAll("#post-container .post-card"), this) }); return orig.call(this, opts); }; window.paginationFires = 0; const sentinel = document.querySelector(\'#post-container .post-card[data-marker="parent"]\'); const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; io.disconnect(); window.paginationFires++; document.getElementById("post-container").insertAdjacentHTML("beforeend", \'<article class="post-card" data-marker="next"><span class="likes-trigger" data-id="PNEXT"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=next">d</a></article>\'); }, { rootMargin: "200px" }); io.observe(sentinel); })();</script>');
+
+    // Precondition: the sentinel must start below viewport height + rootMargin, or the observer
+    // fires on observe() and the negative half of this test proves nothing.
+    const geometry = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('#post-container .post-card')];
+      const parent = document.querySelector('#post-container .post-card[data-marker="parent"]');
+      return { parentIndex: cards.indexOf(parent), lastIndex: cards.length - 1, parentTop: parent.getBoundingClientRect().top, lastTop: cards[cards.length - 1].getBoundingClientRect().top, viewport: window.innerHeight };
+    });
+    assert.equal(geometry.parentIndex, 8);
+    assert.equal(geometry.lastIndex, 14, 'sentinel must sit 6 slides above the final DOM card');
+    assert.ok(geometry.parentTop > geometry.viewport + 200, 'sentinel must start outside viewport + rootMargin; top=' + geometry.parentTop);
+    await page.waitForTimeout(250);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'observer must not fire on load');
+
+    // The pre-fix target: centering the final DOM card, which is the last carousel slide.
+    await page.evaluate(() => { const cards = document.querySelectorAll('#post-container .post-card'); cards[cards.length - 1].scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }); });
+    await page.waitForTimeout(500);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'centering the last carousel slide must not reach the provider sentinel');
+    assert.equal((await lib.getRenderedCardState(page)).count, 15, 'no growth from scrolling the wrong card');
+
+    await page.evaluate(() => { window.scrollCalls = []; });
+    const before = await lib.getRenderedCardState(page);
+    assert.deepEqual(before.ids, ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'PLAST']);
+    const started = Date.now();
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 12000, growthWaitMs: 6000, settleMs: 500, maxRecenters: 1 });
+    assert.equal(after.grew, true, 'centering the top-level sentinel must trigger provider pagination');
+    assert.equal(after.sentinelIndex, 8);
+    assert.equal(after.sentinelId, 'PLAST');
+    assert.ok(after.ids.includes('PNEXT'), 'new batch must be observed: ' + JSON.stringify(after.ids));
+    assert.equal(after.count, 16);
+    assert.equal(await page.evaluate(() => window.paginationFires), 1);
+    const calls = await page.evaluate(() => window.scrollCalls);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].block, 'center');
+    assert.equal(calls[0].id, 'PLAST');
+    assert.equal(calls[0].marker, 'parent', 'must center the top-level sentinel, not a carousel slide; centered a ' + calls[0].marker);
+    assert.equal(calls[0].index, 8);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('pagination follows the observed sentinel when the last post and its slides carry no data-id', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    // A zero-engagement post renders no .likes-trigger and no .comments-trigger, so neither it
+    // nor its carousel slides carry a data-id anywhere. Every markup-based heuristic is blind
+    // here; only the element the provider actually observes identifies the sentinel.
+    const idCard = (marker, id, media) => '<article class="post-card" data-marker="' + marker + '"><span class="likes-trigger" data-id="' + id + '"><span>5</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=' + media + '">d</a></article>';
+    const blankCard = (marker, media) => '<article class="post-card" data-marker="' + marker + '"><a class="content-download-btn" href="https://instacognito.com/media?id=' + media + '">d</a></article>';
+    const lead = Array.from({ length: 8 }, (_, i) => idCard('lead', 'P' + (i + 1), 'lead' + i)).join('');
+    const carousel = blankCard('parent', 'slide0') + Array.from({ length: 6 }, (_, i) => blankCard('slide', 'slide' + (i + 1))).join('');
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // The fixture wraps IntersectionObserver first and only then lets the "provider" build its
+    // observer, exactly the ordering scrapeWithPlaywright establishes between goto and search.
+    await page.setContent('<style>body{margin:0}#post-container{display:block}.post-card{display:block;height:300px;box-sizing:border-box;border:1px solid #ccc}</style><div id="post-container">' + lead + carousel + '</div><script>(function(){ const attr = "data-ff-pagination-sentinel"; const Native = window.IntersectionObserver; function Probed(cb, opts){ const o = new Native(cb, opts); const nat = o.observe.bind(o); o.observe = function(target){ for (const m of document.querySelectorAll("[" + attr + "]")) m.removeAttribute(attr); target.setAttribute(attr, "1"); return nat(target); }; return o; } Probed.prototype = Native.prototype; window.IntersectionObserver = Probed; const orig = Element.prototype.scrollIntoView; window.scrollCalls = []; Element.prototype.scrollIntoView = function(opts){ window.scrollCalls.push({ block: opts && opts.block, marker: this.getAttribute("data-marker"), index: Array.prototype.indexOf.call(document.querySelectorAll("#post-container .post-card"), this) }); return orig.call(this, opts); }; window.paginationFires = 0; const sentinel = document.querySelector(\'#post-container .post-card[data-marker="parent"]\'); const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; io.disconnect(); window.paginationFires++; document.getElementById("post-container").insertAdjacentHTML("beforeend", \'<article class="post-card" data-marker="next"><span class="likes-trigger" data-id="PNEXT"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=next">d</a></article>\'); }, { rootMargin: "200px" }); io.observe(sentinel); })();</script>');
+
+    const setup = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('#post-container .post-card')];
+      const marked = document.querySelector('[data-ff-pagination-sentinel]');
+      return { markedMarker: marked && marked.getAttribute('data-marker'), markedIndex: cards.indexOf(marked), lastIndex: cards.length - 1, markedTop: marked.getBoundingClientRect().top, viewport: window.innerHeight, idsPresent: cards.filter(c => c.querySelector('[data-id]')).length };
+    });
+    assert.equal(setup.markedMarker, 'parent', 'observe() must mark the element the provider watches');
+    assert.equal(setup.markedIndex, 8);
+    assert.equal(setup.lastIndex, 14, 'sentinel must sit 6 slides above the final DOM card');
+    assert.equal(setup.idsPresent, 8, 'only the 8 lead posts carry a data-id');
+    assert.ok(setup.markedTop > setup.viewport + 200, 'sentinel must start outside viewport + rootMargin; top=' + setup.markedTop);
+    await page.waitForTimeout(250);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'observer must not fire on load');
+
+    // Both markup heuristics land here: with no data-id anywhere in the trailing run, the id-run
+    // rule degrades to the last card, which is a slide six cards below the real sentinel.
+    await page.evaluate(() => { const cards = document.querySelectorAll('#post-container .post-card'); cards[cards.length - 1].scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }); });
+    await page.waitForTimeout(500);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'centering the last slide must not reach the provider sentinel');
+    assert.equal((await lib.getRenderedCardState(page)).count, 15, 'no growth from scrolling the wrong card');
+
+    await page.evaluate(() => { window.scrollCalls = []; });
+    const before = await lib.getRenderedCardState(page);
+    assert.deepEqual(before.ids, ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8']);
+    const started = Date.now();
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 12000, growthWaitMs: 6000, settleMs: 500, maxRecenters: 1 });
+    assert.equal(after.grew, true, 'centering the observed sentinel must trigger provider pagination');
+    assert.equal(after.sentinelSource, 'observed');
+    assert.equal(after.sentinelIndex, 8);
+    assert.equal(after.sentinelId, null, 'the sentinel legitimately has no data-id here');
+    assert.ok(after.ids.includes('PNEXT'), 'new batch must be observed: ' + JSON.stringify(after.ids));
+    assert.equal(after.count, 16);
+    assert.equal(await page.evaluate(() => window.paginationFires), 1);
+    const calls = await page.evaluate(() => window.scrollCalls);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].block, 'center');
+    assert.equal(calls[0].marker, 'parent', 'must center the observed sentinel, not a slide; centered a ' + calls[0].marker);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('sentinel probe marks each newly observed element, clears the previous one, and still paginates', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  assert.equal(lib.PAGINATION_SENTINEL_ATTR, 'data-ff-pagination-sentinel', 'fixtures hardcode this attribute; keep them in step');
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    await page.setContent('<div id="a">a</div><div id="b">b</div><div id="c">c</div>');
+    assert.equal(await lib.installPaginationSentinelProbe(page), true);
+    assert.equal(await lib.installPaginationSentinelProbe(page), true, 'installing twice must not double-wrap');
+
+    const marks = await page.evaluate(attr => {
+      const seen = [];
+      const read = () => [...document.querySelectorAll('[' + attr + ']')].map(el => el.id).join(',');
+      const first = new IntersectionObserver(() => {}); first.observe(document.getElementById('a')); seen.push(read());
+      const second = new IntersectionObserver(() => {}); second.observe(document.getElementById('b')); seen.push(read());
+      second.disconnect();
+      const third = new IntersectionObserver(() => {}); third.observe(document.getElementById('c')); seen.push(read());
+      return seen;
+    }, lib.PAGINATION_SENTINEL_ATTR);
+    assert.deepEqual(marks, ['a', 'b', 'c'], 'exactly one element is marked at a time and it is the latest observed');
+
+    // The wrapper must not break the observer it wraps: a visible element still fires.
+    const fired = await page.evaluate(() => new Promise(resolve => {
+      const io = new IntersectionObserver(entries => { if (entries[0].isIntersecting) { io.disconnect(); resolve(true); } });
+      io.observe(document.getElementById('a'));
+      setTimeout(() => resolve(false), 2000);
+    }));
+    assert.equal(fired, true, 'wrapped observers must still deliver intersections');
+  } finally {
+    await browser.close();
+  }
+});
+
 test('attached browser cleanup disconnects transport without closing external server marker', async () => {
   const events = [];
   const externalServer = { closed: false };

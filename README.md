@@ -63,7 +63,9 @@ Manifest and status are mode 600. Receipts include ID, category, media type, ide
 
 ## Website contract
 
-The scraper expects `input#search-input`, `button#download-btn`, `#post-container .post-card`, shortcode from descendant `[data-id]`, type from `[data-type]`, `.content-download-btn[href]` as HTTPS `instacognito.com/media?id=...`, date from the final meaningful `.post-footer` text, and a robust integer profile-header post count. Pagination scrolls the last rendered `.post-card` into view center and waits for unique IDs/card changes/loading state, not the page footer.
+The scraper expects `input#search-input`, `button#download-btn`, `#post-container .post-card`, shortcode from descendant `[data-id]`, type from `[data-type]`, `.content-download-btn[href]` as HTTPS `instacognito.com/media?id=...`, date from the final meaningful `.post-footer` text, and a robust integer profile-header post count. Pagination scrolls the provider's own pagination sentinel into view center and waits for unique IDs/card changes/loading state, not the page footer. The sentinel is the element the provider's `IntersectionObserver` actually watches: FrameFerry wraps the `IntersectionObserver` constructor after navigation and before the search click, so whichever element the provider registers is marked as it is observed. Resolution is fail-closed and documented in order: the observed element, else the first card of the trailing same-`data-id` run (a carousel renders its slides as sibling `.post-card`s inheriting the parent's `data-id`), else the last rendered `.post-card`.
+
+Each pagination step reports which sentinel it used. `sentinelSource` is `observed`, `id-run`, or `last-card`, matching that resolution order. `sentinelIndex` is the sentinel's zero-based position among the rendered `#post-container .post-card` elements. `sentinelId` is the sentinel's `data-id`, and is legitimately `null` for a post that carries no `data-id` at all (a post with no engagement renders neither `.likes-trigger` nor `.comments-trigger`); a `null` here is not a failure signal.
 
 ## Supported capability matrix
 
@@ -99,7 +101,8 @@ A ZIP can be packaged successfully even when the archive itself is only partial.
 - This is **not** an Instagram account export.
 - It can preserve only what the provider's public UI exposes.
 - Provider captions in the visible DOM are truncated to 125 characters, so FrameFerry records them as `captionTruncated` rather than pretending they are full captions.
-- `dateParsed` is written only when the raw provider string parses unambiguously; `dateRaw` is always retained.
+- FrameFerry never infers a missing year and never resolves an ambiguous date. When the provider string carries no explicit four-digit year, or does not parse, the cleaned provider text is preserved verbatim in `dateParsed` instead of being converted to a timestamp; `dateRaw` is always retained.
+- `dateParsed` is therefore not guaranteed to be a timestamp. A consumer must check that the value is an ISO-8601 timestamp before treating it as a date.
 - Deleted, expired, private, CAPTCHA-blocked, or otherwise hidden stories cannot be recovered.
 
 ## Status model

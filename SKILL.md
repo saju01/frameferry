@@ -71,6 +71,8 @@ Do not assume a globally linked `frameferry` binary. Use `node ./bin/frameferry.
 - `stories` and `highlights` have no stable provider shortcode in the public DOM, so later syncs re-fetch them and dedupe after hashing.
 - Section outcomes can be `COMPLETE`, `PARTIAL`, `UNAVAILABLE`, `BLOCKED`, `DEFERRED`, or `ACTION_REQUIRED` depending on what the provider visibly exposed.
 - A successful ZIP package does not prove the archive itself is complete; the completeness split is recorded inside the ZIP metadata.
+- Pagination follows the element the provider's own `IntersectionObserver` watches, not the last rendered card; where that probe is unavailable it falls back fail-closed to the trailing same-`data-id` run, then the last card.
+- Dates are never guessed: a provider string with no explicit year, or one that does not parse, is preserved verbatim, so `dateParsed` is not always a timestamp and must be checked before use.
 
 ## ZIP safety
 
