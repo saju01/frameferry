@@ -71,8 +71,10 @@ Do not assume a globally linked `frameferry` binary. Use `node ./bin/frameferry.
 - `stories` and `highlights` have no stable provider shortcode in the public DOM, so later syncs re-fetch them and dedupe after hashing.
 - Section outcomes can be `COMPLETE`, `PARTIAL`, `UNAVAILABLE`, `BLOCKED`, `DEFERRED`, or `ACTION_REQUIRED` depending on what the provider visibly exposed.
 - A successful ZIP package does not prove the archive itself is complete; the completeness split is recorded inside the ZIP metadata.
+- Pagination follows the element the provider's own `IntersectionObserver` watches, not the last rendered card; where that probe is unavailable it falls back fail-closed to the trailing same-`data-id` run, then the last card.
+- Dates are never guessed: a provider string with no explicit year, or one that does not parse, is preserved verbatim, so `dateParsed` is not always a timestamp and must be checked before use.
 - Dates are only as good as the provider label. Report `dateStatus`/`dateProvenance` as they are: a yearless label such as `23 August` or a relative one such as `2d ago` is `unresolved`, and you must not guess its year from neighbouring items, from scrape order, or from today's date. Say "date unresolved", never invent one.
-- Pagination centers the element the provider is actually observing. `scrollLastCardCenterAndWaitForGrowth` returns `sentinelSource`/`sentinelIndex`/`sentinelId` to a programmatic caller; these are not currently surfaced in `status.json` or CLI output, so do not tell an operator to read them from a run.
+- `scrollLastCardCenterAndWaitForGrowth` returns `sentinelSource`/`sentinelIndex`/`sentinelId` to a programmatic caller; they are not surfaced in `status.json` or CLI output, so do not tell an operator to read them from a run.
 
 ## ZIP safety
 

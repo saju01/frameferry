@@ -63,7 +63,9 @@ Manifest and status are mode 600. Receipts include ID, category, media type, ide
 
 ## Website contract
 
-The scraper expects `input#search-input`, `button#download-btn`, `#post-container .post-card`, shortcode from descendant `[data-id]`, type from `[data-type]`, `.content-download-btn[href]` as HTTPS `instacognito.com/media?id=...`, date from the final meaningful `.post-footer` text, and a robust integer profile-header post count. Pagination scrolls the last rendered `.post-card` into view center and waits for unique IDs/card changes/loading state, not the page footer.
+The scraper expects `input#search-input`, `button#download-btn`, `#post-container .post-card`, shortcode from descendant `[data-id]`, type from `[data-type]`, `.content-download-btn[href]` as HTTPS `instacognito.com/media?id=...`, date from the final meaningful `.post-footer` text, and a robust integer profile-header post count. Pagination scrolls the provider's own pagination sentinel into view center and waits for unique IDs/card changes/loading state, not the page footer. The sentinel is the element the provider's `IntersectionObserver` actually watches: FrameFerry wraps the `IntersectionObserver` constructor after navigation and before the search click, so whichever element the provider registers is marked as it is observed. Resolution is fail-closed and documented in order: the observed element, else the first card of the trailing same-`data-id` run (a carousel renders its slides as sibling `.post-card`s inheriting the parent's `data-id`), else the last rendered `.post-card`.
+
+Each pagination step reports which sentinel it used. `sentinelSource` is `observed`, `id-run`, or `last-card`, matching that resolution order. `sentinelIndex` is the sentinel's zero-based position among the rendered `#post-container .post-card` elements. `sentinelId` is the sentinel's `data-id`, and is legitimately `null` for a post that carries no `data-id` at all (a post with no engagement renders neither `.likes-trigger` nor `.comments-trigger`); a `null` here is not a failure signal.
 
 ## Supported capability matrix
 
@@ -99,6 +101,8 @@ A ZIP can be packaged successfully even when the archive itself is only partial.
 - This is **not** an Instagram account export.
 - It can preserve only what the provider's public UI exposes.
 - Provider captions in the visible DOM are truncated to 125 characters, so FrameFerry records them as `captionTruncated` rather than pretending they are full captions.
+- FrameFerry never infers a missing year and never resolves an ambiguous date. When the provider string carries no explicit four-digit year, or does not parse, the cleaned provider text is preserved verbatim in `dateParsed` instead of being converted to a timestamp; `dateRaw` is always retained.
+- `dateParsed` is therefore not guaranteed to be a timestamp. A consumer must check that the value is an ISO-8601 timestamp before treating it as a date.
 - `dateRaw` is always retained. `dateParsed` keeps its long-standing "best available text" meaning, so it is an ISO timestamp when the label parsed and an echo of the label when it did not.
 - Because that is ambiguous, every item and receipt also carries explicit provenance: `dateStatus` (`resolved` or `unresolved`), `dateProvenance` (`provider-iso`, `provider-explicit-year`, `provider-unparsed-label`, `provider-relative-label`, `provider-yearless-label`, `caller-proven`, or `none`), `dateResolved` (an ISO timestamp, and authoritative only when `dateStatus` is `resolved`), and `dateEvidence`.
 - A year is never inferred. A yearless label such as `23 August`, a relative one such as `2d ago`, a month-precision one such as `August 2024`, and one naming a day that never existed -- date-only (`2024-02-31`) or time-bearing (`2024-02-31T00:00:00Z`) -- all stay `unresolved` with the raw label preserved. A date resolves only when the text spells a complete, valid calendar date.

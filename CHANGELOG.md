@@ -1,9 +1,7 @@
 # Changelog
 
-## 0.2.1 - 2026-09-06
+## 0.2.2 - 2026-09-06
 
-- Fix pagination stalling early: the provider hangs its pagination `IntersectionObserver` on the last post's top-level card and then appends that post's carousel slides as sibling cards, so centering the final DOM card parked the real sentinel outside the observer margin and no further pages loaded. FrameFerry now instruments the page's `IntersectionObserver` before searching and recenters whichever element the provider is actually observing, falling back to the trailing same-`data-id` run and then to the last card.
-- Report `sentinelSource`, `sentinelIndex`, and `sentinelId` from the growth loop so a future stall names the path it took.
 - Add explicit, machine-readable date provenance to every normalized item and receipt: `dateStatus`, `dateProvenance`, `dateResolved`, and `dateEvidence`. A timestamp is authoritative only for an explicit four-digit year or already-ISO input; yearless and relative labels stay unresolved with the raw label preserved, and no year is ever inferred from neighbouring items, scrape order, or the wall clock.
 - Add `requireCaptureTimestamp`, which fails closed rather than letting an unresolved date reach anything that needs a real capture instant.
 - Add `planPendingImport`, a pure advisory helper that groups byte-identical media by SHA-256 before a pending import so identical bytes are registered once, while preserving every source reference, category, and stable ID, reporting truthful unique-byte versus reference counts, and holding disputed identities and malformed entries instead of discarding them.
@@ -14,6 +12,15 @@
 - Make date evidence a closed vocabulary (`{ kind, note }`) instead of free text, with every URL-shaped token stripped, control characters removed, and the note length-capped before it is persisted or exported.
 - Harden signed-provider-URL redaction to cover case variants, explicit ports, userinfo, subdomains, protocol-relative forms, and any query parameter order.
 - `planPendingImport` now preserves every field a caller supplied on each reference, reports invalid or missing categories instead of coercing them to `posts`, validates stable IDs arriving through `known`, rejects bare dot segments and leading dashes, surfaces array holes as errors, and raises `BAD_ARGS` for a non-iterable batch.
+
+## 0.2.1 - 2026-09-06
+
+- Identify the pagination sentinel by observing which element the provider's own `IntersectionObserver` watches, instead of assuming the last rendered `.post-card`.
+- Fix stalled pagination: a carousel renders its slides as sibling `.post-card`s after the post's top-level card, so centering the final DOM card parked the real sentinel outside the observer's 200px `rootMargin` and growth stopped.
+- Retain the markup heuristics as fail-closed fallbacks for pages where the probe was not installed: first card of the trailing same-`data-id` run, then the last card.
+- Report `sentinelIndex`, `sentinelId`, and `sentinelSource` in the returned pagination state.
+- Correct the documented pagination contract to the observed-sentinel mechanism and its fallback order.
+- Correct the `dateParsed` documentation: a provider string with no explicit year, or one that does not parse, is preserved verbatim rather than converted to a timestamp.
 
 ## 0.2.0 - 2026-09-05
 

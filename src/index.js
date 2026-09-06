@@ -8,7 +8,7 @@ const net = require('node:net');
 const { setTimeout: delay } = require('node:timers/promises');
 const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -1132,11 +1132,7 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
       scroll(cards[index]);
       return { sentinelIndex: index, sentinelId: lastId || null, sentinelSource: lastId ? 'id-run' : 'last-card' };
     }, PAGINATION_SENTINEL_ATTR);
-    if (!found) {
-      // Do not keep reporting a sentinel from an earlier iteration that no longer resolves.
-      sentinel = null;
-      return false;
-    }
+    if (!found) return false;
     sentinel = found;
     return true;
   }
