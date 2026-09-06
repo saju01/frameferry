@@ -957,7 +957,7 @@ test('continuation grace re-arms the observed sentinel when the first trigger fi
   const browser = await chromium.launch({ headless: true, executablePath: exe });
   try {
     const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
-    // The Sydney trace: the observed sentinel is present and valid, the first bounded trigger
+    // The production trace: the observed sentinel is present and valid, the first bounded trigger
     // produces no /api/posts request at all, and the second trigger paginates normally.
     const seen = await serveContinuationFixture(page, 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; if (window.intersections < 2) return; io.disconnect(); fetch("/api/posts", { method: "POST", body: "{}" }).then(r => r.json()).then(d => window.appendBatch(d.count)); }, { rootMargin: "200px" }); io.observe(window.sentinel);', jsonRoute({ count: 3 }));
     const monitor = lib.attachContinuationRequestMonitor(page);
@@ -1466,7 +1466,7 @@ test('a challenge that appears during the re-arm pause stops the grace recenter'
     const challenge = '<form id="challenge-form" style="display:none;width:320px;height:90px">verify you are human</form>';
     const provider = 'window.armedAt = null;'
       + 'window.addEventListener("scroll", function(){ if (window.intersections >= 1 && window.scrollY < 5 && window.armedAt === null) { window.armedAt = Date.now(); document.getElementById("challenge-form").style.display = "block"; } });'
-      // The Sydney shape: the first bounded trigger issues no request, so the call reaches grace.
+      // The production shape: the first bounded trigger issues no request, so the call reaches grace.
       + 'const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; window.intersections++; if (window.intersections < 2) return; io.disconnect(); fetch("/api/posts", { method: "POST", body: "{}" }).then(function(r){ return r.json(); }).then(function(d){ window.appendBatch(d.count); }); }, { rootMargin: "200px" }); io.observe(window.sentinel);';
     const seen = await serveContinuationFixture(page, provider, jsonRoute({ count: 3 }), challenge);
     const monitor = lib.attachContinuationRequestMonitor(page);
@@ -1688,7 +1688,7 @@ test('a profile that answers after the old fixed wait is still read, with its re
     // The readiness trace: /api/posts lands first and renders cards, /api/profile answers 1058ms
     // after the click. The old fixed 500ms read saw cards, an empty username and no total.
     const html = '<!doctype html><div id="profile-section"></div><div id="post-container"><article class="post-card"><span class="likes-trigger" data-id="P1"><span>1</span></span></article></div>'
-      + '<script>setTimeout(function(){ document.getElementById("profile-section").innerHTML = \'<span class="username-text">@syrn</span><div>253 posts 505.4k followers</div>\'; }, 1200);</script>';
+      + '<script>setTimeout(function(){ document.getElementById("profile-section").innerHTML = \'<span class="username-text">@fixture_profile</span><div>253 posts 505.4k followers</div>\'; }, 1200);</script>';
     const seen = { unexpected: [] };
     await page.route('**/*', route => {
       const url = new URL(route.request().url());
@@ -1701,17 +1701,17 @@ test('a profile that answers after the old fixed wait is still read, with its re
 
     // What the old fixed 500ms wait produced: cards on screen, profile not yet answered.
     await page.waitForTimeout(500);
-    const early = await lib.extractProfileFromPage(page, 'syrn');
+    const early = await lib.extractProfileFromPage(page, 'fixture_profile');
     assert.equal(early.reportedPostCount, null, 'the fixture must really be unready at 500ms');
 
     const started = Date.now();
-    const ready = await lib.waitForProfileReady(page, 'syrn', { started, maxTimeMs: 30000 });
+    const ready = await lib.waitForProfileReady(page, 'fixture_profile', { started, maxTimeMs: 30000 });
     assert.equal(ready.ready, true, 'the bounded wait must see the late profile');
     assert.equal(ready.matched, true, 'readiness requires the requested username, not just any profile');
     assert.equal(ready.blocked, null);
-    const profile = await lib.extractProfileFromPage(page, 'syrn');
+    const profile = await lib.extractProfileFromPage(page, 'fixture_profile');
     assert.equal(profile.reportedPostCount, 253, 'the real total must be read, never invented and never null');
-    assert.equal(profile.handle, 'syrn');
+    assert.equal(profile.handle, 'fixture_profile');
     assert.ok(Date.now() - started < 30000);
     assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
   } finally {
@@ -1738,7 +1738,7 @@ test('a profile that never arrives stays unknown within bounds instead of faking
     });
     await page.goto(PROFILE_FIXTURE_URL, { waitUntil: 'domcontentloaded' });
     const started = Date.now();
-    const ready = await lib.waitForProfileReady(page, 'syrn', { started, maxTimeMs: 30000, waitMs: 900 });
+    const ready = await lib.waitForProfileReady(page, 'fixture_profile', { started, maxTimeMs: 30000, waitMs: 900 });
     const elapsed = Date.now() - started;
     assert.equal(ready.ready, false, 'a mismatched profile is not readiness');
     assert.equal(ready.matched, false);
@@ -1898,14 +1898,14 @@ test('a stale mismatched profile is never consumed and no section is scraped fro
     const monitor = lib.attachContinuationRequestMonitor(page);
     try {
       // The trap: 2 visible cards against @someoneelse's total of 2 would look complete.
-      const stale = await lib.extractProfileFromPage(page, 'syrn');
+      const stale = await lib.extractProfileFromPage(page, 'fixture_profile');
       assert.equal(stale.reportedPostCount, 2, 'the fixture must really offer a satisfiable foreign total');
 
       const started = Date.now();
-      const scan = await lib.scanReadyProfilePage(page, { handle: 'syrn', maxPages: 4, maxTimeMs: 20000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor, });
+      const scan = await lib.scanReadyProfilePage(page, { handle: 'fixture_profile', maxPages: 4, maxTimeMs: 20000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor, });
       assert.equal(scan.profile.reportedPostCount, null, 'a foreign total must never become this handle’s total');
       assert.equal(scan.profile.rawProfileText, null, 'no profile text may be carried from a mismatched page');
-      assert.equal(scan.profile.handle, 'syrn');
+      assert.equal(scan.profile.handle, 'fixture_profile');
       assert.equal(scan.sections.length, 1);
       const posts = scan.sections[0];
       assert.equal(posts.status, 'ACTION_REQUIRED', 'unproven readiness is action-required, never COMPLETE');
@@ -1940,7 +1940,7 @@ test('readiness stopped by a visible challenge reports BLOCKED and scrapes nothi
     const monitor = lib.attachContinuationRequestMonitor(page);
     try {
       const started = Date.now();
-      const scan = await lib.scanReadyProfilePage(page, { handle: 'syrn', maxPages: 4, maxTimeMs: 20000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
+      const scan = await lib.scanReadyProfilePage(page, { handle: 'fixture_profile', maxPages: 4, maxTimeMs: 20000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
       const elapsed = Date.now() - started;
       const posts = scan.sections[0];
       assert.equal(posts.status, 'BLOCKED', 'a challenge during readiness is blocked evidence, not a timeout');
@@ -1969,15 +1969,15 @@ test('a matching ready profile still scrapes its section end to end', async (t) 
   try {
     const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
     // The gate must not become a wall: a confirmed profile scrapes exactly as before.
-    const html = STALE_PROFILE_HTML.replace('@someoneelse', '@syrn').replace('2 posts', '2 posts');
+    const html = STALE_PROFILE_HTML.replace('@someoneelse', '@fixture_profile').replace('2 posts', '2 posts');
     const seen = await serveProfilePage(page, html);
     const monitor = lib.attachContinuationRequestMonitor(page);
     try {
       const started = Date.now();
-      const scan = await lib.scanReadyProfilePage(page, { handle: 'syrn', maxPages: 2, maxTimeMs: 15000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
+      const scan = await lib.scanReadyProfilePage(page, { handle: 'fixture_profile', maxPages: 2, maxTimeMs: 15000, categories: ['posts'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
       const posts = scan.sections[0];
       assert.equal(scan.profile.reportedPostCount, 2, 'a confirmed profile keeps its real total');
-      assert.equal(scan.profile.handle, 'syrn');
+      assert.equal(scan.profile.handle, 'fixture_profile');
       assert.equal(posts.itemCount, 2, 'the visible cards are scraped once the profile is confirmed');
       assert.equal(posts.uniquePostCount, 2);
       assert.deepEqual(posts.items.map(i => i.shortcode), ['X1', 'X2']);
@@ -2012,7 +2012,7 @@ test('a failure is cleared only by a verified matching receipt, and an unresolve
   assert.ok(manifest.completed['A-0'], 'A must have a receipt');
   assert.ok(manifest.failed['B-0'], 'B must be a real failure');
 
-  // The observed Sydney state: an ID that really was downloaded is ALSO listed as failed, and the
+  // The observed production state: an ID that really was downloaded is ALSO listed as failed, and the
   // next scan does not rediscover it. 429 of 1514 "failures" were of exactly this shape.
   manifest.failed['A-0'] = { stableId: 'A-0', category: 'posts', shortcode: 'A', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
   await writeManifestRaw(out, manifest);
@@ -2784,7 +2784,7 @@ test('R3-2 a crashed takeover claim is recovered, and a live one still admits no
 });
 
 // --- live finding: outcome maps must be pairwise disjoint in every persisted view ---------------
-// Reproduces the shape observed on the first bounded Sydney run at 0fa0eb9: 1243 receipts written
+// Reproduces the shape observed on the first bounded production run at 0fa0eb9: 1243 receipts written
 // before providerMediaFingerprint existed, so every carousel slide failed the reuse gate, fell
 // through to the budget check, and was filed as pending while still recorded as completed.
 

@@ -1223,7 +1223,7 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   if (grew) return decorate(await getRenderedCardState(page));
 
   // The primary window ended with no growth. Before calling that a terminal boundary, spend a
-  // bounded, request-aware grace budget: the Sydney trace shows a first bounded trigger that
+  // bounded, request-aware grace budget: the production trace shows a first bounded trigger that
   // issued no continuation request at all followed by a second that returned HTTP 200 with 19
   // items, so one silent window is not evidence that the provider has nothing left.
   if (await refreshBlocked()) return decorate(await getRenderedCardState(page));
