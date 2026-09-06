@@ -8,7 +8,7 @@ const net = require('node:net');
 const { setTimeout: delay } = require('node:timers/promises');
 const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -212,6 +212,107 @@ function parseDateText(value) {
   const t = Date.parse(clean);
   return Number.isFinite(t) ? new Date(t).toISOString() : clean;
 }
+// Date provenance -------------------------------------------------------------
+// parseDateText (above) is deliberately unchanged: it returns an ISO timestamp when it can and
+// echoes the human label when it cannot, so `dateParsed` alone can never tell a caller whether
+// it holds a proven instant or a piece of display text. The fields below make that difference
+// explicit and machine-readable. A year is NEVER inferred -- not from neighbouring items, not
+// from scrape order, and not from the wall clock -- so a yearless or relative label stays
+// unresolved until a caller supplies a per-item proof.
+const DATE_STATUSES = new Set(['resolved', 'unresolved']);
+const DATE_PROVENANCES = new Set([
+  'provider-iso',            // input was already an ISO-8601 date; UTC, deterministic
+  'provider-explicit-year',  // label carried an explicit 4-digit year; day precision, host TZ
+  'provider-unparsed-label', // explicit year present but the label did not parse to that year
+  'provider-relative-label', // "2d", "3 hours ago", "yesterday" -- no absolute instant
+  'provider-yearless-label', // "23 August" -- ambiguous across years
+  'caller-proven',           // caller supplied a proven date plus the evidence for it
+  'none'                     // no date text at all
+]);
+const EXPLICIT_YEAR_RE = /\b((?:19|20)\d{2})\b/;
+const ISO_DATE_RE = /^(?:19|20)\d{2}-\d{2}(?:-\d{2})?(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+const RELATIVE_DATE_RE = /\bago\b|\byesterday\b|\btoday\b|\bjust now\b|\blast (?:week|month|year)\b|^\d+\s*(?:s|m|h|d|w|min|mins|hr|hrs)$/i;
+function cleanDateText(value) {
+  if (value == null) return null;
+  const text = String(value);
+  return text.split('\n').map(s => s.trim()).filter(Boolean).at(-1) || text.trim() || null;
+}
+function unresolvedDate(dateRaw, dateParsed, provenance) {
+  return { dateRaw, dateParsed, dateResolved: null, dateStatus: 'unresolved', dateProvenance: provenance, dateEvidence: null };
+}
+// Returns the full date field set for one item. `dateProven`/`dateEvidence` are NEW input names
+// on purpose: the long-standing `dateParsed` input keeps its "best available text" meaning and
+// can never promote an item to resolved, so existing callers cannot trip the proof validation.
+function resolveItemDate(value, opts = {}) {
+  const options = (opts && typeof opts === 'object' && !Array.isArray(opts)) ? opts : {};
+  const dateRaw = value == null ? null : (String(value).trim() || null);
+  const dateParsed = parseDateText(value);
+  const hasProof = options.dateProven != null || options.dateEvidence != null;
+  if (hasProof) {
+    const where = options.itemRef ? ' for ' + options.itemRef : '';
+    const evidence = typeof options.dateEvidence === 'string' ? options.dateEvidence.trim() : '';
+    if (!evidence) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven requires dateEvidence describing the per-item proof' + where);
+    if (options.dateProven == null) throw new ArchiveError('BAD_DATE_PROOF', 'dateEvidence supplied without dateProven' + where);
+    const proven = String(options.dateProven).trim();
+    const year = proven.match(EXPLICIT_YEAR_RE);
+    if (!year) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven must carry an explicit four-digit year' + where);
+    const t = Date.parse(proven);
+    if (!Number.isFinite(t)) throw new ArchiveError('BAD_DATE_PROOF', 'dateProven is not a parseable timestamp' + where);
+    const iso = new Date(t).toISOString();
+    // Evidence is caller-supplied free text that lands in receipts and the exported ZIP.
+    return { dateRaw, dateParsed: iso, dateResolved: iso, dateStatus: 'resolved', dateProvenance: 'caller-proven', dateEvidence: redactSignedUrls(evidence) };
+  }
+  const clean = cleanDateText(value);
+  if (!clean) return { dateRaw, dateParsed, dateResolved: null, dateStatus: 'unresolved', dateProvenance: 'none', dateEvidence: null };
+  if (ISO_DATE_RE.test(clean)) {
+    const t = Date.parse(clean);
+    if (Number.isFinite(t)) return { dateRaw, dateParsed, dateResolved: new Date(t).toISOString(), dateStatus: 'resolved', dateProvenance: 'provider-iso', dateEvidence: null };
+  }
+  const year = clean.match(EXPLICIT_YEAR_RE);
+  if (year) {
+    const t = Date.parse(clean);
+    // Date.parse is lenient enough to mint a timestamp out of text like "1999 likes"; require the
+    // instant it produced to actually land in the year the label spelled out.
+    if (Number.isFinite(t) && new Date(t).getFullYear() === Number(year[1])) {
+      return { dateRaw, dateParsed, dateResolved: new Date(t).toISOString(), dateStatus: 'resolved', dateProvenance: 'provider-explicit-year', dateEvidence: null };
+    }
+    return unresolvedDate(dateRaw, dateParsed, 'provider-unparsed-label');
+  }
+  if (RELATIVE_DATE_RE.test(clean)) return unresolvedDate(dateRaw, dateParsed, 'provider-relative-label');
+  return unresolvedDate(dateRaw, dateParsed, 'provider-yearless-label');
+}
+// Fail closed: anything that needs a real capture instant must refuse an unresolved item rather
+// than substitute a guess. Returns the ISO string so callers can use it directly.
+function requireCaptureTimestamp(record, context = 'operation') {
+  const status = record?.dateStatus;
+  const resolved = record?.dateResolved;
+  const ok = status === 'resolved' && typeof resolved === 'string' && ISO_DATE_RE.test(resolved) && Number.isFinite(Date.parse(resolved));
+  if (!ok) {
+    throw new ArchiveError('DATE_UNRESOLVED', context + ' requires a proven capture timestamp; date is ' + (status || 'unknown') + ' (provenance ' + (record?.dateProvenance || 'none') + ')');
+  }
+  return resolved;
+}
+// Stored fields win when they are internally consistent; otherwise recompute from dateRaw so a
+// legacy receipt written before this contract degrades to unresolved instead of to a fabricated
+// timestamp. Used at every site that surfaces a receipt, so index.json and receipts/*.json agree.
+function receiptDateFields(record) {
+  const status = record?.dateStatus;
+  const provenance = record?.dateProvenance;
+  if (DATE_STATUSES.has(status) && DATE_PROVENANCES.has(provenance)) {
+    const resolved = record?.dateResolved;
+    const resolvedOk = typeof resolved === 'string' && ISO_DATE_RE.test(resolved) && Number.isFinite(Date.parse(resolved));
+    if (status === 'resolved' ? resolvedOk : resolved == null) {
+      return {
+        dateStatus: status,
+        dateProvenance: provenance,
+        dateResolved: status === 'resolved' ? resolved : null,
+        dateEvidence: provenance === 'caller-proven' && typeof record.dateEvidence === 'string' ? redactSignedUrls(record.dateEvidence) : null
+      };
+    }
+  }
+  const derived = resolveItemDate(record?.dateRaw ?? null);
+  return { dateStatus: derived.dateStatus, dateProvenance: derived.dateProvenance, dateResolved: derived.dateResolved, dateEvidence: derived.dateEvidence };
+}
 function parseReportedTotal(text) {
   if (!text) return null;
   const s = String(text);
@@ -280,6 +381,7 @@ function normalizeItems(rawItems, opts = {}) {
       nextIndex.set(key, carouselIndex + 1);
     }
     const dateRaw = raw.dateRaw ?? raw.dateText ?? null;
+    const resolvedDate = resolveItemDate(dateRaw, { dateProven: raw.dateProven, dateEvidence: raw.dateEvidence, itemRef: (shortcode || 'item') + '#' + items.length });
     const item = {
       category,
       shortcode: shortcode || null,
@@ -287,7 +389,11 @@ function normalizeItems(rawItems, opts = {}) {
       mediaType,
       href,
       dateRaw: dateRaw ? String(dateRaw).trim() : null,
-      dateParsed: raw.dateParsed || parseDateText(dateRaw),
+      dateParsed: resolvedDate.dateStatus === 'resolved' && resolvedDate.dateProvenance === 'caller-proven' ? resolvedDate.dateParsed : (raw.dateParsed || parseDateText(dateRaw)),
+      dateResolved: resolvedDate.dateResolved,
+      dateStatus: resolvedDate.dateStatus,
+      dateProvenance: resolvedDate.dateProvenance,
+      dateEvidence: resolvedDate.dateEvidence,
       captionTruncated: raw.captionTruncated ?? raw.caption ?? null,
       likes: raw.likes != null ? String(raw.likes) : null,
       comments: raw.comments != null ? String(raw.comments) : null,
@@ -302,6 +408,143 @@ function normalizeItems(rawItems, opts = {}) {
     items.push(item);
   }
   return { items, uniquePostCount: seenPosts.size };
+}
+// Pending-import dedup contract ----------------------------------------------
+// Advisory planner for a pending import batch: it groups byte-identical media by SHA-256 so a
+// consumer can upload or register each distinct byte sequence once, while keeping every source
+// reference that pointed at it. It performs no I/O and MUST NOT be read as a staging layout --
+// the on-disk archive stays one media file and one receipt per stableId, because export names
+// ZIP entries from the receipt path and would otherwise emit duplicate entry names. The dedup
+// this enables is "do not re-upload bytes we already sent", not "collapse files on disk".
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const STABLE_ID_RE = /^[A-Za-z0-9._-]+$/;
+const SHA_IDENTITY_RE = /(?:^|__)sha256-([0-9a-f]{64})$/;
+function pendingImportReference(entry, index) {
+  // Deliberately field-by-field rather than a spread: signed provider URLs (href) never reach
+  // persisted or reported JSON anywhere else in this codebase, and must not start here.
+  return {
+    sourceIndex: index,
+    stableId: String(entry?.stableId || '').trim(),
+    sha256: typeof entry?.sha256 === 'string' ? entry.sha256.trim().toLowerCase() : '',
+    category: VALID_CATEGORIES.includes(entry?.category) ? entry.category : 'posts',
+    shortcode: typeof entry?.shortcode === 'string' && entry.shortcode.trim() ? entry.shortcode.trim() : null,
+    carouselIndex: Number.isInteger(entry?.carouselIndex) ? entry.carouselIndex : 0,
+    mediaType: entry?.mediaType || 'unknown',
+    identityBasis: entry?.identityBasis || (entry?.shortcode ? 'provider-shortcode' : 'content-sha256'),
+    dateStatus: entry?.dateStatus === 'resolved' ? 'resolved' : 'unresolved',
+    dateProvenance: entry?.dateProvenance || 'none',
+    dateResolved: entry?.dateStatus === 'resolved' ? (entry.dateResolved ?? null) : null
+  };
+}
+function knownBySha(known) {
+  const pairs = known instanceof Map ? [...known.entries()] : Object.entries(known && typeof known === 'object' ? known : {});
+  const byStableId = new Map();
+  const bySha = new Map();
+  for (const [stableId, value] of pairs) {
+    const sha = typeof value === 'string' ? value.trim().toLowerCase() : (typeof value?.sha256 === 'string' ? value.sha256.trim().toLowerCase() : '');
+    if (!SHA256_RE.test(sha)) continue;
+    byStableId.set(String(stableId), sha);
+    if (!bySha.has(sha)) bySha.set(sha, String(stableId));
+  }
+  return { byStableId, bySha };
+}
+// Deterministic so a re-run after a partial import produces the same plan: a listing-order
+// dependent choice would re-upload the very bytes the previous run deduped.
+function chooseCanonical(references, knownStableId) {
+  if (knownStableId) return knownStableId;
+  const ranked = [...references].sort((a, b) => {
+    const aProv = a.identityBasis === 'provider-shortcode' ? 0 : 1;
+    const bProv = b.identityBasis === 'provider-shortcode' ? 0 : 1;
+    if (aProv !== bProv) return aProv - bProv;
+    return a.stableId < b.stableId ? -1 : a.stableId > b.stableId ? 1 : 0;
+  });
+  return ranked[0].stableId;
+}
+function planPendingImport(entries, opts = {}) {
+  const options = (opts && typeof opts === 'object' && !Array.isArray(opts)) ? opts : {};
+  const known = knownBySha(options.known);
+  const list = Array.isArray(entries) ? entries : [];
+  const errors = [];
+  const accepted = [];
+  // Errors are removed before grouping so a malformed entry can never masquerade as a conflict.
+  list.forEach((entry, index) => {
+    const ref = pendingImportReference(entry, index);
+    const reasons = [];
+    if (!SHA256_RE.test(ref.sha256)) reasons.push('invalid-sha256');
+    if (!ref.stableId) reasons.push('missing-stable-id');
+    else if (!STABLE_ID_RE.test(ref.stableId)) reasons.push('unsafe-stable-id');
+    const embedded = ref.stableId.match(SHA_IDENTITY_RE);
+    if (embedded && SHA256_RE.test(ref.sha256) && embedded[1] !== ref.sha256) reasons.push('stable-id-embeds-different-sha256');
+    // A category-prefixed id that disagrees with the entry's own category is a caller bug; ids
+    // with no valid category prefix are legacy post ids and are left alone.
+    const prefix = ref.stableId.includes('__') ? ref.stableId.slice(0, ref.stableId.indexOf('__')) : null;
+    if (prefix && VALID_CATEGORIES.includes(prefix) && prefix !== ref.category) reasons.push('category-disagrees-with-stable-id');
+    if (reasons.length) errors.push({ sourceIndex: index, reasons, reference: ref });
+    else accepted.push(ref);
+  });
+  // Same stableId claiming two different byte sequences -- inside the batch, or against an
+  // already-imported asset. Either way the identity is disputed, so nothing under it is staged.
+  const shaByStableId = new Map();
+  const conflictedIds = new Map();
+  for (const ref of accepted) {
+    const priorInBatch = shaByStableId.get(ref.stableId);
+    const priorKnown = known.byStableId.get(ref.stableId);
+    const prior = priorInBatch || priorKnown;
+    if (prior && prior !== ref.sha256) {
+      const seen = conflictedIds.get(ref.stableId) || new Set();
+      seen.add(prior).add(ref.sha256);
+      conflictedIds.set(ref.stableId, seen);
+    } else if (!priorInBatch) shaByStableId.set(ref.stableId, ref.sha256);
+  }
+  const conflicts = [...conflictedIds.entries()]
+    .map(([stableId, shas]) => ({ stableId, sha256: [...shas].sort(), knownSha256: known.byStableId.get(stableId) || null }))
+    .sort((a, b) => (a.stableId < b.stableId ? -1 : a.stableId > b.stableId ? 1 : 0));
+  const byShaGroups = new Map();
+  for (const ref of accepted) {
+    if (!byShaGroups.has(ref.sha256)) byShaGroups.set(ref.sha256, []);
+    byShaGroups.get(ref.sha256).push(ref);
+  }
+  const groups = [...byShaGroups.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([sha256, refs]) => {
+      const references = [...refs].sort((a, b) => (a.stableId < b.stableId ? -1 : a.stableId > b.stableId ? 1 : a.sourceIndex - b.sourceIndex));
+      const disputed = references.some(ref => conflictedIds.has(ref.stableId));
+      const knownStableId = known.bySha.get(sha256) || null;
+      return {
+        sha256,
+        status: disputed ? 'conflict' : 'ready',
+        canonicalStableId: chooseCanonical(references, disputed ? null : knownStableId),
+        alreadyPresent: Boolean(knownStableId),
+        knownStableId,
+        references,
+        stableIds: unique(references.map(ref => ref.stableId)).sort(),
+        categories: unique(references.map(ref => ref.category)).sort(),
+        referenceCount: references.length
+      };
+    });
+  const staged = groups.filter(group => group.status === 'ready');
+  const conflicted = groups.filter(group => group.status === 'conflict');
+  const stagedReferences = staged.reduce((sum, group) => sum + group.referenceCount, 0);
+  const conflictedReferences = conflicted.reduce((sum, group) => sum + group.referenceCount, 0);
+  const alreadyPresent = staged.filter(group => group.alreadyPresent).length;
+  return {
+    groups,
+    staged,
+    conflicts,
+    errors,
+    counts: {
+      references: list.length,
+      erroredReferences: errors.length,
+      stagedReferences,
+      conflictedReferences,
+      uniqueBytes: staged.length,
+      duplicateReferences: stagedReferences - staged.length,
+      alreadyPresent,
+      newUniqueBytes: staged.length - alreadyPresent,
+      conflicts: conflicts.length,
+      conflictedUniqueBytes: conflicted.length
+    }
+  };
 }
 function validateProviderMediaUrl(raw) {
   let u;
@@ -470,6 +713,7 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
       permalink: item.permalink ?? null,
       dateRaw: item.dateRaw ?? null,
       dateParsed: item.dateParsed ?? null,
+      ...receiptDateFields(item),
       highlightGroup: item.highlightGroup ?? null,
       likes: item.likes ?? null,
       comments: item.comments ?? null,
@@ -541,6 +785,7 @@ function publicItemSummary(item, index = 0) {
     captionTruncated: item?.captionTruncated ?? null,
     dateRaw: item?.dateRaw ?? null,
     dateParsed: item?.dateParsed ?? null,
+    ...receiptDateFields(item),
     likes: item?.likes ?? null,
     comments: item?.comments ?? null,
     permalink: item?.permalink ?? null,
@@ -672,6 +917,35 @@ async function getRenderedCardState(page) {
     ids: [...new Set(cards.map(card => card.querySelector('.likes-trigger[data-id], .comments-trigger[data-id], [data-id]')?.getAttribute('data-id')).filter(Boolean))]
   }));
 }
+const PAGINATION_SENTINEL_ATTR = 'data-ff-pagination-sentinel';
+// The provider creates exactly one IntersectionObserver, in `Te`, and re-creates it for every
+// rendered batch to watch the top-level card of the newest last post. Wrapping the constructor
+// after goto but before the search click means no observer can be created before the probe is
+// in place, so the marked element is always the live pagination sentinel -- no inference from
+// card markup, and correct even when that post carries no data-id at all.
+async function installPaginationSentinelProbe(page) {
+  return page.evaluate(attr => {
+    if (window.__ffPaginationSentinelProbe) return true;
+    const Native = window.IntersectionObserver;
+    if (typeof Native !== 'function') return false;
+    function Probed(callback, options) {
+      const observer = new Native(callback, options);
+      const nativeObserve = observer.observe.bind(observer);
+      observer.observe = function (target) {
+        try {
+          for (const marked of document.querySelectorAll('[' + attr + ']')) marked.removeAttribute(attr);
+          if (target && typeof target.setAttribute === 'function') target.setAttribute(attr, '1');
+        } catch { /* marking is best effort; never break the provider's own pagination */ }
+        return nativeObserve(target);
+      };
+      return observer;
+    }
+    Probed.prototype = Native.prototype;
+    window.IntersectionObserver = Probed;
+    window.__ffPaginationSentinelProbe = true;
+    return true;
+  }, PAGINATION_SENTINEL_ATTR);
+}
 async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started, maxTimeMs, growthWaitMs = 15000, settleMs = 1200, recenterEveryMs = 1000, maxRecenters = 3, targetUniqueCount = null } = {}) {
   const waitBudget = Math.max(1, Math.min(growthWaitMs, remainingTimeout(started, maxTimeMs)));
   const deadline = Date.now() + waitBudget;
@@ -683,20 +957,47 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   let lastGrowthAt = 0;
   let nextRecenterAt = 0;
   let recenterCount = 0;
-  async function recenterLastCard() {
-    const cards = page.locator('#post-container .post-card');
-    const count = await cards.count();
-    if (count === 0) return false;
-    await cards.nth(count - 1).evaluate(el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }));
+  let sentinel = null;
+  // The provider hangs its pagination IntersectionObserver (rootMargin 200px) on the TOP-LEVEL
+  // card of the last post, then appends that post's carousel slides as sibling .post-cards
+  // after it. Centering the final DOM card parks the real sentinel several card heights above
+  // the viewport, outside the observer's margin, and pagination stalls with no growth.
+  //
+  // installPaginationSentinelProbe marks whichever element the provider is actually observing,
+  // which is authoritative and needs no inference from card markup. The two heuristics below it
+  // are fail-closed fallbacks for pages where the probe was never installed (a caller driving
+  // this function directly, or an attached page navigated outside our control).
+  async function recenterPaginationSentinel() {
+    const found = await page.evaluate(attr => {
+      const scroll = el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+      const cards = [...document.querySelectorAll('#post-container .post-card')];
+      const idOf = card => card.querySelector('.likes-trigger[data-id], .comments-trigger[data-id], [data-id]')?.getAttribute('data-id') || '';
+      const observed = document.querySelector('[' + attr + ']');
+      if (observed && observed.isConnected) {
+        scroll(observed);
+        return { sentinelIndex: cards.indexOf(observed), sentinelId: idOf(observed) || null, sentinelSource: 'observed' };
+      }
+      if (!cards.length) return null;
+      let index = cards.length - 1;
+      const lastId = idOf(cards[index]);
+      // Carousel slides inherit the parent's data-id, so the first card of the trailing same-id
+      // run is that post's top-level card. Cards with no data-id at all (stories, highlight
+      // stories, zero-engagement posts) carry no identity: fall back to the last card.
+      if (lastId) while (index > 0 && idOf(cards[index - 1]) === lastId) index--;
+      scroll(cards[index]);
+      return { sentinelIndex: index, sentinelId: lastId || null, sentinelSource: lastId ? 'id-run' : 'last-card' };
+    }, PAGINATION_SENTINEL_ATTR);
+    if (!found) return false;
+    sentinel = found;
     return true;
   }
-  if (!await recenterLastCard()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0 };
+  if (!await recenterPaginationSentinel()) return { ...beforeState, grew: false, waitedMs: 0, recenterCount: 0, sentinelIndex: null, sentinelId: null, sentinelSource: null };
   recenterCount++;
   nextRecenterAt = Date.now() + recenterEveryMs;
   while (Date.now() < deadline && Date.now() - started < maxTimeMs) {
     const now = Date.now();
     if (now >= nextRecenterAt && recenterCount < maxRecenters) {
-      if (await recenterLastCard()) recenterCount++;
+      if (await recenterPaginationSentinel()) recenterCount++;
       nextRecenterAt = now + recenterEveryMs;
     }
     const state = await getRenderedCardState(page);
@@ -711,16 +1012,16 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
       bestState = state;
       bestCount = Math.max(bestCount, state.count);
       bestIds = stateIds;
-      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      if (targetUniqueCount && bestIds.size >= targetUniqueCount) return { ...state, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount, ...sentinel };
     }
     if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
       const finalState = await getRenderedCardState(page);
-      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount };
+      return { ...finalState, grew: true, sawLoading, waitedMs: waitBudget - Math.max(0, deadline - Date.now()), recenterCount, ...sentinel };
     }
     await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
   }
   const finalState = await getRenderedCardState(page);
-  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount };
+  return { ...finalState, grew, sawLoading, waitedMs: waitBudget, recenterCount, ...sentinel };
 }
 async function cleanupScrapeBrowser(page, browser) {
   if (page) await page.close().catch(() => {});
@@ -860,6 +1161,9 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     else { browser = await chromium.launch({ headless: true, executablePath: browserExecutable, channel: browserChannel, timeout: remainingTimeout(started, maxTimeMs) }); page = await browser.newPage(); }
     page.setDefaultTimeout(remainingTimeout(started, maxTimeMs));
     await page.goto(PROVIDER_PHOTO_URL, { waitUntil: 'domcontentloaded', timeout: remainingTimeout(started, maxTimeMs) });
+    // Must run after navigation and before the search click: the provider only builds its
+    // pagination observer once results render, so this is the last safe moment to wrap it.
+    await installPaginationSentinelProbe(page).catch(() => false);
     await page.fill('input#search-input', handle, { timeout: remainingTimeout(started, maxTimeMs) });
     await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
     await page.waitForTimeout(Math.min(500, remainingTimeout(started, maxTimeMs)));
@@ -1083,6 +1387,7 @@ async function exportProfile(opts = {}) {
     permalink: receipt.permalink ?? null,
     dateRaw: receipt.dateRaw ?? null,
     dateParsed: receipt.dateParsed ?? null,
+    ...receiptDateFields(receipt),
     highlightGroup: receipt.highlightGroup ?? null,
     bytes: receipt.bytes,
     sha256: receipt.sha256,
@@ -1111,7 +1416,7 @@ async function exportProfile(opts = {}) {
   generated.set(rootEntry + '/sections.json', Buffer.from(jsonText(sections)));
   generated.set(rootEntry + '/README.txt', Buffer.from(zipReadmeText(handle, status)));
   for (const receipt of receipts) {
-    const publicReceipt = { ...receipt, category: receiptCategory(receipt), identityBasis: receiptIdentityBasis(receipt) };
+    const publicReceipt = { ...receipt, category: receiptCategory(receipt), identityBasis: receiptIdentityBasis(receipt), ...receiptDateFields(receipt) };
     delete publicReceipt.href;
     generated.set(rootEntry + '/receipts/' + receiptStableId(receipt) + '.json', Buffer.from(jsonText(publicReceipt)));
   }
@@ -1198,8 +1503,12 @@ module.exports = {
   legacyStableMediaId,
   stableMediaId,
   parseDateText,
+  resolveItemDate,
+  requireCaptureTimestamp,
+  receiptDateFields,
   normalizeItems,
   parseReportedTotal,
+  planPendingImport,
   validateProviderMediaUrl,
   validateRedirectTarget,
   isPrivateIp,
@@ -1212,6 +1521,8 @@ module.exports = {
   archiveProfile,
   exportProfile,
   getRenderedCardState,
+  PAGINATION_SENTINEL_ATTR,
+  installPaginationSentinelProbe,
   scrollLastCardCenterAndWaitForGrowth,
   scrapeWithPlaywright,
   extractReportedTotalFromPage,

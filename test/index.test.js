@@ -405,6 +405,160 @@ test('pagination waits for partial batch to settle and recenters current last ca
   }
 });
 
+test('pagination centers the provider top-level sentinel, not a trailing carousel child card', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    // Provider shape: R() appends each post's carousel slides as SIBLING .post-cards that inherit
+    // the parent's data-id, and Te() observes only the last post's TOP-LEVEL card with a 200px
+    // rootMargin. data-marker is test-only and is what distinguishes parent from slide, since the
+    // provider renders byte-identical markup for both.
+    const card = (marker, id, media) => '<article class="post-card" data-marker="' + marker + '"><span class="likes-trigger" data-id="' + id + '"><span>5</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=' + media + '">d</a></article>';
+    const lead = Array.from({ length: 8 }, (_, i) => card('lead', 'P' + (i + 1), 'lead' + i)).join('');
+    const carousel = card('parent', 'PLAST', 'slide0') + Array.from({ length: 6 }, (_, i) => card('slide', 'PLAST', 'slide' + (i + 1))).join('');
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    await page.setContent('<style>body{margin:0}#post-container{display:block}.post-card{display:block;height:300px;box-sizing:border-box;border:1px solid #ccc}</style><div id="post-container">' + lead + carousel + '</div><script>(function(){ const orig = Element.prototype.scrollIntoView; window.scrollCalls = []; Element.prototype.scrollIntoView = function(opts){ const tag = this.querySelector("[data-id]"); window.scrollCalls.push({ block: opts && opts.block, marker: this.getAttribute("data-marker"), id: tag ? tag.getAttribute("data-id") : null, index: Array.prototype.indexOf.call(document.querySelectorAll("#post-container .post-card"), this) }); return orig.call(this, opts); }; window.paginationFires = 0; const sentinel = document.querySelector(\'#post-container .post-card[data-marker="parent"]\'); const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; io.disconnect(); window.paginationFires++; document.getElementById("post-container").insertAdjacentHTML("beforeend", \'<article class="post-card" data-marker="next"><span class="likes-trigger" data-id="PNEXT"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=next">d</a></article>\'); }, { rootMargin: "200px" }); io.observe(sentinel); })();</script>');
+
+    // Precondition: the sentinel must start below viewport height + rootMargin, or the observer
+    // fires on observe() and the negative half of this test proves nothing.
+    const geometry = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('#post-container .post-card')];
+      const parent = document.querySelector('#post-container .post-card[data-marker="parent"]');
+      return { parentIndex: cards.indexOf(parent), lastIndex: cards.length - 1, parentTop: parent.getBoundingClientRect().top, lastTop: cards[cards.length - 1].getBoundingClientRect().top, viewport: window.innerHeight };
+    });
+    assert.equal(geometry.parentIndex, 8);
+    assert.equal(geometry.lastIndex, 14, 'sentinel must sit 6 slides above the final DOM card');
+    assert.ok(geometry.parentTop > geometry.viewport + 200, 'sentinel must start outside viewport + rootMargin; top=' + geometry.parentTop);
+    await page.waitForTimeout(250);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'observer must not fire on load');
+
+    // The pre-fix target: centering the final DOM card, which is the last carousel slide.
+    await page.evaluate(() => { const cards = document.querySelectorAll('#post-container .post-card'); cards[cards.length - 1].scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }); });
+    await page.waitForTimeout(500);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'centering the last carousel slide must not reach the provider sentinel');
+    assert.equal((await lib.getRenderedCardState(page)).count, 15, 'no growth from scrolling the wrong card');
+
+    await page.evaluate(() => { window.scrollCalls = []; });
+    const before = await lib.getRenderedCardState(page);
+    assert.deepEqual(before.ids, ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'PLAST']);
+    const started = Date.now();
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 12000, growthWaitMs: 6000, settleMs: 500, maxRecenters: 1 });
+    assert.equal(after.grew, true, 'centering the top-level sentinel must trigger provider pagination');
+    assert.equal(after.sentinelIndex, 8);
+    assert.equal(after.sentinelId, 'PLAST');
+    assert.ok(after.ids.includes('PNEXT'), 'new batch must be observed: ' + JSON.stringify(after.ids));
+    assert.equal(after.count, 16);
+    assert.equal(await page.evaluate(() => window.paginationFires), 1);
+    const calls = await page.evaluate(() => window.scrollCalls);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].block, 'center');
+    assert.equal(calls[0].id, 'PLAST');
+    assert.equal(calls[0].marker, 'parent', 'must center the top-level sentinel, not a carousel slide; centered a ' + calls[0].marker);
+    assert.equal(calls[0].index, 8);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('pagination follows the observed sentinel when the last post and its slides carry no data-id', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    // A zero-engagement post renders no .likes-trigger and no .comments-trigger, so neither it
+    // nor its carousel slides carry a data-id anywhere. Every markup-based heuristic is blind
+    // here; only the element the provider actually observes identifies the sentinel.
+    const idCard = (marker, id, media) => '<article class="post-card" data-marker="' + marker + '"><span class="likes-trigger" data-id="' + id + '"><span>5</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=' + media + '">d</a></article>';
+    const blankCard = (marker, media) => '<article class="post-card" data-marker="' + marker + '"><a class="content-download-btn" href="https://instacognito.com/media?id=' + media + '">d</a></article>';
+    const lead = Array.from({ length: 8 }, (_, i) => idCard('lead', 'P' + (i + 1), 'lead' + i)).join('');
+    const carousel = blankCard('parent', 'slide0') + Array.from({ length: 6 }, (_, i) => blankCard('slide', 'slide' + (i + 1))).join('');
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // The fixture wraps IntersectionObserver first and only then lets the "provider" build its
+    // observer, exactly the ordering scrapeWithPlaywright establishes between goto and search.
+    await page.setContent('<style>body{margin:0}#post-container{display:block}.post-card{display:block;height:300px;box-sizing:border-box;border:1px solid #ccc}</style><div id="post-container">' + lead + carousel + '</div><script>(function(){ const attr = "data-ff-pagination-sentinel"; const Native = window.IntersectionObserver; function Probed(cb, opts){ const o = new Native(cb, opts); const nat = o.observe.bind(o); o.observe = function(target){ for (const m of document.querySelectorAll("[" + attr + "]")) m.removeAttribute(attr); target.setAttribute(attr, "1"); return nat(target); }; return o; } Probed.prototype = Native.prototype; window.IntersectionObserver = Probed; const orig = Element.prototype.scrollIntoView; window.scrollCalls = []; Element.prototype.scrollIntoView = function(opts){ window.scrollCalls.push({ block: opts && opts.block, marker: this.getAttribute("data-marker"), index: Array.prototype.indexOf.call(document.querySelectorAll("#post-container .post-card"), this) }); return orig.call(this, opts); }; window.paginationFires = 0; const sentinel = document.querySelector(\'#post-container .post-card[data-marker="parent"]\'); const io = new IntersectionObserver(function(entries){ if (!entries[0].isIntersecting) return; io.disconnect(); window.paginationFires++; document.getElementById("post-container").insertAdjacentHTML("beforeend", \'<article class="post-card" data-marker="next"><span class="likes-trigger" data-id="PNEXT"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=next">d</a></article>\'); }, { rootMargin: "200px" }); io.observe(sentinel); })();</script>');
+
+    const setup = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('#post-container .post-card')];
+      const marked = document.querySelector('[data-ff-pagination-sentinel]');
+      return { markedMarker: marked && marked.getAttribute('data-marker'), markedIndex: cards.indexOf(marked), lastIndex: cards.length - 1, markedTop: marked.getBoundingClientRect().top, viewport: window.innerHeight, idsPresent: cards.filter(c => c.querySelector('[data-id]')).length };
+    });
+    assert.equal(setup.markedMarker, 'parent', 'observe() must mark the element the provider watches');
+    assert.equal(setup.markedIndex, 8);
+    assert.equal(setup.lastIndex, 14, 'sentinel must sit 6 slides above the final DOM card');
+    assert.equal(setup.idsPresent, 8, 'only the 8 lead posts carry a data-id');
+    assert.ok(setup.markedTop > setup.viewport + 200, 'sentinel must start outside viewport + rootMargin; top=' + setup.markedTop);
+    await page.waitForTimeout(250);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'observer must not fire on load');
+
+    // Both markup heuristics land here: with no data-id anywhere in the trailing run, the id-run
+    // rule degrades to the last card, which is a slide six cards below the real sentinel.
+    await page.evaluate(() => { const cards = document.querySelectorAll('#post-container .post-card'); cards[cards.length - 1].scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }); });
+    await page.waitForTimeout(500);
+    assert.equal(await page.evaluate(() => window.paginationFires), 0, 'centering the last slide must not reach the provider sentinel');
+    assert.equal((await lib.getRenderedCardState(page)).count, 15, 'no growth from scrolling the wrong card');
+
+    await page.evaluate(() => { window.scrollCalls = []; });
+    const before = await lib.getRenderedCardState(page);
+    assert.deepEqual(before.ids, ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8']);
+    const started = Date.now();
+    const after = await lib.scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: 12000, growthWaitMs: 6000, settleMs: 500, maxRecenters: 1 });
+    assert.equal(after.grew, true, 'centering the observed sentinel must trigger provider pagination');
+    assert.equal(after.sentinelSource, 'observed');
+    assert.equal(after.sentinelIndex, 8);
+    assert.equal(after.sentinelId, null, 'the sentinel legitimately has no data-id here');
+    assert.ok(after.ids.includes('PNEXT'), 'new batch must be observed: ' + JSON.stringify(after.ids));
+    assert.equal(after.count, 16);
+    assert.equal(await page.evaluate(() => window.paginationFires), 1);
+    const calls = await page.evaluate(() => window.scrollCalls);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].block, 'center');
+    assert.equal(calls[0].marker, 'parent', 'must center the observed sentinel, not a slide; centered a ' + calls[0].marker);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('sentinel probe marks each newly observed element, clears the previous one, and still paginates', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  assert.equal(lib.PAGINATION_SENTINEL_ATTR, 'data-ff-pagination-sentinel', 'fixtures hardcode this attribute; keep them in step');
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    await page.setContent('<div id="a">a</div><div id="b">b</div><div id="c">c</div>');
+    assert.equal(await lib.installPaginationSentinelProbe(page), true);
+    assert.equal(await lib.installPaginationSentinelProbe(page), true, 'installing twice must not double-wrap');
+
+    const marks = await page.evaluate(attr => {
+      const seen = [];
+      const read = () => [...document.querySelectorAll('[' + attr + ']')].map(el => el.id).join(',');
+      const first = new IntersectionObserver(() => {}); first.observe(document.getElementById('a')); seen.push(read());
+      const second = new IntersectionObserver(() => {}); second.observe(document.getElementById('b')); seen.push(read());
+      second.disconnect();
+      const third = new IntersectionObserver(() => {}); third.observe(document.getElementById('c')); seen.push(read());
+      return seen;
+    }, lib.PAGINATION_SENTINEL_ATTR);
+    assert.deepEqual(marks, ['a', 'b', 'c'], 'exactly one element is marked at a time and it is the latest observed');
+
+    // The wrapper must not break the observer it wraps: a visible element still fires.
+    const fired = await page.evaluate(() => new Promise(resolve => {
+      const io = new IntersectionObserver(entries => { if (entries[0].isIntersecting) { io.disconnect(); resolve(true); } });
+      io.observe(document.getElementById('a'));
+      setTimeout(() => resolve(false), 2000);
+    }));
+    assert.equal(fired, true, 'wrapped observers must still deliver intersections');
+  } finally {
+    await browser.close();
+  }
+});
+
 test('attached browser cleanup disconnects transport without closing external server marker', async () => {
   const events = [];
   const externalServer = { closed: false };
@@ -703,6 +857,221 @@ test('local CLI works from repo path without assuming global frameferry', () => 
   const parsed = JSON.parse(doctor.stdout);
   assert.equal(typeof parsed.node, 'string');
   assert.equal(typeof parsed.playwright, 'boolean');
+});
+
+test('date provenance resolves only explicit-year and ISO input, never yearless or relative labels', () => {
+  const iso = lib.resolveItemDate('2024-08-23');
+  assert.equal(iso.dateStatus, 'resolved');
+  assert.equal(iso.dateProvenance, 'provider-iso');
+  assert.equal(iso.dateResolved, '2024-08-23T00:00:00.000Z');
+
+  const explicit = lib.resolveItemDate(['views', '23 August 2024'].join('\n'));
+  assert.equal(explicit.dateStatus, 'resolved');
+  assert.equal(explicit.dateProvenance, 'provider-explicit-year');
+  assert.equal(new Date(explicit.dateResolved).getFullYear(), 2024);
+
+  // The whole point of the contract: a label with no year stays unresolved. No year is ever
+  // inferred from a neighbouring item, from scrape order, or from the wall clock.
+  for (const [text, provenance] of [['23 August', 'provider-yearless-label'], ['August 23', 'provider-yearless-label'], ['2d ago', 'provider-relative-label'], ['yesterday', 'provider-relative-label'], ['3h', 'provider-relative-label']]) {
+    const got = lib.resolveItemDate(text);
+    assert.equal(got.dateStatus, 'unresolved', text + ' must not resolve');
+    assert.equal(got.dateResolved, null, text + ' must not carry a timestamp');
+    assert.equal(got.dateProvenance, provenance, text);
+    assert.equal(got.dateRaw, text, 'raw label is preserved verbatim');
+  }
+
+  const missing = lib.resolveItemDate(null);
+  assert.equal(missing.dateStatus, 'unresolved');
+  assert.equal(missing.dateProvenance, 'none');
+  assert.equal(missing.dateResolved, null);
+
+  // Date.parse is lenient enough to mint an instant from text that merely contains four digits;
+  // the resolved year must match the year the label actually spelled out.
+  const junk = lib.resolveItemDate('1999 likes');
+  assert.equal(junk.dateResolved, null);
+  assert.ok(junk.dateStatus === 'unresolved', 'junk containing a year must not resolve');
+});
+
+test('caller date proof is accepted only with evidence and fails closed otherwise', () => {
+  const proven = lib.resolveItemDate('23 August', { dateProven: '2024-08-23T10:00:00.000Z', dateEvidence: 'per-item permalink page shows 23 August 2024' });
+  assert.equal(proven.dateStatus, 'resolved');
+  assert.equal(proven.dateProvenance, 'caller-proven');
+  assert.equal(proven.dateResolved, '2024-08-23T10:00:00.000Z');
+  assert.equal(proven.dateRaw, '23 August', 'the raw provider label is still preserved');
+  assert.match(proven.dateEvidence, /permalink page/);
+
+  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: '2024-08-23' }), err => err.code === 'BAD_DATE_PROOF' && /dateEvidence/.test(err.message));
+  assert.throws(() => lib.resolveItemDate('23 August', { dateEvidence: 'trust me' }), err => err.code === 'BAD_DATE_PROOF');
+  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: '23 August', dateEvidence: 'no year in the proof' }), err => err.code === 'BAD_DATE_PROOF' && /four-digit year/.test(err.message));
+  assert.throws(() => lib.resolveItemDate('23 August', { dateProven: 'not a date 2024 at all!!', dateEvidence: 'unparseable' }), err => err.code === 'BAD_DATE_PROOF');
+
+  // Evidence is caller free text that lands in receipts and the exported ZIP.
+  const redacted = lib.resolveItemDate(null, { dateProven: '2024-08-23', dateEvidence: 'seen at https://instacognito.com/media?id=SIGNEDTOKEN' });
+  assert.ok(!redacted.dateEvidence.includes('SIGNEDTOKEN'), 'signed provider URLs must not survive in evidence: ' + redacted.dateEvidence);
+});
+
+test('legacy dateParsed input can never promote an item to resolved', () => {
+  // dateParsed keeps its long-standing "best available text" meaning, so existing callers that
+  // pass it keep working and cannot accidentally trip the proof validation.
+  const { items } = lib.normalizeItems([
+    { shortcode: 'A', href: 'https://instacognito.com/media?id=a', mediaType: 'image', dateRaw: '23 August', dateParsed: '2024-08-23T00:00:00.000Z' }
+  ], { category: 'posts', mediaTypes: ['image', 'video'] });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].dateParsed, '2024-08-23T00:00:00.000Z', 'backward-compatible field is untouched');
+  assert.equal(items[0].dateStatus, 'unresolved', 'an unproven ISO passthrough does not resolve the item');
+  assert.equal(items[0].dateResolved, null);
+  assert.equal(items[0].dateProvenance, 'provider-yearless-label');
+  assert.equal(items[0].dateRaw, '23 August');
+});
+
+test('normalizeItems stamps provenance on every item and requireCaptureTimestamp fails closed', () => {
+  const { items } = lib.normalizeItems([
+    { shortcode: 'A', href: 'https://instacognito.com/media?id=a', mediaType: 'image', dateRaw: '2024-08-23' },
+    { shortcode: 'B', href: 'https://instacognito.com/media?id=b', mediaType: 'image', dateRaw: '23 August' },
+    { shortcode: 'C', href: 'https://instacognito.com/media?id=c', mediaType: 'image' }
+  ], { category: 'posts', mediaTypes: ['image', 'video'] });
+  assert.equal(items.length, 3);
+  for (const item of items) {
+    assert.ok(['resolved', 'unresolved'].includes(item.dateStatus), 'every item carries a machine-readable status');
+    assert.ok(typeof item.dateProvenance === 'string' && item.dateProvenance, 'every item carries provenance');
+  }
+  assert.equal(lib.requireCaptureTimestamp(items[0], 'test'), '2024-08-23T00:00:00.000Z');
+  assert.throws(() => lib.requireCaptureTimestamp(items[1], 'timeline write'), err => err.code === 'DATE_UNRESOLVED');
+  assert.throws(() => lib.requireCaptureTimestamp(items[2], 'timeline write'), err => err.code === 'DATE_UNRESOLVED');
+  // A legacy record with no provenance fields at all, and a hand-edited one claiming resolved
+  // without a usable timestamp, must both be refused rather than trusted.
+  assert.throws(() => lib.requireCaptureTimestamp({ dateRaw: '23 August', dateParsed: '2024-08-23T00:00:00.000Z' }, 'timeline write'), err => err.code === 'DATE_UNRESOLVED');
+  assert.throws(() => lib.requireCaptureTimestamp({ dateStatus: 'resolved', dateResolved: '23 August' }, 'timeline write'), err => err.code === 'DATE_UNRESOLVED');
+  assert.throws(() => lib.requireCaptureTimestamp({ dateStatus: 'resolved', dateResolved: null }, 'timeline write'), err => err.code === 'DATE_UNRESOLVED');
+});
+
+test('legacy receipts without provenance export as unresolved and index agrees with receipts', { skip: !python3Available }, async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const zipPath = path.join(d, 'legacy-dates.zip');
+  await lib.archiveProfile({
+    handle: 'example',
+    output: out,
+    sections: [section('posts', [{ shortcode: 'A', href: 'https://instacognito.com/media?id=a', mediaType: 'image', dateRaw: '23 August' }], { reportedTotal: 1 })],
+    dnsLookup: publicDns,
+    fetchImpl: async () => res(),
+    delayMs: 0
+  });
+  const manifestPath = path.join(out, '.frameferry', 'example', 'manifest.json');
+  const receiptPath = path.join(out, 'receipts', 'example', 'A-0.json');
+  const manifest = await readJson(manifestPath);
+  const receipt = await readJson(receiptPath);
+  // Simulate a receipt written before this contract existed: the new fields simply are not there,
+  // but the misleading dateParsed echo is.
+  for (const field of ['dateStatus', 'dateProvenance', 'dateResolved', 'dateEvidence']) {
+    delete manifest.completed['A-0'][field];
+    delete receipt[field];
+  }
+  assert.equal(receipt.dateParsed, '23 August', 'legacy receipts echo the label into dateParsed');
+  await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  await fsp.writeFile(receiptPath, JSON.stringify(receipt, null, 2) + '\n');
+
+  await lib.exportProfile({ handle: 'example', output: out, zip: zipPath });
+  const py = spawnSync('python3', ['-c', [
+    'import json, sys, zipfile',
+    'z=zipfile.ZipFile(sys.argv[1])',
+    'root=sorted({n.split("/",1)[0] for n in z.namelist()})[0]',
+    'idx=json.loads(z.read(root+"/index.json"))[0]',
+    'rec=json.loads(z.read(root+"/receipts/A-0.json"))',
+    'print(json.dumps([idx["dateStatus"], idx["dateProvenance"], idx["dateResolved"], idx["dateRaw"], rec["dateStatus"], rec["dateProvenance"], rec["dateResolved"]]))'
+  ].join('\n'), zipPath], { encoding: 'utf8' });
+  assert.equal(py.status, 0, py.stderr);
+  const [idxStatus, idxProv, idxResolved, idxRaw, recStatus, recProv, recResolved] = JSON.parse(py.stdout);
+  assert.equal(idxStatus, 'unresolved', 'a legacy yearless receipt must not gain a fabricated timestamp');
+  assert.equal(idxProv, 'provider-yearless-label');
+  assert.equal(idxResolved, null);
+  assert.equal(idxRaw, '23 August', 'the raw label is still preserved');
+  // Both surfaces recompute through the same helper, so the ZIP cannot contradict itself.
+  assert.equal(recStatus, idxStatus);
+  assert.equal(recProv, idxProv);
+  assert.equal(recResolved, idxResolved);
+});
+
+test('pending import dedupes byte-identical media by sha256 while preserving every reference', () => {
+  const shaA = 'a'.repeat(64);
+  const shaB = 'b'.repeat(64);
+  const entries = [
+    { stableId: 'P1-0', sha256: shaA, category: 'posts', shortcode: 'P1', identityBasis: 'provider-shortcode', href: 'https://instacognito.com/media?id=SIGNED' },
+    { stableId: 'stories__sha256-' + shaA, sha256: shaA, category: 'stories', identityBasis: 'content-sha256' },
+    { stableId: 'P2-0', sha256: shaA, category: 'posts', shortcode: 'P2', carouselIndex: 0, identityBasis: 'provider-shortcode' },
+    { stableId: 'P3-0', sha256: shaB, category: 'posts', shortcode: 'P3', identityBasis: 'provider-shortcode' }
+  ];
+  const plan = lib.planPendingImport(entries);
+  assert.equal(plan.counts.references, 4);
+  assert.equal(plan.counts.uniqueBytes, 2, 'three references share one byte sequence');
+  assert.equal(plan.counts.duplicateReferences, 2);
+  assert.equal(plan.counts.newUniqueBytes, 2);
+  assert.equal(plan.counts.erroredReferences, 0);
+  assert.equal(plan.counts.conflicts, 0);
+
+  const shared = plan.staged.find(group => group.sha256 === shaA);
+  assert.equal(shared.referenceCount, 3, 'no reference may be discarded by dedup');
+  assert.deepEqual(shared.stableIds, ['P1-0', 'P2-0', 'stories__sha256-' + shaA]);
+  // Byte-identical media legitimately appears under more than one category; both survive.
+  assert.deepEqual(shared.categories, ['posts', 'stories']);
+  assert.equal(shared.canonicalStableId, 'P1-0', 'provider-shortcode identity is preferred over a content hash id');
+
+  // Signed provider URLs never reach persisted or reported JSON anywhere else; not here either.
+  assert.ok(!JSON.stringify(plan).includes('SIGNED'), 'plan must not carry signed provider URLs');
+
+  // Every reference is accounted for in exactly one bucket.
+  assert.equal(plan.counts.references, plan.counts.stagedReferences + plan.counts.conflictedReferences + plan.counts.erroredReferences);
+
+  // Deterministic: a re-run over a differently ordered batch must not re-upload deduped bytes.
+  const strip = p => JSON.stringify(p.groups.map(g => ({ ...g, references: g.references.map(({ sourceIndex, ...rest }) => rest) })));
+  assert.equal(strip(plan), strip(lib.planPendingImport([...entries].reverse())), 'plan decisions must not depend on input order');
+});
+
+test('pending import holds conflicts and malformed entries without discarding references', () => {
+  const shaA = 'a'.repeat(64);
+  const shaB = 'b'.repeat(64);
+
+  // Same stableId claiming two different byte sequences, inside one batch.
+  const inBatch = lib.planPendingImport([
+    { stableId: 'P1-0', sha256: shaA, category: 'posts', shortcode: 'P1' },
+    { stableId: 'P1-0', sha256: shaB, category: 'posts', shortcode: 'P1' }
+  ]);
+  assert.equal(inBatch.counts.conflicts, 1);
+  assert.equal(inBatch.staged.length, 0, 'disputed identity must never be staged');
+  assert.deepEqual(inBatch.conflicts[0].sha256, [shaA, shaB]);
+  assert.equal(inBatch.groups.reduce((n, g) => n + g.referenceCount, 0), 2, 'both references are retained for a human to resolve');
+
+  // The same conflict across the already-imported boundary, which is the one that would
+  // overwrite existing evidence.
+  const vsKnown = lib.planPendingImport([{ stableId: 'P1-0', sha256: shaB, category: 'posts', shortcode: 'P1' }], { known: { 'P1-0': { sha256: shaA } } });
+  assert.equal(vsKnown.counts.conflicts, 1);
+  assert.equal(vsKnown.conflicts[0].knownSha256, shaA);
+  assert.equal(vsKnown.staged.length, 0);
+
+  // Already imported, same bytes: reused rather than counted as new.
+  const reuse = lib.planPendingImport([{ stableId: 'P1-0', sha256: shaA, category: 'posts', shortcode: 'P1' }], { known: { 'P1-0': { sha256: shaA } } });
+  assert.equal(reuse.counts.alreadyPresent, 1);
+  assert.equal(reuse.counts.newUniqueBytes, 0, 'truthful counts: nothing new to upload');
+  assert.equal(reuse.staged[0].knownStableId, 'P1-0');
+
+  // Malformed entries are surfaced, never silently dropped, and cannot masquerade as conflicts.
+  const bad = lib.planPendingImport([
+    { stableId: 'stories__sha256-' + shaA, sha256: shaB, category: 'stories' },
+    { stableId: 'X-0', sha256: 'not-a-hash' },
+    { sha256: shaA, category: 'posts' },
+    { stableId: 'stories__P9-0', sha256: shaA, category: 'posts' },
+    { stableId: '../escape', sha256: shaA, category: 'posts' }
+  ]);
+  assert.equal(bad.counts.erroredReferences, 5);
+  assert.equal(bad.staged.length, 0);
+  assert.equal(bad.counts.references, bad.counts.stagedReferences + bad.counts.conflictedReferences + bad.counts.erroredReferences);
+  const reasons = bad.errors.map(e => e.reasons.join(','));
+  assert.ok(reasons.includes('stable-id-embeds-different-sha256'), JSON.stringify(reasons));
+  assert.ok(reasons.some(r => r.includes('invalid-sha256')), JSON.stringify(reasons));
+  assert.ok(reasons.some(r => r.includes('missing-stable-id')), JSON.stringify(reasons));
+  assert.ok(reasons.includes('category-disagrees-with-stable-id'), JSON.stringify(reasons));
+  assert.ok(reasons.some(r => r.includes('unsafe-stable-id')), JSON.stringify(reasons));
+  for (const err of bad.errors) assert.ok(err.reference, 'the offending reference is retained on the error');
 });
 
 test('content-export branch retains at least the baseline test inventory plus new coverage', async () => {

@@ -59,7 +59,7 @@ CDP attach is loopback only and requires owner permission. When using `--attach-
 <output>/.frameferry/<handle>/lock.json
 ```
 
-Manifest and status are mode 600. Receipts include ID, category, media type, identity basis, bytes, SHA-256, content type, source host, run ID, timestamps, `dateRaw`, `dateParsed`, `captionTruncated`, and highlight grouping when exposed. They do not include ephemeral signed media URLs. Stable post media IDs stay `post-shortcode + carousel-index`, so URL rotation does not create duplicates for posts. Reels are category-qualified to avoid collisions. Stories and highlights have no stable shortcode in the public DOM, so later syncs re-fetch them and dedupe after hashing.
+Manifest and status are mode 600. Receipts include ID, category, media type, identity basis, bytes, SHA-256, content type, source host, run ID, timestamps, `dateRaw`, `dateParsed`, the date provenance fields described under [Metadata caveats](#metadata-caveats), `captionTruncated`, and highlight grouping when exposed. They do not include ephemeral signed media URLs. Stable post media IDs stay `post-shortcode + carousel-index`, so URL rotation does not create duplicates for posts. Reels are category-qualified to avoid collisions. Stories and highlights have no stable shortcode in the public DOM, so later syncs re-fetch them and dedupe after hashing.
 
 ## Website contract
 
@@ -99,8 +99,22 @@ A ZIP can be packaged successfully even when the archive itself is only partial.
 - This is **not** an Instagram account export.
 - It can preserve only what the provider's public UI exposes.
 - Provider captions in the visible DOM are truncated to 125 characters, so FrameFerry records them as `captionTruncated` rather than pretending they are full captions.
-- `dateParsed` is written only when the raw provider string parses unambiguously; `dateRaw` is always retained.
+- `dateRaw` is always retained. `dateParsed` keeps its long-standing "best available text" meaning, so it is an ISO timestamp when the label parsed and an echo of the label when it did not.
+- Because that is ambiguous, every item and receipt also carries explicit provenance: `dateStatus` (`resolved` or `unresolved`), `dateProvenance` (`provider-iso`, `provider-explicit-year`, `provider-unparsed-label`, `provider-relative-label`, `provider-yearless-label`, `caller-proven`, or `none`), `dateResolved` (an ISO timestamp, and authoritative only when `dateStatus` is `resolved`), and `dateEvidence`.
+- A year is never inferred. A yearless label such as `23 August`, or a relative one such as `2d ago`, stays `unresolved` with the raw label preserved. Only a caller that can prove a per-item date may resolve one, by passing `dateProven` together with a non-empty `dateEvidence`; an unproven or malformed claim raises `BAD_DATE_PROOF` rather than being quietly accepted.
+- `requireCaptureTimestamp(record)` fails closed with `DATE_UNRESOLVED` unless the record carries a genuinely resolved timestamp, so an unresolved date cannot leak into anything that needs a real capture instant.
+- `provider-explicit-year` resolution is day-precision and parsed in the host timezone; `provider-iso` is UTC and deterministic.
 - Deleted, expired, private, CAPTCHA-blocked, or otherwise hidden stories cannot be recovered.
+
+## Pending import dedup
+
+`planPendingImport(entries, { known })` is a pure, advisory helper for callers that push an archive into another system. It groups byte-identical media by SHA-256 so identical bytes are registered once, and returns `staged`, `conflicts`, `errors`, and a `counts` block whose `references` always equals `stagedReferences + conflictedReferences + erroredReferences`.
+
+- Every source reference is preserved. Dedup never discards a reference, a category, or a stable ID: the same bytes legitimately appear under more than one category, and each group lists all of them.
+- `uniqueBytes` counts distinct byte sequences, `duplicateReferences` the references that share them, and `alreadyPresent`/`newUniqueBytes` split those against media the caller already holds. Passing `known` as a `stableId -> receipt` map (the manifest `completed` shape) works unchanged.
+- The plan is deterministic, so re-running it over a differently ordered batch after a partial import will not re-register bytes the previous run already deduped.
+- A stable ID claiming two different byte sequences, whether inside the batch or against already-imported media, is a conflict: it is reported and held, never staged and never overwritten. Malformed entries are returned in `errors` with the offending reference attached rather than dropped.
+- It performs no I/O and is not a staging layout. The on-disk archive stays one media file and one receipt per stable ID.
 
 ## Status model
 

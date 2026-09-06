@@ -71,6 +71,8 @@ Do not assume a globally linked `frameferry` binary. Use `node ./bin/frameferry.
 - `stories` and `highlights` have no stable provider shortcode in the public DOM, so later syncs re-fetch them and dedupe after hashing.
 - Section outcomes can be `COMPLETE`, `PARTIAL`, `UNAVAILABLE`, `BLOCKED`, `DEFERRED`, or `ACTION_REQUIRED` depending on what the provider visibly exposed.
 - A successful ZIP package does not prove the archive itself is complete; the completeness split is recorded inside the ZIP metadata.
+- Dates are only as good as the provider label. Report `dateStatus`/`dateProvenance` as they are: a yearless label such as `23 August` or a relative one such as `2d ago` is `unresolved`, and you must not guess its year from neighbouring items, from scrape order, or from today's date. Say "date unresolved", never invent one.
+- Pagination centers the element the provider is actually observing. If a run still stops early, report the `sentinelSource` it recorded rather than assuming which path was taken.
 
 ## ZIP safety
 
