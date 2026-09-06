@@ -809,9 +809,11 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   // which is authoritative and needs no inference from card markup. The two heuristics below it
   // are fail-closed fallbacks for pages where the probe was never installed (a caller driving
   // this function directly, or an attached page navigated outside our control).
-  async function recenterPaginationSentinel() {
-    const found = await page.evaluate(attr => {
-      const scroll = el => el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  // scrollToIt=false reports the sentinel without touching the viewport, which is how a call
+  // that must not trigger anything can still say which element the provider is watching.
+  async function locatePaginationSentinel(scrollToIt) {
+    const found = await page.evaluate(([attr, scrollToIt]) => {
+      const scroll = el => { if (scrollToIt) el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }); };
       const cards = [...document.querySelectorAll('#post-container .post-card')];
       const idOf = card => card.querySelector('.likes-trigger[data-id], .comments-trigger[data-id], [data-id]')?.getAttribute('data-id') || '';
       const observed = document.querySelector('[' + attr + ']');
@@ -828,15 +830,27 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
       if (lastId) while (index > 0 && idOf(cards[index - 1]) === lastId) index--;
       scroll(cards[index]);
       return { sentinelIndex: index, sentinelId: lastId || null, sentinelSource: lastId ? 'id-run' : 'last-card' };
-    }, PAGINATION_SENTINEL_ATTR);
+    }, [PAGINATION_SENTINEL_ATTR, !!scrollToIt]);
     if (!found) return false;
     sentinel = found;
     return true;
   }
-  // Re-centering an element that is already intersecting produces no IntersectionObserver
-  // callback, so the in-window recenters cannot wake a provider observer that stayed silent.
-  // A re-arm scrolls fully away first, lets the browser deliver the leave, and then centers the
-  // sentinel again, which is a genuine fresh enter transition.
+  const recenterPaginationSentinel = () => locatePaginationSentinel(true);
+  // Every scroll to the sentinel is a pagination trigger, including the in-window cadence
+  // recenter: when an already-pending batch renders, the provider rebuilds its observer on the
+  // new last card and the probe re-marks a DIFFERENT element, so the next recenter scrolls to an
+  // element that has never intersected and fires it. Nothing may scroll into a denial or a
+  // visible challenge, and a challenge found this way has to stick, because the DOM state that
+  // proved it can be gone by the time the call returns.
+  async function refreshBlocked() {
+    if (!blocked) blocked = await detectContinuationDenial(page, continuationMonitor);
+    return blocked;
+  }
+  // Re-centering an element that is already intersecting and unchanged produces no
+  // IntersectionObserver callback, so the cadence recenters cannot by themselves wake a provider
+  // observer that stayed silent on the same sentinel. A re-arm scrolls fully away first, lets the
+  // browser deliver the leave, and then centers the sentinel again, which is a genuine fresh
+  // enter transition.
   async function rearmPaginationSentinel() {
     const observedStillConnected = await page.evaluate(attr => {
       const observed = document.querySelector('[' + attr + ']');
@@ -853,15 +867,23 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   // One bounded observation window. The primary window, the in-flight settlement extension and
   // every grace window run through here, so they cannot drift apart. Returns a finished result
   // when growth settled (or the target was reached) and null when the window simply expired.
-  async function runWaitWindow(windowMs) {
+  async function runWaitWindow(windowMs, { allowRecenter = true } = {}) {
     const windowBudget = Math.max(1, Math.min(windowMs, remainingTimeout(started, maxTimeMs)));
     const deadline = Date.now() + windowBudget;
     nextRecenterAt = Date.now() + recenterEveryMs;
     while (Date.now() < deadline && Date.now() - started < maxTimeMs) {
       const now = Date.now();
-      if (now >= nextRecenterAt && recenterCount < maxRecenters) {
-        if (await recenterPaginationSentinel()) recenterCount++;
-        nextRecenterAt = now + recenterEveryMs;
+      let haltAfterObserving = false;
+      // The guard rides the recenter path only, so it costs at most maxRecenters extra round
+      // trips per window rather than one per poll tick. A denial stops the trigger, not the
+      // observation: reading the DOM one more time before returning keeps a batch that really
+      // did render from being reported as no growth.
+      if (allowRecenter && now >= nextRecenterAt && recenterCount < maxRecenters) {
+        if (await refreshBlocked()) haltAfterObserving = true;
+        else {
+          if (await recenterPaginationSentinel()) recenterCount++;
+          nextRecenterAt = now + recenterEveryMs;
+        }
       }
       const state = await getRenderedCardState(page);
       const stateIds = new Set(state.ids || []);
@@ -877,12 +899,20 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
         bestIds = stateIds;
         if (targetUniqueCount && bestIds.size >= targetUniqueCount) {
           waitedMs += windowBudget - Math.max(0, deadline - Date.now());
+          await refreshBlocked();
           return decorate(state);
         }
       }
       if (grew && loading === 0 && Date.now() - lastGrowthAt >= settleMs) {
         waitedMs += windowBudget - Math.max(0, deadline - Date.now());
+        // A challenge that appeared mid-window must survive a growing return: decorate() only
+        // folds in the monitor's HTTP latch, and the DOM check is the only thing that sees it.
+        await refreshBlocked();
         return decorate(await getRenderedCardState(page));
+      }
+      if (haltAfterObserving) {
+        waitedMs += windowBudget - Math.max(0, deadline - Date.now());
+        return null;
       }
       await page.waitForTimeout(Math.min(250, Math.max(1, deadline - Date.now())));
     }
@@ -893,16 +923,28 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   // chance to render yet, so extend the wait rather than declaring a boundary. It triggers
   // nothing new and never spends a grace attempt, and the maxSettlements cap keeps the total
   // bounded whether the pending request predates this call or was issued by a grace re-arm.
-  async function settleInFlightRequest() {
+  async function settleInFlightRequest(windowOptions = {}) {
     if (settlementsUsed >= maxSettlements || inFlight() === 0) return null;
     settlementsUsed++;
-    return runWaitWindow(inFlightSettleMs);
+    return runWaitWindow(inFlightSettleMs, windowOptions);
   }
   // Never trigger into a denial. The opening recenter is itself a pagination trigger and the
   // monitor's denial latch outlives a single call, so a 429 recorded by an earlier page
   // iteration has to stop this one before anything is scrolled.
-  blocked = await detectContinuationDenial(page, continuationMonitor);
-  if (blocked) return decorate(beforeState);
+  if (await refreshBlocked()) return decorate(beforeState);
+  // A continuation already pending on entry meets the opening recenter first, and with the
+  // sentinel outside the viewport that scroll is a fresh enter transition: two requests would
+  // run at once. Settle it first, with the cadence recenter suppressed so this window triggers
+  // nothing, and read the sentinel without scrolling so it is still reported. If the settlement
+  // window expires with nothing denied, the pending request is stale and the ordinary opening
+  // recenter proceeds.
+  if (inFlight() > 0) {
+    await locatePaginationSentinel(false);
+    const settledAtEntry = await settleInFlightRequest({ allowRecenter: false });
+    if (settledAtEntry) return settledAtEntry;
+    if (grew) return decorate(await getRenderedCardState(page));
+    if (await refreshBlocked()) return decorate(await getRenderedCardState(page));
+  }
   if (!await recenterPaginationSentinel()) return decorate(beforeState);
   recenterCount++;
   const settled = await runWaitWindow(growthWaitMs);
@@ -913,14 +955,12 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
   // bounded, request-aware grace budget: the Sydney trace shows a first bounded trigger that
   // issued no continuation request at all followed by a second that returned HTTP 200 with 19
   // items, so one silent window is not evidence that the provider has nothing left.
-  blocked = await detectContinuationDenial(page, continuationMonitor);
-  if (blocked) return decorate(await getRenderedCardState(page));
+  if (await refreshBlocked()) return decorate(await getRenderedCardState(page));
 
-  const extended = await settleInFlightRequest();
+  const extended = await settleInFlightRequest();  // pre-grace settlement
   if (extended) return extended;
   if (grew) return decorate(await getRenderedCardState(page));
-  blocked = await detectContinuationDenial(page, continuationMonitor);
-  if (blocked) return decorate(await getRenderedCardState(page));
+  if (await refreshBlocked()) return decorate(await getRenderedCardState(page));
 
   // Grace is deliberately narrow: only an authoritative observed sentinel that is still
   // connected, only when the monitor saw no continuation request at all in this call AND none is
@@ -935,6 +975,7 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
     && inFlight() === 0
     && remainingTimeout(started, maxTimeMs) > MIN_GRACE_WINDOW_MS
   ) {
+    if (await refreshBlocked()) break;
     graceAttemptsUsed++;
     if (!await rearmPaginationSentinel()) break;
     recenterCount++;
@@ -947,8 +988,7 @@ async function scrollLastCardCenterAndWaitForGrowth(page, beforeState, { started
     const graceExtended = await settleInFlightRequest();
     if (graceExtended) return graceExtended;
     if (grew) break;
-    blocked = await detectContinuationDenial(page, continuationMonitor);
-    if (blocked) break;
+    if (await refreshBlocked()) break;
   }
   return decorate(await getRenderedCardState(page));
 }
