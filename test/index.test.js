@@ -2238,3 +2238,269 @@ test('a mid-run checkpoint still carries outstanding work the scan has not re-se
   assert.ok(midRun[0]['B-0'], 'a checkpoint must not drop outstanding work that this scan did not re-see');
   assert.ok((await readManifest(out)).failed['B-0'], 'and it must still be owed at the end of the run');
 });
+
+// --- independent review 1 counterexamples ------------------------------------------------------
+// Each case below is a counterexample the first round of tests missed. All synthetic and offline.
+
+test('P1-1 a run cannot report COMPLETE while it still owes outstanding media', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const slides = [
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s0' },
+    { shortcode: 'CAR', href: 'https://instacognito.com/media?id=s1' }
+  ];
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => url.includes('id=s1') ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
+  });
+  assert.ok((await readManifest(out)).failed['CAR-1'], 'CAR-1 must start out owed');
+  // A later scan that satisfies the post total but never re-sees the owed slide.
+  const s = await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [slides[0]], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.equal(s.coverage.outstandingMediaCount, 1);
+  assert.deepEqual(s.resume.stillMissing, ['CAR-1']);
+  assert.notEqual(s.status, 'COMPLETE', 'COMPLETE while media is still owed is a false completion');
+});
+
+test('P1-2 a deferred retry of a rediscovered failure keeps the item, never drops it', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const bad = { shortcode: 'B', href: 'https://instacognito.com/media?id=b' };
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 1, items: [bad], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async () => res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } })
+  });
+  assert.ok((await readManifest(out)).failed['B-0']);
+  // Rediscovered, then denied: it is fresh (so carried state no longer covers it) and the deferral
+  // stops the run before it can be filed anywhere.
+  await assert.rejects(() => lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 1, items: [bad], dnsLookup: publicDns, delayMs: 0,
+    remainingMs: 1000, maxTimeMs: 1000,
+    fetchImpl: async () => res({ status: 429, headers: { 'retry-after': '120', 'content-type': 'image/jpeg' } })
+  }), err => err.code === 'DEFERRED');
+  const manifest = await readManifest(out);
+  const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
+  assert.ok(outstanding['B-0'], 'a deferred item must still be owed, not silently forgotten');
+});
+
+test('P1-3a a checkpoint records discovered work that has not been acquired yet', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const items = ['A', 'B', 'C', 'D', 'E'].map(s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s }));
+  let calls = 0;
+  const midRun = [];
+  const fetchImpl = async () => {
+    calls++;
+    if (calls === 3) {
+      const onDisk = await readJson(path.join(out, '.frameferry', 'example', 'manifest.json')).catch(() => null);
+      midRun.push(onDisk ? { ...(onDisk.failed || {}), ...(onDisk.pending || {}) } : {});
+    }
+    return res();
+  };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 5, items, dnsLookup: publicDns, fetchImpl, delayMs: 0, checkpointEveryItems: 2 });
+  assert.ok(midRun[0]['E-0'], 'work already discovered but not yet acquired must be checkpointed as owed');
+  assert.ok(midRun[0]['D-0'], 'and so must every other queued item');
+});
+
+test('P1-3b receipts committed between checkpoints are adopted, not re-downloaded', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  // A crash between the receipt landing on disk and the manifest learning about it.
+  const manifest = await readManifest(out);
+  delete manifest.completed['A-0'];
+  await writeManifestRaw(out, manifest);
+  assert.ok(fs.existsSync(path.join(out, 'receipts', 'example', 'A-0.json')), 'the receipt file must still be on disk');
+  let fetches = 0;
+  await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [{ shortcode: 'A', href: 'https://instacognito.com/media?id=rotated' }], dnsLookup: publicDns, fetchImpl: async () => { fetches++; return res(); }, delayMs: 0 });
+  assert.equal(fetches, 0, 'an orphaned but verifiable receipt must be adopted, not re-fetched');
+  assert.ok((await readManifest(out)).completed['A-0'], 'and it must be back in the manifest');
+});
+
+test('P1-4a spending the acquisition budget never marks an already completed id as owed', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0, maxTimeMs: 5000, acquisitionMaxTimeMs: 0 });
+  const manifest = await readManifest(out);
+  const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
+  assert.equal(outstanding['A-0'], undefined, 'an id with a verified receipt is not owed just because the budget ran out');
+  assert.ok(manifest.completed['A-0']);
+  assert.equal(s.coverage.outstandingMediaCount, 0);
+});
+
+test('P1-4b a receipt only resolves the id and handle it actually belongs to', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  const root = await lib.safeOutputRoot(out);
+  const paths = lib.profilePaths(root, 'example');
+  const receipt = (await readManifest(out)).completed['A-0'];
+
+  const wrongId = await lib.reconcileAgainstReceipts(paths, { 'B-0': receipt }, { 'B-0': { stableId: 'B-0', error: 'x' } });
+  assert.deepEqual(wrongId.resolved, [], 'a receipt for A-0 must not resolve B-0');
+  assert.ok(wrongId.retained['B-0']);
+
+  const wrongHandle = await lib.reconcileAgainstReceipts(paths, { 'A-0': { ...receipt, profileHandle: 'someoneelse' } }, { 'A-0': { stableId: 'A-0', error: 'x' } });
+  assert.deepEqual(wrongHandle.resolved, [], 'a receipt belonging to another handle must not resolve anything here');
+  assert.ok(wrongHandle.retained['A-0']);
+
+  const right = await lib.reconcileAgainstReceipts(paths, { 'A-0': receipt }, { 'A-0': { stableId: 'A-0', error: 'x' } });
+  assert.deepEqual(right.resolved, ['A-0'], 'the receipt that genuinely matches still resolves');
+});
+
+test('P1-5 lock takeover is fail-closed on an unattributable lock and release is ownership checked', async () => {
+  const d = await tmp();
+  const root = await lib.safeOutputRoot(path.join(d, 'out'));
+  const paths = lib.profilePaths(root, 'example');
+  await fsp.mkdir(paths.stateDir, { recursive: true });
+
+  // A lock naming no pid cannot be proved stale, so it must not be taken over.
+  await fsp.writeFile(paths.lock, JSON.stringify({ host: os.hostname(), runId: 'nopid' }));
+  await assert.rejects(() => lib.withLock(paths, 'r', async () => {}), /lock/i, 'an unattributable lock must fail closed, not be assumed stale');
+  assert.ok(fs.existsSync(paths.lock), 'and it must be left where it was');
+  await fsp.unlink(paths.lock);
+
+  // If our lock is taken over while we hold it, releasing must not delete the new owner's lock.
+  let observed = null;
+  await lib.withLock(paths, 'mine', async () => {
+    observed = JSON.parse(await fsp.readFile(paths.lock, 'utf8'));
+    await fsp.writeFile(paths.lock, JSON.stringify({ pid: process.pid, host: os.hostname(), runId: 'someone-else', token: 'not-ours' }));
+  });
+  assert.ok(observed && observed.token, 'a held lock must carry an ownership token');
+  assert.ok(fs.existsSync(paths.lock), 'releasing must not unlink a lock this run no longer owns');
+  assert.equal(JSON.parse(await fsp.readFile(paths.lock, 'utf8')).runId, 'someone-else');
+});
+
+test('P1-6 a carousel slide is never resolved by index alone when the provider media differs', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const s0 = { shortcode: 'CAR', href: 'https://instacognito.com/media?id=slideZero' };
+  const s1 = { shortcode: 'CAR', href: 'https://instacognito.com/media?id=slideOne' };
+  const bodyFor = url => url.includes('slideZero') ? jpg : png;
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 1, items: [s0, s1], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } })
+  });
+  let manifest = await readManifest(out);
+  assert.equal(manifest.completed['CAR-0'].bytes, jpg.length, 'slide 0 holds the first media');
+  assert.equal(manifest.completed['CAR-1'].bytes, png.length, 'slide 1 holds the second media');
+
+  // The same two slides, re-observed in the opposite order. Encounter order now calls slideOne
+  // "CAR-0", so resolving by index would silently label the wrong media as slide 0.
+  let fetches = 0;
+  await lib.archiveProfile({
+    handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [s1, s0], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => { fetches++; return res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } }); }
+  });
+  assert.ok(fetches > 0, 'a slide whose provider media no longer matches its receipt must not be reused by index');
+  manifest = await readManifest(out);
+  assert.equal(manifest.completed['CAR-0'].bytes, png.length, 'CAR-0 must now hold the media actually observed at slide 0');
+  assert.equal(manifest.completed['CAR-1'].bytes, jpg.length);
+});
+
+test('P2-7 an unexpected failure still finalizes the owner instead of leaving a live RUNNING claim', async (t) => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
+  await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  const media = path.join(out, 'media', 'example', 'A-0.jpg');
+  await fsp.chmod(media, 0o000);
+  const stillReadable = await fsp.readFile(media).then(() => true).catch(() => false);
+  if (stillReadable) { await fsp.chmod(media, 0o600); t.skip('cannot revoke read access in this environment'); return; }
+  try {
+    await assert.rejects(() => lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 }));
+  } finally {
+    await fsp.chmod(media, 0o600);
+  }
+  const owner = await readOwnerFile(out);
+  assert.equal(owner.terminal, true, 'a run that died must not leave a non-terminal claim naming this live process');
+  // The real harm: the next legitimate run in this same live process being refused as a second writer.
+  const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
+  assert.equal(s.status, 'COMPLETE');
+});
+
+test('P2-8 acquisition serves the ids already owed before newly discovered ones', async () => {
+  const d = await tmp();
+  const out = path.join(d, 'out');
+  const mk = s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s });
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 3, items: [mk('X'), mk('B'), mk('C')], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => (url.includes('id=B') || url.includes('id=C')) ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
+  });
+  const owed = await readManifest(out);
+  assert.ok(owed.failed['B-0'] && owed.failed['C-0'], 'B and C must start out owed');
+
+  // A scan that surfaces two new posts alongside the owed ones. First-seen order would spend the
+  // budget on the new work and starve the backlog again.
+  const order = [];
+  await lib.archiveProfile({
+    handle: 'example', output: out, reportedTotal: 5, items: [mk('N1'), mk('N2'), mk('B'), mk('C')], dnsLookup: publicDns, delayMs: 0,
+    fetchImpl: async url => { order.push(new URL(url).searchParams.get('id')); return res(); }
+  });
+  assert.deepEqual(order.slice(0, 2).sort(), ['B', 'C'], 'the already owed ids must be acquired first, got ' + order.join(','));
+});
+
+test('P2-10 a legacy time-budget marker is pending work, not a download failure', () => {
+  assert.equal(lib.isPendingEntry({ error: 'time budget reached' }), true);
+  const split = lib.partitionPriorOutcomes({ failed: { 'A-0': { stableId: 'A-0', error: 'time budget reached' }, 'B-0': { stableId: 'B-0', error: 'provider returned HTML instead of media' } } });
+  assert.ok(split.pending['A-0'], 'legacy budget skips migrate to pending');
+  assert.equal(split.failed['A-0'], undefined);
+  assert.ok(split.failed['B-0'], 'a real failure stays a failure');
+});
+
+// A provider that denies pagination on POSTS. The REELS tab is stocked so that scraping on past a
+// denial is visible in the result rather than silent.
+const DENIAL_TABS_HTML = '<!doctype html><style>body{margin:0}.post-card{display:block;height:300px}</style>'
+  + '<div id="profile-section"><span class="username-text">@denyhandle</span><div>40 posts 10k followers</div></div>'
+  + '<div id="menu-wrapper"><div class="menu-item" data-id="POSTS">Posts</div><div class="menu-item" data-id="REELS">Reels</div></div>'
+  + '<div id="post-container"></div>'
+  + '<script>(function(){'
+  + 'const card = (id, type) => \'<article class="post-card"><img class="post-image" data-type="\' + type + \'"><span class="likes-trigger" data-id="\' + id + \'"><span>1</span></span><a class="content-download-btn" href="https://instacognito.com/media?id=\' + id + \'">d</a></article>\';'
+  + 'window.reelsRendered = 0;'
+  + 'window.renderPosts = function(){ document.getElementById("post-container").innerHTML = [1,2,3].map(function(i){ return card("P" + i, "image"); }).join(""); window.arm(); };'
+  + 'window.renderReels = function(){ window.reelsRendered++; document.getElementById("post-container").innerHTML = [1,2].map(function(i){ return card("R" + i, "video"); }).join(""); };'
+  + 'window.arm = function(){ const cards = document.querySelectorAll("#post-container .post-card"); if (!cards.length) return;'
+  + '  if (window.io) window.io.disconnect();'
+  + '  window.io = new IntersectionObserver(function(e){ if (!e[0].isIntersecting) return; fetch("/api/posts", { method: "POST", body: "{}" }).catch(function(){}); }, { rootMargin: "200px" });'
+  + '  window.io.observe(cards[cards.length - 1]); };'
+  + 'document.querySelector(\'#menu-wrapper .menu-item[data-id="REELS"]\').addEventListener("click", window.renderReels);'
+  + 'window.renderPosts();'
+  + '})();</script>';
+
+test('P2-9 a provider denial is preserved as evidence and stops the remaining sections', async (t) => {
+  let chromium;
+  try { chromium = require('playwright').chromium; } catch { t.skip('playwright package unavailable'); return; }
+  const exe = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  if (!exe || !fs.existsSync(exe)) { t.skip('no existing chromium binary; not downloading'); return; }
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const seen = await serveProfilePage(page, DENIAL_TABS_HTML, {
+      '/api/posts': route => route.fulfill({ status: 429, headers: { 'retry-after': '120' }, contentType: 'application/json', body: '{"error":"slow down"}' })
+    });
+    const monitor = lib.attachContinuationRequestMonitor(page);
+    try {
+      const started = Date.now();
+      const scan = await lib.scanReadyProfilePage(page, { handle: 'denyhandle', maxPages: 3, maxTimeMs: 20000, categories: ['posts', 'reels'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
+      const posts = scan.sections.find(s => s.category === 'posts');
+      assert.equal(posts.status, 'PARTIAL');
+      // The cause must survive, not be flattened into a generic bounded-limit reason.
+      assert.ok(posts.evidence && posts.evidence.blocked, 'the denial must be persisted as section evidence');
+      assert.equal(posts.evidence.blocked.status, 429);
+      assert.ok(Date.parse(posts.evidence.blocked.retryAt) > Date.now(), 'Retry-After must be preserved: ' + posts.evidence.blocked.retryAt);
+      assert.match(posts.reason, /429|denied|denial/i, 'the reason must name the denial, got: ' + posts.reason);
+
+      const reels = scan.sections.find(s => s.category === 'reels');
+      assert.notEqual(reels.status, 'COMPLETE', 'no section may be scraped after the provider has denied');
+      assert.equal(await page.evaluate(() => window.reelsRendered), 0, 'the reels tab must not be clicked after a denial');
+      assert.deepEqual(seen.unexpected, [], 'fixture must never reach the network');
+    } finally {
+      monitor.detach();
+    }
+  } finally {
+    await browser.close();
+  }
+});
