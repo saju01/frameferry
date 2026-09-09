@@ -31,9 +31,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Run tests (strict)
-        run: node scripts/run-ci-tests.js
-        env:
-          PLAYWRIGHT_CHROMIUM_EXECUTABLE: ''
+        run: npm run test:ci
 
       - name: Package content guard
         run: node scripts/package-guard.js

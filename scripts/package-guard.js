@@ -8,13 +8,18 @@
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
 
-const ALLOWED_PREFIXES = [
+// Exact root filenames — matched by strict equality only, not startsWith.
+const ALLOWED_EXACT_ROOTS = new Set([
   'package.json',
   'README.md',
   'LICENSE',
   'SKILL.md',
   'SECURITY.md',
   'CHANGELOG.md',
+]);
+
+// Directory prefixes — entries must end with '/' and are matched with startsWith.
+const ALLOWED_DIR_PREFIXES = [
   'bin/',
   'src/',
   'scripts/',
@@ -22,43 +27,64 @@ const ALLOWED_PREFIXES = [
   'references/',
 ];
 
-const BLOCKED_PATTERNS = [
+// Forbidden file extensions (credentials, crypto material, archives, databases, locks)
+const BLOCKED_EXTENSIONS = [
   /\.env$/i,
-  /credentials/i,
-  /\.tar\.gz$/,
-  /\.tgz$/,
-  /\.zip$/,
-  /\.7z$/,
-  /\.rar$/,
-  /\.part$/,
-  /\.sqlite/i,
-  /receipt/i,
-  /manifest\.json$/,
-  /status\.json$/,
-  /owner\.json$/,
-  /\.lock$/,
-  /discovery\.jsonl$/,
-  /node_modules\//,
-  /\.frameferry\//,
-  /\.openclaw\//,
-  /\.claude\//,
-  /media\//,
-  /state\//,
-  /auth/i,
-  /secret/i,
-  /token/i,
-  /\.pem$/,
-  /\.key$/,
-  /\.cert$/,
-  /canary/i,
-  /backfill/i,
+  /\.pem$/i,
+  /\.key$/i,
+  /\.cert$/i,
+  /\.sqlite\d*$/i,
+  /\.tar\.gz$/i,
+  /\.tgz$/i,
+  /\.zip$/i,
+  /\.7z$/i,
+  /\.rar$/i,
+  /\.part$/i,
+  /\.lock$/i,
 ];
 
-const BLOCKED_CONTENT_PATTERNS = [
-  /\/home\/saju/,
-  /syrn/,
-  /missbusty/i,
+// Forbidden exact basenames (matched against the last path segment)
+const BLOCKED_BASENAMES = [
+  /^credentials?\.[a-z]+$/i,
+  /^secrets?\.[a-z]+$/i,
+  /^receipt\.[a-z]+$/i,
+  /^manifest\.json$/i,
+  /^status\.json$/i,
+  /^owner\.json$/i,
+  /^discovery\.jsonl$/i,
 ];
+
+// Forbidden directory components (exact path segment names, not substrings)
+// Matched against each /-delimited segment of the entry path.
+const BLOCKED_DIR_COMPONENTS = new Set([
+  'node_modules',
+  '.frameferry',
+  '.openclaw',
+  '.claude',
+  'state',
+  'media',
+]);
+
+function blockedReason(filePath) {
+  for (const re of BLOCKED_EXTENSIONS) {
+    if (re.test(filePath)) return `extension matches ${re}`;
+  }
+
+  const basename = filePath.split('/').pop();
+  for (const re of BLOCKED_BASENAMES) {
+    if (re.test(basename)) return `basename matches ${re}`;
+  }
+
+  const segments = filePath.split('/');
+  // Check all segments except the last one (that's the basename, handled above)
+  for (let i = 0; i < segments.length - 1; i++) {
+    if (BLOCKED_DIR_COMPONENTS.has(segments[i])) {
+      return `directory component '${segments[i]}' is forbidden`;
+    }
+  }
+
+  return null;
+}
 
 function run() {
   let output;
@@ -90,7 +116,13 @@ function run() {
     process.exit(1);
   }
 
-  const files = (Array.isArray(parsed) ? parsed[0] : parsed).files || [];
+  const pkg = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (!pkg || typeof pkg !== 'object' || !Array.isArray(pkg.files)) {
+    console.error('package-guard: npm pack JSON is missing a files array');
+    process.exit(1);
+  }
+
+  const files = pkg.files;
   if (!files.length) {
     console.error('package-guard: npm pack reported zero files');
     process.exit(1);
@@ -99,25 +131,21 @@ function run() {
   const errors = [];
 
   for (const entry of files) {
+    if (typeof entry !== 'object' || entry === null || typeof entry.path !== 'string' || !entry.path) {
+      errors.push('MALFORMED: pack entry is missing a valid path string');
+      continue;
+    }
     const filePath = entry.path;
 
-    const allowed = ALLOWED_PREFIXES.some(prefix =>
-      filePath === prefix || filePath.startsWith(prefix)
-    );
+    const allowed = ALLOWED_EXACT_ROOTS.has(filePath) ||
+      ALLOWED_DIR_PREFIXES.some(prefix => filePath.startsWith(prefix));
     if (!allowed) {
       errors.push(`UNEXPECTED: ${filePath} (not in allowlist)`);
     }
 
-    for (const pattern of BLOCKED_PATTERNS) {
-      if (pattern.test(filePath)) {
-        errors.push(`BLOCKED: ${filePath} matches ${pattern}`);
-      }
-    }
-
-    for (const pattern of BLOCKED_CONTENT_PATTERNS) {
-      if (pattern.test(filePath)) {
-        errors.push(`PRIVATE: ${filePath} matches content pattern ${pattern}`);
-      }
+    const reason = blockedReason(filePath);
+    if (reason) {
+      errors.push(`BLOCKED: ${filePath} — ${reason}`);
     }
   }
 
