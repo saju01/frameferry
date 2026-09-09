@@ -35,7 +35,3 @@ jobs:
 
       - name: Package content guard
         run: node scripts/package-guard.js
-
-      # Temporary probe: prove this workflow reports an intentional failure.
-      - name: Intentional failure probe (temporary)
-        run: exit 1
