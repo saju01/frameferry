@@ -744,6 +744,7 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
       throw new ArchiveError('MEDIA_TYPE_MISMATCH', 'delivered media magic contradicts expected type or MIME; item stays owed', {
         expectedMediaType,
         actualMediaType,
+        magicContainer: got.kind || 'unknown',
         mimeClass: mimeMediaType,
         contentTypeToken: sanitizeContentTypeToken(ct),
         httpStatus: typeof res.status === 'number' && Number.isFinite(res.status) && res.status >= 0 ? res.status : null,
@@ -850,6 +851,7 @@ function sanitizeFailedItem(item, error, index = 0, attempts = null, errorCode =
       mismatchDiagnostics: {
         expectedMediaType: ['image', 'video', 'unknown'].includes(item._mismatchDiagnostics.expectedMediaType) ? item._mismatchDiagnostics.expectedMediaType : 'unknown',
         actualMediaType: ['image', 'video', 'unknown'].includes(item._mismatchDiagnostics.actualMediaType) ? item._mismatchDiagnostics.actualMediaType : 'unknown',
+        magicContainer: ['jpg', 'png', 'mp4', 'webp', 'unknown'].includes(item._mismatchDiagnostics.magicContainer) ? item._mismatchDiagnostics.magicContainer : 'unknown',
         mimeClass: ['image', 'video', 'unknown'].includes(item._mismatchDiagnostics.mimeClass) ? item._mismatchDiagnostics.mimeClass : 'unknown',
         contentTypeToken: typeof item._mismatchDiagnostics.contentTypeToken === 'string' && item._mismatchDiagnostics.contentTypeToken.length <= 64 ? item._mismatchDiagnostics.contentTypeToken : null,
         httpStatus: Number.isFinite(item._mismatchDiagnostics.httpStatus) && item._mismatchDiagnostics.httpStatus >= 0 ? item._mismatchDiagnostics.httpStatus : null,
