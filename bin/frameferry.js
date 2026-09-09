@@ -4,7 +4,7 @@ const COMMANDS = new Set(['doctor', 'archive', 'export', 'status', 'help', 'vers
 function allowedFlags(cmd) {
   if (cmd === 'doctor') return new Set(['attachCdp']);
   if (cmd === 'status') return new Set(['output','json']);
-  if (cmd === 'archive') return new Set(['output','mode','categories','mediaTypes','zip','overwriteZip','maxPages','maxTimeMs','maxBytes','maxZipBytes','maxZipEntries','maxZipFiles','delayMs','networkTimeoutMs','browserExecutable','browserChannel','attachCdp','json']);
+  if (cmd === 'archive') return new Set(['output','mode','categories','mediaTypes','zip','overwriteZip','maxPages','maxTimeMs','maxBytes','maxZipBytes','maxZipEntries','maxZipFiles','delayMs','networkTimeoutMs','browserExecutable','browserChannel','attachCdp','json',"discoveryMaxTimeMs","acquisitionMaxTimeMs","slicePages","sliceTimeMs","checkpointEveryItems","maxAcquireItems","maxAcquireBytes","maxLocatorAgeMs","maxObservedMedia","discoveryOnly","targetIds","targetPosts","byteEvidenceRoot","stopOnItemFailure"]);
   if (cmd === 'export') return new Set(['output','zip','overwriteZip','maxZipBytes','maxZipEntries','maxZipFiles','json']);
   return new Set();
 }
@@ -20,7 +20,7 @@ function parse(argv) {
     if (!a.startsWith('--')) throw new ArchiveError('BAD_ARGS', 'unexpected positional argument: ' + a);
     const key = a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     if (!allowedFlags(cmd).has(key)) throw new ArchiveError('BAD_ARGS', a + ' is not valid for ' + cmd);
-    const bools = new Set(['json', 'overwriteZip']);
+    const bools = new Set(['json', 'overwriteZip', 'discoveryOnly', 'stopOnItemFailure']);
     if (bools.has(key)) { opts[key] = true; continue; }
     if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) throw new ArchiveError('BAD_ARGS', a + ' requires a value');
     opts[key] = argv[++i];
@@ -60,7 +60,7 @@ function usage(code) {
     return;
   }
   if (opts.cmd === 'archive') {
-    const s = await archiveProfile({ handle: opts.handle, output: opts.output, mode: opts.mode || 'full', categories: opts.categories, mediaTypes: opts.mediaTypes, zip: opts.zip, overwriteZip: !!opts.overwriteZip, maxPages: num(opts, 'maxPages', 12), maxTimeMs: num(opts, 'maxTimeMs', 600000), maxBytes: num(opts, 'maxBytes', 50*1024*1024), maxZipBytes: num(opts, 'maxZipBytes', undefined), maxZipEntries: num(opts, 'maxZipEntries', undefined), maxZipFiles: num(opts, 'maxZipFiles', undefined), delayMs: num(opts, 'delayMs', 500), networkTimeoutMs: num(opts, 'networkTimeoutMs', undefined), browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp });
+    const s = await archiveProfile({ handle: opts.handle, output: opts.output, mode: opts.mode || 'full', categories: opts.categories, mediaTypes: opts.mediaTypes, zip: opts.zip, overwriteZip: !!opts.overwriteZip, maxPages: num(opts, 'maxPages', 12), maxTimeMs: num(opts, 'maxTimeMs', 600000), maxBytes: num(opts, 'maxBytes', 50*1024*1024), maxZipBytes: num(opts, 'maxZipBytes', undefined), maxZipEntries: num(opts, 'maxZipEntries', undefined), maxZipFiles: num(opts, 'maxZipFiles', undefined), delayMs: num(opts, 'delayMs', 500), networkTimeoutMs: num(opts, 'networkTimeoutMs', undefined), browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp, discoveryOnly: !!opts.discoveryOnly, targetIds: opts.targetIds, targetPosts: opts.targetPosts, byteEvidenceRoot: opts.byteEvidenceRoot, discoveryMaxTimeMs: num(opts, 'discoveryMaxTimeMs', undefined), acquisitionMaxTimeMs: num(opts, 'acquisitionMaxTimeMs', undefined), slicePages: num(opts, 'slicePages', undefined), sliceTimeMs: num(opts, 'sliceTimeMs', undefined), checkpointEveryItems: num(opts, 'checkpointEveryItems', undefined), maxAcquireItems: num(opts, 'maxAcquireItems', undefined), maxAcquireBytes: num(opts, 'maxAcquireBytes', undefined), maxLocatorAgeMs: num(opts, 'maxLocatorAgeMs', undefined), maxObservedMedia: num(opts, 'maxObservedMedia', undefined), stopOnItemFailure: !!opts.stopOnItemFailure });
     if (opts.zip) {
       const exported = await exportProfile({ handle: opts.handle, output: opts.output, zip: opts.zip, overwriteZip: !!opts.overwriteZip, maxZipBytes: num(opts, 'maxZipBytes', undefined), maxZipEntries: num(opts, 'maxZipEntries', undefined), maxZipFiles: num(opts, 'maxZipFiles', undefined) });
       s.zip = exported;

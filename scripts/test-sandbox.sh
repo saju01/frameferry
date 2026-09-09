@@ -35,12 +35,25 @@ if [ -n "$chromium_real" ] && [ -x "$chromium_real" ]; then
   args+=(--setenv PLAYWRIGHT_CHROMIUM_EXECUTABLE "$chromium_real")
 fi
 echo "sandbox: bwrap isolated copied tree, no network namespace, clearenv, cap-drop, cgroup MemoryMax=1G, node heap cap 512MiB" >&2
-if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet -p MemoryMax=1G -p TasksMax=512 true 2>/dev/null; then
-  systemd-run --user --scope --quiet -p MemoryMax=1G -p TasksMax=512 bwrap "${args[@]}" "$node_path" --test "$@"
+if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=512 true 2>/dev/null; then
+  systemd-run --user --scope --quiet -p MemoryMax=1G -p MemorySwapMax=0 -p TasksMax=512 bash -c '
+    set -eu
+    group=$(cut -d: -f3 /proc/self/cgroup)
+    cap=$(cat "/sys/fs/cgroup$group/memory.max")
+    swap=$(cat "/sys/fs/cgroup$group/memory.swap.max")
+    test "$cap" = 1073741824
+    test "$swap" = 0
+    echo "enforced-memory-max=$cap enforced-swap-max=$swap cgroup=$group"
+    echo "outer-netns=$(readlink /proc/self/ns/net)"
+    set +e
+    bwrap "$@"
+    code=$?
+    echo "memory-peak=$(cat "/sys/fs/cgroup$group/memory.peak") test-exit=$code"
+    cat "/sys/fs/cgroup$group/memory.events"
+    exit "$code"
+  ' bash "${args[@]}" "$node_path" --test "$@"
   exit_code=$?
   exit "$exit_code"
 fi
-echo "warning: systemd-run user scope unavailable; using bwrap namespace plus Node heap cap only" >&2
-bwrap "${args[@]}" "$node_path" --test "$@"
-exit_code=$?
-exit "$exit_code"
+echo "ERROR: required MemoryMax=1GiB scope unavailable; refusing fallback" >&2
+exit 1

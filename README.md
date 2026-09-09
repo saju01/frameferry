@@ -69,7 +69,7 @@ Each pagination step reports which sentinel it used. `sentinelSource` is `observ
 
 ## Supported capability matrix
 
-- **Posts**: implemented and regression-tested. Existing stable IDs stay `shortcode + carouselIndex`, so repeat syncs reuse verified receipts even when provider URLs rotate.
+- **Posts**: implemented and regression-tested, with full-history completion still requiring observed terminal evidence. Legacy filenames/receipts retain their IDs; new discovery IDs use category/post/locator fingerprints. Provider fingerprints can rotate across runs: unchanged bytes require explicit scoped byte proof for compatibility, not encounter-order matching. See the bounded-discovery reference for the opt-in evidence root and remaining limits.
 - **Reels**: implemented and regression-tested against the public DOM shape. IDs are category-qualified as `reels__<shortcode>-<carouselIndex>`. Live public-profile behaviour remains unproven in this repo.
 - **Stories**: implemented and regression-tested against the public DOM shape. The provider UI exposes no stable shortcode, so later syncs re-fetch story/highlight media and dedupe after hashing. Live public-profile behaviour remains unproven in this repo.
 - **Highlights**: implemented against the public tab plus highlight-group DOM shape and reported honestly when the provider exposes no groups. Live public-profile behaviour remains unproven in this repo.
@@ -146,3 +146,7 @@ Run `doctor`. If Playwright has no browser, run `npx playwright install chromium
 ## Rights and privacy
 
 Archive only public content you have rights or permission to keep, and stay within InstaCognito's terms: https://instacognito.com/terms-and-conditions. This is not a commercial scraping platform and does not promise guaranteed completeness, no account risk, or unlimited use. The provider can change selectors, rate-limit, remove media, or return incomplete results. Carousels can produce more files than displayed post counts.
+
+## Bounded discovery repair
+
+See [bounded discovery and fingerprint identities](references/bounded-discovery.md) for retained UI slices, discovery-only canaries, validated CLI budgets, legacy aliases, crash recovery and explicit operational limits.
