@@ -160,10 +160,10 @@ canary ended at initial category readiness after roughly eight seconds with no c
 That path previously omitted transport evidence, so the live request state is unknown:
 we do NOT claim proven latency or source exhaustion for that specific run. A real-DOM
 regression independently reproduced the defect: an 8.5-second pending response was
-abandoned by the fixed8-second readiness ceiling despite remaining global budget.
+abandoned by the fixed 8-second readiness ceiling despite remaining global budget.
 
 Readiness now observes the same pending response without reissuing search/tab/scroll,
-clamped by the original global discovery deadline, with at most8seconds of post-settle
+clamped by the original global discovery deadline, with at most 8 seconds of post-settle
 render grace. It does not accept stale no-content or cards while transport is pending.
 Denial/challenge stops immediately. A pending deadline exits PARTIAL/awaiting-response;
 all category-readiness outcomes carry sanitized transport counts. This does not change

@@ -16,7 +16,7 @@ test('validateOptions accepts stopOnItemFailure', () => {
 const bin = path.join(__dirname, '..', 'bin', 'frameferry.js');
 
 test('CLI parser accepts --stop-on-item-failure for archive', () => {
-  const result = spawnSync(process.execPath, [bin, 'archive', 'example', '--stop-on-item-failure', '--output', '/tmp/frameferry-stop-on-item-failure-test'], { encoding: 'utf8', timeout: 5000 });
+  const result = spawnSync(process.execPath, [bin, 'archive', 'example', '--stop-on-item-failure', '--max-acquire-items'], { encoding: 'utf8', timeout: 5000 });
   assert.ok(!/is not valid for archive/.test(result.stderr || ''));
 });
 
@@ -27,8 +27,8 @@ test('CLI parser rejects --stop-on-item-failure for non-archive commands', () =>
 });
 
 test('CLI parser treats --stop-on-item-failure as boolean (no value required)', () => {
-  const result = spawnSync(process.execPath, [bin, 'archive', 'example', '--stop-on-item-failure', '--max-acquire-items', '1', '--output', '/tmp/frameferry-stop-on-item-failure-test'], { encoding: 'utf8', timeout: 5000 });
-  assert.ok(!/requires a value/.test(result.stderr || ''));
+  const result = spawnSync(process.execPath, [bin, 'archive', 'example', '--stop-on-item-failure', '--output'], { encoding: 'utf8', timeout: 5000 });
+  assert.ok(!/stop-on-item-failure.*requires a value/.test(result.stderr || ''));
 });
 
 test('default behavior does not stop on item failure', () => {
