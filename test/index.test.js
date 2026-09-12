@@ -6,6 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const lib = require('../src/index.js');
+function expectedId(post, media, category = 'posts') { const h = x => require('node:crypto').createHash('sha256').update(x).digest('hex'); return category + '__' + h(JSON.stringify([category, post, h('/media?id=' + media)])); }
 
 const python3Available = spawnSync('python3', ['-c', 'import zipfile'], { stdio: 'ignore' }).status === 0;
 
@@ -48,11 +49,11 @@ test('normalizes real provider carousel: one card per slide with same shortcode 
     { shortcode: 'CAR', href: 'https://instacognito.com/media?id=1' },
     { shortcode: 'CAR', href: 'https://instacognito.com/media?id=2' },
     { shortcode: 'OTHER', href: 'https://instacognito.com/media?id=3' },
-    { shortcode: 'CAR', carouselIndex: 1, href: 'https://instacognito.com/media?id=dup' }
+    { shortcode: 'CAR', carouselIndex: 1, href: 'https://instacognito.com/media?id=2' }
   ];
   const n = lib.normalizeItems(raw);
   assert.equal(n.uniquePostCount, 2);
-  assert.deepEqual(n.items.map(i => i.stableId), ['CAR-0', 'CAR-1', 'OTHER-0']);
+  assert.deepEqual(n.items.map(i => i.stableId), [expectedId("CAR", "1"), expectedId("CAR", "2"), expectedId("OTHER", "3")]);
 });
 
 test('repeat-page cards dedupe before assigning carousel indices', () => {
@@ -62,7 +63,7 @@ test('repeat-page cards dedupe before assigning carousel indices', () => {
     { shortcode: 'OTHER', href: 'https://instacognito.com/media?id=three', type: 'photo' }
   ];
   const n = lib.normalizeItems([...page, ...page]);
-  assert.deepEqual(n.items.map(i => i.stableId), ['CAR-0', 'CAR-1', 'OTHER-0']);
+  assert.deepEqual(n.items.map(i => i.stableId), [expectedId("CAR", "one"), expectedId("CAR", "two"), expectedId("OTHER", "three")]);
 });
 
 test('malformed dates are preserved instead of becoming invalid watermark', () => {
@@ -97,7 +98,7 @@ test('unknown denom cannot claim complete and advertised shortfall is partial', 
     mode: 'sync',
     reportedTotal: 3,
     noGrowth: true,
-    items: [{ shortcode: 'A', href: 'https://instacognito.com/media?id=rotated' }],
+    items: [{ shortcode: 'A', href: 'https://instacognito.com/media?id=a&signature=rotated' }],
     dnsLookup: publicDns,
     fetchImpl: async () => res(),
     delayMs: 0
@@ -200,7 +201,7 @@ test('sync reuses verified receipts: second run same IDs rotated URLs performs z
   const items1 = [{ shortcode: 'A', href: 'https://instacognito.com/media?id=oldA' }, { shortcode: 'B', href: 'https://instacognito.com/media?id=oldB' }];
   await lib.archiveProfile({ handle: 'example', output: out, mode: 'full', reportedTotal: 2, items: items1, dnsLookup: publicDns, fetchImpl: async () => { calls++; return res(); }, delayMs: 0 });
   calls = 0;
-  const items2 = [{ shortcode: 'A', href: 'https://instacognito.com/media?id=newA' }, { shortcode: 'B', href: 'https://instacognito.com/media?id=newB' }];
+  const items2 = [{ shortcode: 'A', href: 'https://instacognito.com/media?id=oldA&signature=fresh' }, { shortcode: 'B', href: 'https://instacognito.com/media?id=oldB&signature=fresh' }];
   const s2 = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 2, items: items2, dnsLookup: publicDns, fetchImpl: async () => { calls++; return res(); }, delayMs: 0 });
   assert.equal(s2.status, 'COMPLETE');
   assert.equal(s2.reusedCount, 2);
@@ -213,9 +214,9 @@ test('corrupted completed file is retried and repaired', async () => {
   let calls = 0;
   const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => { calls++; return res(); }, delayMs: 0 });
-  await fsp.writeFile(path.join(out, 'media', 'example', 'A-0.jpg'), Buffer.from('bad'));
+  await fsp.writeFile(path.join(out, 'media', 'example', expectedId("A", "a") + ".jpg"), Buffer.from('bad'));
   calls = 0;
-  const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [{ shortcode: 'A', href: 'https://instacognito.com/media?id=rotated' }], dnsLookup: publicDns, fetchImpl: async () => { calls++; return res(); }, delayMs: 0 });
+  const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [{ shortcode: 'A', href: 'https://instacognito.com/media?id=a&signature=rotated' }], dnsLookup: publicDns, fetchImpl: async () => { calls++; return res(); }, delayMs: 0 });
   assert.equal(s.status, 'COMPLETE');
   assert.equal(calls, 1);
 });
@@ -303,7 +304,7 @@ test('actual Playwright DOM fixture models real carousel cards and profile-secti
     const got = await lib.extractItemsFromPage(page, { category: 'posts', mediaTypes: ['image', 'video'], reportedTotal: total });
     assert.equal(total, 2);
     assert.equal(got.uniquePostCount, 2);
-    assert.deepEqual(got.items.map(i => i.stableId), ['CAR-0', 'CAR-1', 'OTHER-0']);
+    assert.deepEqual(got.items.map(i => i.stableId), [expectedId("CAR", "one"), expectedId("CAR", "two"), expectedId("OTHER", "three")]);
   } finally {
     await browser.close();
   }
@@ -590,7 +591,7 @@ test('extractItemsFromPage understands provider-like posts/stories cards', async
     await page.setContent('<div id="post-container"><article class="post-card"><div class="post-image" data-type="image"></div><div class="post-content"><p>Hello world</p><a class="content-download-btn" href="https://instacognito.com/media?id=a">d</a></div><div class="post-footer"><div class="icon-group likes-trigger" data-id="CAR"><span>5</span></div><div class="icon-group comments-trigger" data-id="CAR"><span>1</span></div><div class="icon-group"><span>2024-01-01</span></div></div></article><article class="post-card"><div class="post-image" data-type="video"></div><div class="post-content"><p>Zero social proof</p><a class="content-download-btn" href="https://instacognito.com/media?id=b">d</a></div><div class="post-footer"><div class="icon-group"><span>2024-01-02</span></div></div></article></div>');
     const posts = await lib.extractItemsFromPage(page, { category: 'posts', mediaTypes: ['image', 'video'] });
     assert.equal(posts.items.length, 2);
-    assert.equal(posts.items[0].stableId, 'CAR-0');
+    assert.equal(posts.items[0].stableId, expectedId("CAR", "a"));
     assert.equal(posts.items[1].stableId, null);
     await page.setContent('<div id="post-container"><article class="post-card"><div class="story-image" data-type="video"></div><div class="post-content"><a class="content-download-btn" href="https://instacognito.com/media?id=s1">d</a></div><div class="post-footer"><div class="icon-group"><span>23 August</span></div></div></article></div>');
     const stories = await lib.extractItemsFromPage(page, { category: 'stories', mediaTypes: ['image', 'video'] });
@@ -624,8 +625,8 @@ test('archiveProfile reuses post receipts on stable IDs and rotated URLs', async
     output: out,
     mode: 'sync',
     sections: [section('posts', [
-      { shortcode: 'A', href: 'https://instacognito.com/media?id=newA', mediaType: 'image' },
-      { shortcode: 'B', href: 'https://instacognito.com/media?id=newB', mediaType: 'image' }
+      { shortcode: 'A', href: 'https://instacognito.com/media?id=oldA&signature=fresh', mediaType: 'image' },
+      { shortcode: 'B', href: 'https://instacognito.com/media?id=oldB&signature=fresh', mediaType: 'image' }
     ], { reportedTotal: 2 })],
     dnsLookup: publicDns,
     fetchImpl: async () => { calls++; return res(); },
@@ -719,9 +720,9 @@ test('legacy post receipts without category still count toward uniquePostCount a
     delayMs: 0
   });
   const manifestPath = path.join(out, '.frameferry', 'example', 'manifest.json');
-  const receiptPath = path.join(out, 'receipts', 'example', 'A-0.json');
+  const receiptPath = path.join(out, 'receipts', 'example', expectedId("A", "a") + ".json");
   const manifest = await readJson(manifestPath);
-  delete manifest.completed['A-0'].category;
+  delete manifest.completed[expectedId("A", "a")].category;
   await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
   const receipt = await readJson(receiptPath);
   delete receipt.category;
@@ -730,7 +731,7 @@ test('legacy post receipts without category still count toward uniquePostCount a
     handle: 'example',
     output: out,
     mode: 'sync',
-    sections: [section('posts', [{ shortcode: 'A', href: 'https://instacognito.com/media?id=rotated', mediaType: 'image' }], { reportedTotal: 1 })],
+    sections: [section('posts', [{ shortcode: 'A', href: 'https://instacognito.com/media?id=a&signature=rotated', mediaType: 'image' }], { reportedTotal: 1 })],
     dnsLookup: publicDns,
     fetchImpl: async () => { throw new Error('should not fetch'); },
     delayMs: 0
@@ -831,7 +832,7 @@ test('exportProfile refuses corrupted bytes, stale part files, and zero zip limi
   await lib.exportProfile({ handle: 'example', output: out, zip: zipPath, overwriteZip: true });
   assert.equal(fs.existsSync(zipPath + '.part'), false);
   await assert.rejects(() => lib.exportProfile({ handle: 'example', output: out, zip: path.join(d, 'zero.zip'), maxZipBytes: 0 }), /positive number/);
-  await fsp.writeFile(path.join(out, 'media', 'example', 'A-0.jpg'), Buffer.from('corrupt'));
+  await fsp.writeFile(path.join(out, 'media', 'example', expectedId("A", "a") + ".jpg"), Buffer.from('corrupt'));
   await assert.rejects(() => lib.exportProfile({ handle: 'example', output: out, zip: path.join(d, 'corrupt.zip') }), /receipt verification failed/);
 });
 
@@ -2009,31 +2010,31 @@ test('a failure is cleared only by a verified matching receipt, and an unresolve
     fetchImpl: async url => url.includes('id=b') ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
   });
   let manifest = await readManifest(out);
-  assert.ok(manifest.completed['A-0'], 'A must have a receipt');
-  assert.ok(manifest.failed['B-0'], 'B must be a real failure');
+  assert.ok(manifest.completed[expectedId("A", "a")], 'A must have a receipt');
+  assert.ok(manifest.failed[expectedId("B", "b")], 'B must be a real failure');
 
   // The observed production state: an ID that really was downloaded is ALSO listed as failed, and the
   // next scan does not rediscover it. 429 of 1514 "failures" were of exactly this shape.
-  manifest.failed['A-0'] = { stableId: 'A-0', category: 'posts', shortcode: 'A', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
+  manifest.failed[expectedId("A", "a")] = { stableId: expectedId("A", "a"), category: 'posts', shortcode: 'A', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
   await writeManifestRaw(out, manifest);
 
   const other = { shortcode: 'C', href: 'https://instacognito.com/media?id=c' };
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 3, items: [other], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   manifest = await readManifest(out);
   const stillFailed = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
-  assert.equal(stillFailed['A-0'], undefined, 'a failure with a verified matching receipt must be resolved, not carried forever');
-  assert.ok(stillFailed['B-0'], 'a failure with no receipt must be retained, never cleared blindly');
-  assert.ok((manifest.audit || []).some(entry => (entry.resolvedByReceipt || []).includes('A-0')), 'resolution must be auditable');
+  assert.equal(stillFailed[expectedId("A", "a")], undefined, 'a failure with a verified matching receipt must be resolved, not carried forever');
+  assert.ok(stillFailed[expectedId("B", "b")], 'a failure with no receipt must be retained, never cleared blindly');
+  assert.ok((manifest.audit || []).some(entry => (entry.resolvedByReceipt || []).includes(expectedId("A", "a"))), 'resolution must be auditable');
 
   // Presence of a completed entry is not enough: the bytes must still verify.
   manifest = await readManifest(out);
-  manifest.failed['A-0'] = { stableId: 'A-0', category: 'posts', shortcode: 'A', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
+  manifest.failed[expectedId("A", "a")] = { stableId: expectedId("A", "a"), category: 'posts', shortcode: 'A', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
   await writeManifestRaw(out, manifest);
-  await fsp.writeFile(path.join(out, 'media', 'example', 'A-0.jpg'), Buffer.from('corrupted'));
+  await fsp.writeFile(path.join(out, 'media', 'example', expectedId("A", "a") + ".jpg"), Buffer.from('corrupted'));
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 3, items: [other], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   manifest = await readManifest(out);
   const afterCorruption = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
-  assert.ok(afterCorruption['A-0'], 'a corrupted receipt must not count as verified resolution');
+  assert.ok(afterCorruption[expectedId("A", "a")], 'a corrupted receipt must not count as verified resolution');
 });
 
 test('an interrupted run has already persisted the progress it made, and the next run reuses it', async () => {
@@ -2055,7 +2056,7 @@ test('an interrupted run has already persisted the progress it made, and the nex
   assert.ok(midRun[0] >= 2, 'progress must be checkpointed durably during the run, not only at the end; saw ' + midRun[0]);
 
   let fetches = 0;
-  const rotated = items.map(i => ({ shortcode: i.shortcode, href: 'https://instacognito.com/media?id=' + i.shortcode + '-rotated' }));
+  const rotated = items.map(i => ({ shortcode: i.shortcode, href: 'https://instacognito.com/media?id=' + i.shortcode + '&signature=rotated' }));
   const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 5, items: rotated, dnsLookup: publicDns, fetchImpl: async () => { fetches++; return res(); }, delayMs: 0 });
   assert.equal(fetches, 0, 'a resumed run must reuse every verified receipt');
   assert.equal(s.reusedCount, 5);
@@ -2105,15 +2106,15 @@ test('no id is ever both completed and outstanding, and carousel slides stay dis
     fetchImpl: async url => url.includes('id=s1') ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
   });
   let manifest = await readManifest(out);
-  assert.ok(manifest.completed['CAR-0'], 'slide 0 downloaded');
-  assert.ok(manifest.failed['CAR-1'], 'slide 1 failed and stays its own distinct entry');
-  assert.equal(manifest.failed['CAR-1'].carouselIndex, 1, 'a failed slide must keep its own carousel index');
-  assert.equal(manifest.completed['CAR-0'].carouselIndex, 0);
+  assert.ok(manifest.completed[expectedId("CAR", "s0")], 'slide 0 downloaded');
+  assert.ok(manifest.failed[expectedId("CAR", "s1")], 'slide 1 failed and stays its own distinct entry');
+  assert.equal(manifest.failed[expectedId("CAR", "s1")].carouselIndex, 1, 'a failed slide must keep its own carousel index');
+  assert.equal(manifest.completed[expectedId("CAR", "s0")].carouselIndex, 0);
 
   // Inject the overlap for both a completed slide and a completed solo post, then run a scan that
   // rediscovers neither: the invariant must hold without the ids being re-seen.
-  manifest.failed['CAR-0'] = { ...manifest.failed['CAR-1'], stableId: 'CAR-0', carouselIndex: 0, error: 'pending fresh scan retry' };
-  manifest.failed['SOLO-0'] = { stableId: 'SOLO-0', category: 'posts', shortcode: 'SOLO', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
+  manifest.failed[expectedId("CAR", "s0")] = { ...manifest.failed[expectedId("CAR", "s1")], stableId: expectedId("CAR", "s0"), carouselIndex: 0, error: 'pending fresh scan retry' };
+  manifest.failed[expectedId("SOLO", "solo")] = { stableId: expectedId("SOLO", "solo"), category: 'posts', shortcode: 'SOLO', carouselIndex: 0, mediaType: 'image', identityBasis: 'provider-shortcode', error: 'pending fresh scan retry' };
   await writeManifestRaw(out, manifest);
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [{ shortcode: 'NEW', href: 'https://instacognito.com/media?id=new' }], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   manifest = await readManifest(out);
@@ -2121,7 +2122,7 @@ test('no id is ever both completed and outstanding, and carousel slides stay dis
   for (const id of Object.keys(outstanding)) {
     assert.equal(manifest.completed[id], undefined, 'id ' + id + ' is recorded as both completed and outstanding');
   }
-  assert.ok(outstanding['CAR-1'], 'the genuinely missing slide must survive the reconciliation');
+  assert.ok(outstanding[expectedId("CAR", "s1")], 'the genuinely missing slide must survive the reconciliation');
   assert.equal(new Set(Object.keys(manifest.completed)).size, Object.keys(manifest.completed).length);
 });
 
@@ -2202,7 +2203,7 @@ test('a resumed run targets the ids it is still missing and reports what discove
   assert.ok(s.resume, 'a resumed run must report its own resume coverage');
   assert.equal(s.resume.targeted, 1, 'B-0 is the one outstanding id');
   assert.equal(s.resume.rediscovered, 0);
-  assert.deepEqual(s.resume.stillMissing, ['B-0']);
+  assert.deepEqual(s.resume.stillMissing, [expectedId("B", "b")]);
 
   const s2 = await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [good, bad], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   assert.equal(s2.resume.targeted, 1);
@@ -2219,7 +2220,7 @@ test('a mid-run checkpoint still carries outstanding work the scan has not re-se
     handle: 'example', output: out, reportedTotal: 1, items: [bad], dnsLookup: publicDns, delayMs: 0,
     fetchImpl: async () => res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } })
   });
-  assert.ok((await readManifest(out)).failed['B-0'], 'B-0 must start out outstanding');
+  assert.ok((await readManifest(out)).failed[expectedId("B", "b")], 'B-0 must start out outstanding');
 
   // A later scan that never re-sees B-0. If a checkpoint wrote only this run's own maps, a crash
   // here would erase B-0 and the next run would never know it was owed.
@@ -2235,8 +2236,8 @@ test('a mid-run checkpoint still carries outstanding work the scan has not re-se
     return res();
   };
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 5, items, dnsLookup: publicDns, fetchImpl, delayMs: 0, checkpointEveryItems: 2 });
-  assert.ok(midRun[0]['B-0'], 'a checkpoint must not drop outstanding work that this scan did not re-see');
-  assert.ok((await readManifest(out)).failed['B-0'], 'and it must still be owed at the end of the run');
+  assert.ok(midRun[0][expectedId("B", "b")], 'a checkpoint must not drop outstanding work that this scan did not re-see');
+  assert.ok((await readManifest(out)).failed[expectedId("B", "b")], 'and it must still be owed at the end of the run');
 });
 
 // --- independent review 1 counterexamples ------------------------------------------------------
@@ -2253,11 +2254,11 @@ test('P1-1 a run cannot report COMPLETE while it still owes outstanding media', 
     handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, delayMs: 0,
     fetchImpl: async url => url.includes('id=s1') ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
   });
-  assert.ok((await readManifest(out)).failed['CAR-1'], 'CAR-1 must start out owed');
+  assert.ok((await readManifest(out)).failed[expectedId("CAR", "s1")], 'CAR-1 must start out owed');
   // A later scan that satisfies the post total but never re-sees the owed slide.
   const s = await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [slides[0]], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   assert.equal(s.coverage.outstandingMediaCount, 1);
-  assert.deepEqual(s.resume.stillMissing, ['CAR-1']);
+  assert.deepEqual(s.resume.stillMissing, [expectedId("CAR", "s1")]);
   assert.notEqual(s.status, 'COMPLETE', 'COMPLETE while media is still owed is a false completion');
 });
 
@@ -2269,7 +2270,7 @@ test('P1-2 a deferred retry of a rediscovered failure keeps the item, never drop
     handle: 'example', output: out, reportedTotal: 1, items: [bad], dnsLookup: publicDns, delayMs: 0,
     fetchImpl: async () => res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } })
   });
-  assert.ok((await readManifest(out)).failed['B-0']);
+  assert.ok((await readManifest(out)).failed[expectedId("B", "b")]);
   // Rediscovered, then denied: it is fresh (so carried state no longer covers it) and the deferral
   // stops the run before it can be filed anywhere.
   await assert.rejects(() => lib.archiveProfile({
@@ -2279,7 +2280,7 @@ test('P1-2 a deferred retry of a rediscovered failure keeps the item, never drop
   }), err => err.code === 'DEFERRED');
   const manifest = await readManifest(out);
   const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
-  assert.ok(outstanding['B-0'], 'a deferred item must still be owed, not silently forgotten');
+  assert.ok(outstanding[expectedId("B", "b")], 'a deferred item must still be owed, not silently forgotten');
 });
 
 test('P1-3a a checkpoint records discovered work that has not been acquired yet', async () => {
@@ -2297,8 +2298,8 @@ test('P1-3a a checkpoint records discovered work that has not been acquired yet'
     return res();
   };
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 5, items, dnsLookup: publicDns, fetchImpl, delayMs: 0, checkpointEveryItems: 2 });
-  assert.ok(midRun[0]['E-0'], 'work already discovered but not yet acquired must be checkpointed as owed');
-  assert.ok(midRun[0]['D-0'], 'and so must every other queued item');
+  assert.ok(midRun[0][expectedId('E','E')], 'work already discovered but not yet acquired must be checkpointed as owed');
+  assert.ok(midRun[0][expectedId('D','D')], 'and so must every other queued item');
 });
 
 test('P1-3b receipts committed between checkpoints are adopted, not re-downloaded', async () => {
@@ -2308,13 +2309,13 @@ test('P1-3b receipts committed between checkpoints are adopted, not re-downloade
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   // A crash between the receipt landing on disk and the manifest learning about it.
   const manifest = await readManifest(out);
-  delete manifest.completed['A-0'];
+  delete manifest.completed[expectedId("A", "a")];
   await writeManifestRaw(out, manifest);
-  assert.ok(fs.existsSync(path.join(out, 'receipts', 'example', 'A-0.json')), 'the receipt file must still be on disk');
+  assert.ok(fs.existsSync(path.join(out, 'receipts', 'example', expectedId("A", "a") + ".json")), 'the receipt file must still be on disk');
   let fetches = 0;
-  await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [{ shortcode: 'A', href: 'https://instacognito.com/media?id=rotated' }], dnsLookup: publicDns, fetchImpl: async () => { fetches++; return res(); }, delayMs: 0 });
+  await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [{ shortcode: 'A', href: 'https://instacognito.com/media?id=a&signature=rotated' }], dnsLookup: publicDns, fetchImpl: async () => { fetches++; return res(); }, delayMs: 0 });
   assert.equal(fetches, 0, 'an orphaned but verifiable receipt must be adopted, not re-fetched');
-  assert.ok((await readManifest(out)).completed['A-0'], 'and it must be back in the manifest');
+  assert.ok((await readManifest(out)).completed[expectedId("A", "a")], 'and it must be back in the manifest');
 });
 
 test('P1-4a spending the acquisition budget never marks an already completed id as owed', async () => {
@@ -2325,8 +2326,8 @@ test('P1-4a spending the acquisition budget never marks an already completed id 
   const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0, maxTimeMs: 5000, acquisitionMaxTimeMs: 0 });
   const manifest = await readManifest(out);
   const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
-  assert.equal(outstanding['A-0'], undefined, 'an id with a verified receipt is not owed just because the budget ran out');
-  assert.ok(manifest.completed['A-0']);
+  assert.equal(outstanding[expectedId("A", "a")], undefined, 'an id with a verified receipt is not owed just because the budget ran out');
+  assert.ok(manifest.completed[expectedId("A", "a")]);
   assert.equal(s.coverage.outstandingMediaCount, 0);
 });
 
@@ -2337,18 +2338,18 @@ test('P1-4b a receipt only resolves the id and handle it actually belongs to', a
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   const root = await lib.safeOutputRoot(out);
   const paths = lib.profilePaths(root, 'example');
-  const receipt = (await readManifest(out)).completed['A-0'];
+  const receipt = (await readManifest(out)).completed[expectedId("A", "a")];
 
   const wrongId = await lib.reconcileAgainstReceipts(paths, { 'B-0': receipt }, { 'B-0': { stableId: 'B-0', error: 'x' } });
   assert.deepEqual(wrongId.resolved, [], 'a receipt for A-0 must not resolve B-0');
   assert.ok(wrongId.retained['B-0']);
 
-  const wrongHandle = await lib.reconcileAgainstReceipts(paths, { 'A-0': { ...receipt, profileHandle: 'someoneelse' } }, { 'A-0': { stableId: 'A-0', error: 'x' } });
+  const wrongHandle = await lib.reconcileAgainstReceipts(paths, { [expectedId("A", "a")]: { ...receipt, profileHandle: 'someoneelse' } }, { [expectedId("A", "a")]: { stableId: expectedId("A", "a"), error: 'x' } });
   assert.deepEqual(wrongHandle.resolved, [], 'a receipt belonging to another handle must not resolve anything here');
-  assert.ok(wrongHandle.retained['A-0']);
+  assert.ok(wrongHandle.retained[expectedId("A", "a")]);
 
-  const right = await lib.reconcileAgainstReceipts(paths, { 'A-0': receipt }, { 'A-0': { stableId: 'A-0', error: 'x' } });
-  assert.deepEqual(right.resolved, ['A-0'], 'the receipt that genuinely matches still resolves');
+  const right = await lib.reconcileAgainstReceipts(paths, { [expectedId("A", "a")]: receipt }, { [expectedId("A", "a")]: { stableId: expectedId("A", "a"), error: 'x' } });
+  assert.deepEqual(right.resolved, [expectedId("A", "a")], 'the receipt that genuinely matches still resolves');
 });
 
 test('P1-5 lock takeover is fail-closed on an unattributable lock and release is ownership checked', async () => {
@@ -2385,8 +2386,8 @@ test('P1-6 a carousel slide is never resolved by index alone when the provider m
     fetchImpl: async url => res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } })
   });
   let manifest = await readManifest(out);
-  assert.equal(manifest.completed['CAR-0'].bytes, jpg.length, 'slide 0 holds the first media');
-  assert.equal(manifest.completed['CAR-1'].bytes, png.length, 'slide 1 holds the second media');
+  assert.equal(manifest.completed[expectedId("CAR", "slideZero")].bytes, jpg.length, 'slide 0 holds the first media');
+  assert.equal(manifest.completed[expectedId("CAR", "slideOne")].bytes, png.length, 'slide 1 holds the second media');
 
   // The same two slides, re-observed in the opposite order. Encounter order now calls slideOne
   // "CAR-0", so resolving by index would silently label the wrong media as slide 0.
@@ -2395,14 +2396,20 @@ test('P1-6 a carousel slide is never resolved by index alone when the provider m
     handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [s1, s0], dnsLookup: publicDns, delayMs: 0,
     fetchImpl: async url => { fetches++; return res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } }); }
   });
-  assert.ok(fetches > 0, 'a slide whose provider media no longer matches its receipt must not be reused by index');
+  assert.equal(fetches, 0, 'reversal does not change fingerprint identity or require re-acquisition');
+  // Independently retain the original byte-conflict contract: the same positively bound
+  // identity serves different bytes. No canonical file or receipt may be replaced.
+  const paths = lib.profilePaths(out, 'example');
+  const conflict0 = await lib.downloadOne(lib.normalizeItems([s0]).items[0], paths, { handle: 'example', runId: 'conflict', completedMap: manifest.completed, dnsLookup: publicDns, fetchImpl: async () => res({body:png}) });
+  const conflict1 = await lib.downloadOne(lib.normalizeItems([s1]).items[0], paths, { handle: 'example', runId: 'conflict', completedMap: manifest.completed, dnsLookup: publicDns, fetchImpl: async () => res({body:jpg}) });
   manifest = await readManifest(out);
   // Round 2 corrected this: re-acquiring must not remap a verified slide. The stored content stands
   // and the conflicting observation is held, because slide position is not evidence about which
   // media a verified id refers to.
-  assert.equal(manifest.completed['CAR-0'].bytes, jpg.length, 'a verified slide must not be overwritten by a conflicting one');
-  assert.equal(manifest.completed['CAR-1'].bytes, png.length);
-  assert.ok(manifest.conflicts['CAR-0'] && manifest.conflicts['CAR-1'], 'both conflicting observations must be held');
+  assert.equal(manifest.completed[expectedId("CAR", "slideZero")].bytes, jpg.length, 'a verified slide must not be overwritten by a conflicting one');
+  assert.equal(manifest.completed[expectedId("CAR", "slideOne")].bytes, png.length);
+  assert.ok(conflict0.conflict && conflict1.conflict, 'both byte-conflicting observations must be held');
+  assert.equal(conflict0.conflict.observedProviderMediaFingerprint, lib.providerMediaFingerprint(s0.href));
 });
 
 test('P2-7 an unexpected failure still finalizes the owner instead of leaving a live RUNNING claim', async (t) => {
@@ -2410,7 +2417,7 @@ test('P2-7 an unexpected failure still finalizes the owner instead of leaving a 
   const out = path.join(d, 'out');
   const item = { shortcode: 'A', href: 'https://instacognito.com/media?id=a' };
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
-  const media = path.join(out, 'media', 'example', 'A-0.jpg');
+  const media = path.join(out, 'media', 'example', expectedId("A", "a") + ".jpg");
   await fsp.chmod(media, 0o000);
   const stillReadable = await fsp.readFile(media).then(() => true).catch(() => false);
   if (stillReadable) { await fsp.chmod(media, 0o600); t.skip('cannot revoke read access in this environment'); return; }
@@ -2435,7 +2442,7 @@ test('P2-8 acquisition serves the ids already owed before newly discovered ones'
     fetchImpl: async url => (url.includes('id=B') || url.includes('id=C')) ? res({ body: Buffer.from('not-media'), headers: { 'content-type': 'image/jpeg' } }) : res()
   });
   const owed = await readManifest(out);
-  assert.ok(owed.failed['B-0'] && owed.failed['C-0'], 'B and C must start out owed');
+  assert.ok(owed.failed[expectedId("B", "B")] && owed.failed[expectedId("C", "C")], 'B and C must start out owed');
 
   // A scan that surfaces two new posts alongside the owed ones. First-seen order would spend the
   // budget on the new work and starve the backlog again.
@@ -2542,7 +2549,7 @@ test('R2-2 a lone slide of a known carousel is not reused by index, and a confli
     handle: 'example', output: out, reportedTotal: 1, items: [s0, s1], dnsLookup: publicDns, delayMs: 0,
     fetchImpl: async url => res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } })
   });
-  assert.equal((await readManifest(out)).completed['CAR-0'].bytes, jpg.length);
+  assert.equal((await readManifest(out)).completed[expectedId("CAR", "slideZero")].bytes, jpg.length);
 
   // Only ONE slide of the carousel is visible now, so encounter order calls it CAR-0 even though
   // the media is the second slide. Slide count 1 must not be enough to resolve it by index.
@@ -2551,10 +2558,13 @@ test('R2-2 a lone slide of a known carousel is not reused by index, and a confli
     handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: [s1], dnsLookup: publicDns, delayMs: 0,
     fetchImpl: async url => { fetches++; return res({ body: bodyFor(url), headers: { 'content-type': 'image/jpeg' } }); }
   });
-  assert.ok(fetches > 0, 'a lone slide of a post known to be a carousel must not resolve by index alone');
+  assert.equal(fetches, 0, 'a partial window resolves the matching fingerprint, not index zero');
+  const prior = await readManifest(out);
+  const conflict = await lib.downloadOne(lib.normalizeItems([s0]).items[0], lib.profilePaths(out, 'example'), { handle: 'example', runId: 'conflict', completedMap: prior.completed, dnsLookup: publicDns, fetchImpl: async () => res({body:png}) });
   const manifest = await readManifest(out);
-  assert.equal(manifest.completed['CAR-0'].bytes, jpg.length, 'a verified slide must never be destructively overwritten by a conflicting one');
-  assert.ok(manifest.conflicts && manifest.conflicts['CAR-0'], 'the conflicting content must be held and recorded');
+  assert.equal(manifest.completed[expectedId("CAR", "slideZero")].bytes, jpg.length, 'a verified slide must never be destructively overwritten by a conflicting one');
+  assert.ok(conflict.conflict, 'the conflicting content must be held and recorded');
+  assert.equal(conflict.conflict.observedBytes, png.length);
 });
 
 test('R2-3 the discovered queue is persisted before any acquisition starts', async () => {
@@ -2572,7 +2582,7 @@ test('R2-3 the discovered queue is persisted before any acquisition starts', asy
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 3, items, dnsLookup: publicDns, fetchImpl, delayMs: 0, checkpointEveryItems: 100 });
   const owed = atFirstFetch[0];
   assert.ok(owed, 'a manifest must exist before the first acquisition');
-  for (const id of ['A-0', 'B-0', 'C-0']) assert.ok(owed[id], 'the whole discovered queue must be persisted before acquiring: missing ' + id);
+  for (const id of ['A','B','C'].map(p => expectedId(p,p))) assert.ok(owed[id], 'the whole discovered queue must be persisted before acquiring: missing ' + id);
 });
 
 test('R2-4 unverifiable completed entries cannot claim completeness and never overlap owed work', async () => {
@@ -2581,13 +2591,13 @@ test('R2-4 unverifiable completed entries cannot claim completeness and never ov
   const mk = s => ({ shortcode: s, href: 'https://instacognito.com/media?id=' + s });
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 2, items: [mk('A'), mk('B')], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   // B's bytes rot on disk and no later scan re-observes B.
-  await fsp.writeFile(path.join(out, 'media', 'example', 'B-0.jpg'), Buffer.from('rotted'));
+  await fsp.writeFile(path.join(out, 'media', 'example', expectedId("B", "B") + ".jpg"), Buffer.from('rotted'));
   const s = await lib.archiveProfile({ handle: 'example', output: out, mode: 'sync', reportedTotal: 2, items: [mk('A')], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   assert.notEqual(s.status, 'COMPLETE', 'a receipt that no longer verifies cannot count toward completeness');
   const manifest = await readManifest(out);
   const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
-  assert.ok(outstanding['B-0'], 'the unverifiable id must be owed again');
-  assert.equal(manifest.completed['B-0'], undefined, 'and it must not still be counted as completed');
+  assert.ok(outstanding[expectedId("B", "B")], 'the unverifiable id must be owed again');
+  assert.equal(manifest.completed[expectedId("B", "B")], undefined, 'and it must not still be counted as completed');
   for (const id of Object.keys(outstanding)) assert.equal(manifest.completed[id], undefined, id + ' is both completed and owed');
 });
 
@@ -2607,8 +2617,8 @@ test('R2-4b a checkpoint never lists a verified completed id as owed', async () 
       return res();
     }
   });
-  assert.equal(seen[0]['A-0'], undefined, 'an id with a verified receipt must not be checkpointed as owed');
-  assert.ok(seen[0]['C-0'], 'while genuinely unacquired work still must be');
+  assert.equal(seen[0][expectedId("A", "A")], undefined, 'an id with a verified receipt must not be checkpointed as owed');
+  assert.ok(seen[0][expectedId("C", "C")], 'while genuinely unacquired work still must be');
 });
 
 test('R2-5 identity must be positively proved on every resolution path', async () => {
@@ -2618,18 +2628,18 @@ test('R2-5 identity must be positively proved on every resolution path', async (
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: [item], dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   const root = await lib.safeOutputRoot(out);
   const paths = lib.profilePaths(root, 'example');
-  const receipt = (await readManifest(out)).completed['A-0'];
+  const receipt = (await readManifest(out)).completed[expectedId("A", "a")];
 
   // A receipt missing its identity fields proves nothing.
   const noId = { ...receipt }; delete noId.stableId; delete noId.id;
   assert.deepEqual((await lib.reconcileAgainstReceipts(paths, { 'B-0': noId }, { 'B-0': { stableId: 'B-0', error: 'x' } }, 'example')).resolved, [], 'a receipt with no stableId must not resolve anything');
   const noHandle = { ...receipt }; delete noHandle.profileHandle;
-  assert.deepEqual((await lib.reconcileAgainstReceipts(paths, { 'A-0': noHandle }, { 'A-0': { stableId: 'A-0', error: 'x' } }, 'example')).resolved, [], 'a receipt with no handle must not resolve anything');
+  assert.deepEqual((await lib.reconcileAgainstReceipts(paths, { [expectedId("A", "a")]: noHandle }, { [expectedId("A", "a")]: { stableId: expectedId("A", "a"), error: 'x' } }, 'example')).resolved, [], 'a receipt with no handle must not resolve anything');
 
   // Content-identical reuse inside downloadOne must check identity too, not just the hash.
   const foreign = { ...receipt, profileHandle: 'someoneelse' };
-  const got = await lib.downloadOne({ ...item, stableId: 'A-0', carouselIndex: 0, category: 'posts', mediaType: 'image' }, paths, {
-    dnsLookup: publicDns, fetchImpl: async () => res(), runId: 'r', remainingMs: 5000, completedMap: { 'A-0': foreign }, handle: 'example'
+  const got = await lib.downloadOne({ ...item, stableId: expectedId("A", "a"), carouselIndex: 0, category: 'posts', mediaType: 'image' }, paths, {
+    dnsLookup: publicDns, fetchImpl: async () => res(), runId: 'r', remainingMs: 5000, completedMap: { [expectedId("A", "a")]: foreign }, handle: 'example'
   });
   assert.notEqual(got.receipt.profileHandle, 'someoneelse', 'a receipt belonging to another handle must never be reused by content match');
   assert.equal(got.receipt.profileHandle, 'example');
@@ -2744,9 +2754,9 @@ test('R3-1 owed work is scheduled fairly across sections, not drained section by
   // outstanding id sits untouched on one.
   await lib.archiveProfile({ ...common, sections: [bothSections()[0]], fetchImpl: failing });
   const owed = await readManifest(out);
-  assert.ok(owed.failed['P1-0'] && owed.failed['P2-0'], 'both post ids must be owed');
-  assert.ok(owed.failed['reels__R1-0'], 'the reel id must be owed too');
-  assert.ok(owed.failed['P1-0'].attempts > owed.failed['reels__R1-0'].attempts, 'the posts backlog must have consumed more attempts');
+  assert.ok(owed.failed[expectedId("P1", "P1")] && owed.failed[expectedId("P2", "P2")], 'both post ids must be owed');
+  assert.ok(owed.failed[expectedId("R1", "R1", "reels")], 'the reel id must be owed too');
+  assert.ok(owed.failed[expectedId("P1", "P1")].attempts > owed.failed[expectedId("R1", "R1", "reels")].attempts, 'the posts backlog must have consumed more attempts');
 
   const order = [];
   await lib.archiveProfile({
@@ -2816,7 +2826,7 @@ test('R4-1 a completed id is never left in pending when the budget runs out', as
   assert.deepEqual(overlapPending, [], 'completed ids must not also be pending');
   assert.deepEqual(overlapFailed, [], 'completed ids must not also be failed');
   // Non-destructive: the verified receipts are what resolves the overlap, so they must survive.
-  assert.ok(manifest.completed['CAR-0'] && manifest.completed['CAR-1'], 'verified receipts must be preserved, not dropped to force disjointness');
+  assert.ok(manifest.completed[expectedId("CAR", "s0")] && manifest.completed[expectedId("CAR", "s1")], 'verified receipts must be preserved, not dropped to force disjointness');
   assert.equal(s.coverage.outstandingMediaCount, 0);
 });
 
@@ -2838,7 +2848,7 @@ test('R4-2 a completed id is never left in failed when a fresh attempt fails', a
   const completedIds = new Set(Object.keys(manifest.completed));
   assert.deepEqual(Object.keys(manifest.failed || {}).filter(id => completedIds.has(id)), [], 'a failed retry must not leave the id both completed and failed');
   assert.deepEqual(Object.keys(manifest.pending || {}).filter(id => completedIds.has(id)), []);
-  assert.ok(manifest.completed['CAR-0'] && manifest.completed['CAR-1'], 'the previously verified content still stands');
+  assert.ok(manifest.completed[expectedId("CAR", "s0")] && manifest.completed[expectedId("CAR", "s1")], 'the previously verified content still stands');
 });
 
 test('R4-3 an unverifiable receipt loses its completed claim and stays owed', async () => {
@@ -2851,7 +2861,7 @@ test('R4-3 an unverifiable receipt loses its completed claim and stays owed', as
   await lib.archiveProfile({ handle: 'example', output: out, reportedTotal: 1, items: slides, dnsLookup: publicDns, fetchImpl: async () => res(), delayMs: 0 });
   await stripFingerprints(out);
   // CAR-1's bytes rot, so it cannot be the thing that resolves its own outstanding entry.
-  await fsp.writeFile(path.join(out, 'media', 'example', 'CAR-1.jpg'), Buffer.from('rotted'));
+  await fsp.writeFile(path.join(out, 'media', 'example', expectedId("CAR", "s1") + ".jpg"), Buffer.from('rotted'));
 
   await lib.archiveProfile({
     handle: 'example', output: out, mode: 'sync', reportedTotal: 1, items: slides, dnsLookup: publicDns, delayMs: 0,
@@ -2859,9 +2869,9 @@ test('R4-3 an unverifiable receipt loses its completed claim and stays owed', as
   });
   const manifest = await readManifest(out);
   const outstanding = { ...(manifest.failed || {}), ...(manifest.pending || {}) };
-  assert.ok(outstanding['CAR-1'], 'unresolved work must be preserved, never cleared to satisfy the invariant');
-  assert.equal(manifest.completed['CAR-1'], undefined, 'and it must stop claiming to be completed');
-  assert.ok(manifest.completed['CAR-0'], 'the slide that still verifies is untouched');
+  assert.ok(outstanding[expectedId("CAR", "s1")], 'unresolved work must be preserved, never cleared to satisfy the invariant');
+  assert.equal(manifest.completed[expectedId("CAR", "s1")], undefined, 'and it must stop claiming to be completed');
+  assert.ok(manifest.completed[expectedId("CAR", "s0")], 'the slide that still verifies is untouched');
   assert.deepEqual(Object.keys(outstanding).filter(id => manifest.completed[id]), []);
 });
 

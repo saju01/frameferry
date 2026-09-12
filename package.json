@@ -7,6 +7,7 @@
   },
   "scripts": {
     "test": "node --test",
+    "test:ci": "node scripts/run-ci-tests.js",
     "test:sandbox": "./scripts/test-sandbox.sh"
   },
   "engines": {
