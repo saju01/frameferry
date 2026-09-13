@@ -38,7 +38,7 @@ async function installGuards(page,budget){
   // Cosmetic previews never leave the browser. Media acquisition uses downloadOne.
   if(['image','media','stylesheet','font'].includes(req.resourceType()))return route.abort('blockedbyclient');
   if(u.origin!==F.PROVIDER_ORIGIN)return route.fallback();
-  try{budget.assert();budget.reserve('discovery');}
+  try{budget.assert();await budget.admit('discovery');}
   catch(e){return route.abort('blockedbyclient');}
   return route.fallback();
  });
@@ -111,7 +111,7 @@ async function syncWindow(input,deps={}){
  }catch(e){result.status=budget.data.denial?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message)};for(const h of config.handles)if(!result.handles[h.handle])result.handles[h.handle]={status:'NOT_COMPLETED',failed:true,files:[]};return result;}
  finally{
   if(context)await context.close().catch(()=>{});if(browser)await browser.close().catch(()=>{});
-  result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,denial:budget.data.denial};
+  result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,quotaPolicy:budget.data.quota_policy,minRequestIntervalMs:budget.data.min_request_interval_ms,denial:budget.data.denial};
   try{await F.atomicWriteJson(resultFile,result);}finally{budget.close();}
  }
 }

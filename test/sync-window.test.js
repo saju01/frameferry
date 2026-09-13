@@ -90,3 +90,27 @@ test('composition rejects mismatched selected IDs and malformed date provenance'
  h.observations[0].date={timeZone:'UTC'};await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]));
  h.observations[0].date={...date,observedAt:'2020-01-01T00:00:00Z'};await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]),/date provenance/);
 });
+
+test('public provider has no inherited 120/140 quota, and history/denial remain intact',async t=>{
+ const p=path.join(await tmp(t),'budget.json'),a=openBudget(p,'old-policy');a.close();
+ const old=JSON.parse(await fs.readFile(p));old.requests=140;old.recent_request_ms=Array(140).fill(Date.now());old.session_ceiling=120;old.hourly_ceiling=140;delete old.quota_policy;await fs.writeFile(p,JSON.stringify(old));
+ const b=openBudget(p,'old-policy');b.reserve('discovery');assert.equal(b.data.requests,141);assert.equal(b.data.recent_request_ms.length,141);assert.equal(b.data.session_ceiling,null);assert.equal(b.data.hourly_ceiling,null);assert.equal(b.data.previous_local_ceilings.hour,140);
+ assert.throws(()=>b.inspect(403,{},'https://instacognito.com'),/DENIED/);b.close();const c=openBudget(p,'new-policy');assert.throws(()=>c.reserve('discovery'),/denial/);c.close();
+});
+test('shared admission paces concurrent starts and denial prevents queued calls',async t=>{
+ const p=path.join(await tmp(t),'budget.json'),b=openBudget(p,'pace');let times=[];
+ await Promise.all(['discovery','download','discovery'].map(phase=>b.admit(phase).then(()=>times.push(performance.now()))));assert.equal(times.length,3);assert.ok(times[1]-times[0]>=480);assert.ok(times[2]-times[1]>=480);
+ const pending=b.admit('download');assert.throws(()=>b.inspect(429,{'retry-after':'60'},'https://instacognito.com'),/RATE_LIMITED/);await assert.rejects(pending);assert.equal(b.data.requests,3);b.close();
+});
+test('expired download signal cannot send a queued request after pacing',async t=>{
+ const p=path.join(await tmp(t),'budget.json'),b=openBudget(p,'abort'),ac=new AbortController();await b.admit('discovery');ac.abort();await assert.rejects(b.admit('download',ac.signal));assert.equal(b.data.requests,1);b.close();
+});
+
+test('closing a paced run rejects queued admissions before ledger/network mutation',async t=>{
+ const p=path.join(await tmp(t),'budget.json'),b=openBudget(p,'close');await b.admit('discovery');const pending=b.admit('download');b.close();await assert.rejects(pending,/closed/);assert.equal(JSON.parse(await fs.readFile(p)).requests,1);
+});
+
+test('pacing survives close and reopen with a different run ID',async t=>{
+ const p=path.join(await tmp(t),'budget.json'),a=openBudget(p,'run-a');await a.admit('discovery');const first=performance.now();a.close();
+ const b=openBudget(p,'run-b');await b.admit('download');assert.ok(performance.now()-first>=480);assert.equal(b.data.recent_request_ms.length,2);assert.equal(b.data.requests,1);b.close();
+});

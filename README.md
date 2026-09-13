@@ -165,11 +165,15 @@ Example private configuration (keep real handles, paths and scheduling outside t
 - `COMPLETE` means all requested visible windows were read and their selected
   media verified. Output always has `fullHistoryComplete:false`. A stopped/empty/
   unreadable window or partial acquisition is nonzero, never a quiet success.
-- Default ceilings are 120 requests per invocation, 140 per rolling hour, 1 GiB
-  total downloaded bytes, 50 MiB/file, 10 minutes and 1,000 visible cards/handle.
-  Request overrides can only lower the session ceiling. All provider-origin
-  browser requests and every download/redirect are charged; cosmetic previews,
-  styles and fonts are blocked before sending. Denials are sticky across run IDs.
+- There is **no default signed-account-style hourly or per-run request quota**
+  for this public provider. Starts are paced at least 500 ms apart across browser
+  discovery and downloads. Counts remain auditable; an optional `maxRequests`
+  bounds one job only and is not advertised as a provider quota. Default resource
+  bounds remain 1 GiB total download, 50 MiB/file, 10 minutes and 1,000 visible
+  cards/handle. All provider-origin browser requests and download/redirect hops
+  are counted; cosmetic previews, styles and fonts are blocked before sending.
+  Real provider denials (including 429 and its Retry-After evidence) remain
+  sticky across run IDs. Existing accounting/denials are never reset to resume.
   Stale ledger locks require explicit operator inspection, never automatic reset.
 - Each completed file is a normal verified FrameFerry receipt. Restarts reuse
   positively bound, rehashed receipts. Old carousel positions and changing locators
