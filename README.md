@@ -207,3 +207,21 @@ Archive only public content you have rights or permission to keep, and stay with
 ## Bounded discovery repair
 
 See [bounded discovery and fingerprint identities](references/bounded-discovery.md) for retained UI slices, discovery-only canaries, validated CLI budgets, legacy aliases, crash recovery and explicit operational limits.
+
+### Known-post coverage guard
+
+A successful `sync-window` result means the returned visible window was processed,
+not that the provider feed is current. A profile listing can omit a recent post
+that its direct-link lookup returns. Private callers can supply up to 50
+`expectedPosts` per handle, each with `shortcode`, `category: "posts"`,
+`minDayHi` (calendar date), `source` (`owner-direct-observation` or
+`verified-receipt`), and timezone-bearing `sourceObservedAt`. No source URLs,
+credentials or account lists belong in the public repository.
+
+For witnesses at or after the job cutoff, the current Posts window must contain
+that shortcode with compatible selected date evidence. Missing or conflicting
+witnesses yield `PARTIAL / FEED_COVERAGE_GAP` before that handle's downloads;
+result composition revalidates the exact witness policy and observations too.
+This guard does not add pagination, refresh upstream caches, or discover unknown
+missing post IDs. It intentionally fails closed on a missing first-window witness.
+A witness match is necessary evidence only, never full-feed or full-history proof.

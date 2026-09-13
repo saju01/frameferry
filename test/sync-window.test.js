@@ -32,7 +32,7 @@ async function browserFixture(t,status=200,profileDelay=0){
  const wrap={newContext:async opts=>{assert.equal(opts.serviceWorkers,'block');const c=await browser.newContext(opts);contexts.push(c);await c.route('**/*',async route=>{
   const u=new URL(route.request().url());if(u.pathname==='/media'){preview++;return route.abort();}
   requests++;
-  const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="post-container"></div><script>function show(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@example</span> 1 posts\';document.getElementById("post-container").innerHTML=\'<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>\';}</script>';
+  const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><script>function show(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@example</span> 1 posts\';document.getElementById("post-container").innerHTML=\'<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>\';}</script>';
   const delayed = profileDelay ? html.replace('document.getElementById("profile-section").innerHTML=', 'setTimeout(()=>document.getElementById("profile-section").innerHTML=').replace(" 1 posts\';document.getElementById", " 1 posts\',"+profileDelay+");document.getElementById") : html;
   await route.fulfill({status,contentType:'text/html',body:delayed});
  });return c;},close:async()=>{}};
@@ -113,4 +113,43 @@ test('closing a paced run rejects queued admissions before ledger/network mutati
 test('pacing survives close and reopen with a different run ID',async t=>{
  const p=path.join(await tmp(t),'budget.json'),a=openBudget(p,'run-a');await a.admit('discovery');const first=performance.now();a.close();
  const b=openBudget(p,'run-b');await b.admit('download');assert.ok(performance.now()-first>=480);assert.equal(b.data.recent_request_ms.length,2);assert.equal(b.data.requests,1);b.close();
+});
+
+const witness=(shortcode='KNOWN')=>({shortcode,category:'posts',minDayHi:'2026-09-12',source:'owner-direct-observation',sourceObservedAt:'2026-09-13T00:00:00Z'});
+test('known-post config rejects malformed, duplicate, category and untrusted provenance fields',()=>{
+ const valid={dateAfter:'2026-09-08',expectedPosts:[witness()]};assert.equal(W.validateExpectedPosts(valid).length,1);
+ for(const w of [{...witness(),category:'stories'},{...witness(),minDayHi:'2026-02-31'},{...witness(),shortcode:'https://example.org'},{...witness(),source:'arbitrary'},{...witness(),sourceObservedAt:'nope'},{...witness(),sourceObservedAt:'2099-01-01T00:00:00Z'},{...witness(),url:'secret'}])assert.throws(()=>W.validateExpectedPosts({...valid,expectedPosts:[w]}));
+ assert.throws(()=>W.validateExpectedPosts({...valid,expectedPosts:[witness(),witness()]}));assert.throws(()=>W.validateExpectedPosts({...valid,expectedPosts:null}));
+});
+test('known-post coverage matches category and date, not carousel position, and is not full-feed proof',()=>{
+ const spec={dateAfter:'2026-09-08',expectedPosts:[witness()]},row={category:'posts',shortcode:'KNOWN',date:{dayHi:'2026-09-12'},selected:true};
+ assert.equal(W.witnessCoverage(spec,[]).satisfied,false);
+ assert.equal(W.witnessCoverage(spec,[{...row,category:'reels'}]).satisfied,false);
+ assert.equal(W.witnessCoverage(spec,[{...row,date:{dayHi:'2026-08-13'}}]).satisfied,false);
+ const ok=W.witnessCoverage(spec,[row,{...row,stableId:'different-slide'}]);assert.equal(ok.satisfied,true);assert.deepEqual(ok.observedWitnesses,['KNOWN']);assert.equal(ok.fullFeedComplete,false);
+ assert.equal(W.witnessCoverage({...spec,dateAfter:'2026-09-13'},[]).satisfied,true);
+});
+test('real browser missing witness returns PARTIAL with evidence before any download',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t);const config={handles:[{handle:'example',dateAfter:'2026-09-08',expectedPosts:[witness()]}],runId:'known-gap',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true};
+ let downloads=0;const old=globalThis.fetch;t.after(()=>{globalThis.fetch=old;});globalThis.fetch=async()=>{downloads++;throw Error('must not download');};
+ const d=await W.syncWindow(config,fixture);assert.equal(d.status,'PARTIAL');assert.equal(d.error.code,'FEED_COVERAGE_GAP');assert.equal(d.handles.example.status,'PARTIAL');assert.deepEqual(d.handles.example.coverage.missingWitnesses,['KNOWN']);assert.equal(downloads,0);assert.equal(d.fullHistoryComplete,false);
+ assert.equal(JSON.parse(await fs.readFile(config.resultFile)).status,'PARTIAL');
+});
+test('real browser witness match succeeds and composition rechecks policy and observations',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t),old=globalThis.fetch;t.after(()=>{globalThis.fetch=old;});globalThis.fetch=async()=>new Response(jpg,{headers:{'content-type':'image/jpeg'}});
+ const spec={handle:'example',dateAfter:'2020-01-01',expectedPosts:[{...witness('POST'),minDayHi:'2020-01-01'}]},cfg={handles:[spec],runId:'match',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true};
+ const d=await W.syncWindow(cfg,fixture);assert.equal(d.status,'COMPLETE',JSON.stringify(d));assert.equal(d.handles.example.coverage.satisfied,true);assert.equal(d.handles.example.coverage.fullFeedComplete,false);
+ const combined=await W.combineWindowResults({...cfg,runId:'combined',resultFile:path.join(root,'combined.json')},[cfg.resultFile]);assert.equal(combined.status,'COMPLETE');
+ delete d.handles.example.coverage;await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'legacy',resultFile:path.join(root,'legacy.json')},[cfg.resultFile]),/known-post coverage/);
+ d.handles.example.coverage=combined.handles.example.coverage;d.handles.example.observations[0].shortcode='OTHER';await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'missing',resultFile:path.join(root,'missing.json')},[cfg.resultFile]),/known-post coverage/);
+});
+
+test('pure destination validator recomputes date provenance even with coherent forged coverage',()=>{
+ const at='2026-09-13T00:00:00Z',date=estimateDate('1 hour ago',at,'Europe/Amsterdam'),spec={handle:'example',dateAfter:'2026-09-08',expectedPosts:[witness()]},id='posts__'+'a'.repeat(64);
+ const x={stableId:id,shortcode:'KNOWN',category:'posts',selected:true,date},file={stableId:id,shortcode:'KNOWN',profileHandle:'example',date};
+ const h={status:'COMPLETE',scope:'current-visible-posts',dateAfter:spec.dateAfter,observedAt:at,observedCards:1,selectedCards:1,observations:[x],files:[file]};h.coverage=W.witnessCoverage(spec,h.observations);
+ assert.equal(W.validateWitnessWindow(spec,h,{timeZone:'Europe/Amsterdam',allowEstimatedDates:true}).satisfied,true);
+ for(const [key,value] of [['raw','13 August'],['iso','2026-09-12T12:00:00.000Z'],['observedAt','2026-09-12T00:00:00Z'],['timeZone','UTC'],['basis','absolute_year'],['precision','day']]){
+  const forged=JSON.parse(JSON.stringify(h));forged.observations[0].date[key]=value;forged.files[0].date[key]=value;assert.throws(()=>W.validateWitnessWindow(spec,forged,{timeZone:'Europe/Amsterdam',allowEstimatedDates:true}),/date provenance/);
+ }
 });

@@ -13,6 +13,7 @@ function validate(config){
  const seen=new Set();
  for(const h of config.handles){F.validateHandle(h.handle);if(seen.has(h.handle))throw new F.ArchiveError('BAD_ARGS','duplicate handle');seen.add(h.handle);
   if(typeof h.dateAfter!=='string'||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(h.dateAfter)||new Date(h.dateAfter).toISOString().slice(0,10)!==h.dateAfter)throw new F.ArchiveError('BAD_ARGS','explicit calendar dateAfter required');
+  validateExpectedPosts(h);
  }
  if(typeof config.runId!=='string'||!/^[A-Za-z0-9._-]{1,150}$/.test(config.runId))throw new F.ArchiveError('BAD_ARGS','safe runId required');
  if(!config.output||!config.resultFile||!config.requestLedger)throw new F.ArchiveError('BAD_ARGS','output, resultFile and requestLedger required');
@@ -31,6 +32,49 @@ function select(raw,observedAt,options){
   if(date.precision==='estimated'&&options.allowEstimatedDates!==true)throw new F.ArchiveError('DATE_POLICY','ambiguous source date requires explicit allowEstimatedDates');
   return {item,date,selected:date.dayHi>=options.dateAfter};
  });
+}
+// Caller-supplied evidence of known recent Posts. This is a necessary condition,
+// never proof that a provider listing is current or that the whole feed is complete.
+function validateExpectedPosts(spec){
+ const witnesses=spec.expectedPosts===undefined?[]:spec.expectedPosts;
+ if(!Array.isArray(witnesses)||witnesses.length>50)throw new F.ArchiveError('BAD_ARGS','expectedPosts must contain at most 50 witnesses');
+ const seen=new Set(),keys=['category','minDayHi','shortcode','source','sourceObservedAt'];
+ for(const w of witnesses){
+  if(!w||typeof w!=='object'||Object.keys(w).sort().join(',')!==keys.join(',')||w.category!=='posts'||typeof w.shortcode!=='string'||!/^[A-Za-z0-9_-]{1,64}$/.test(w.shortcode)||seen.has(w.shortcode))throw new F.ArchiveError('BAD_ARGS','invalid or duplicate Posts witness');
+  seen.add(w.shortcode);
+  if(typeof w.minDayHi!=='string'||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(w.minDayHi)||!Number.isFinite(Date.parse(w.minDayHi))||new Date(w.minDayHi).toISOString().slice(0,10)!==w.minDayHi)throw new F.ArchiveError('BAD_ARGS','invalid witness date');
+  if(!['owner-direct-observation','verified-receipt'].includes(w.source)||typeof w.sourceObservedAt!=='string'||!/(Z|[+-][0-9]{2}:[0-9]{2})$/.test(w.sourceObservedAt)||!Number.isFinite(Date.parse(w.sourceObservedAt))||Date.parse(w.sourceObservedAt)>Date.now()+1000)throw new F.ArchiveError('BAD_ARGS','invalid witness provenance');
+ }
+ return witnesses;
+}
+function witnessCoverage(spec,observations){
+ const expectedPosts=validateExpectedPosts(spec);
+ const applicable=expectedPosts.filter(w=>w.minDayHi>=spec.dateAfter),observedWitnesses=[],missingWitnesses=[],conflictingWitnesses=[];
+ for(const w of applicable){
+  const cards=observations.filter(x=>x.category==='posts'&&x.shortcode===w.shortcode);
+  if(!cards.length)missingWitnesses.push(w.shortcode);
+  else if(cards.some(x=>!x.selected||!x.date?.dayHi||x.date.dayHi<w.minDayHi))conflictingWitnesses.push(w.shortcode);
+  else observedWitnesses.push(w.shortcode);
+ }
+ return {policy:'known-posts-v1',scope:'current-visible-posts',fullFeedComplete:false,expectedPosts,observedWitnesses,missingWitnesses,conflictingWitnesses,satisfied:!missingWitnesses.length&&!conflictingWitnesses.length};
+}
+// Pure validation shared with receipt destinations; no browser, filesystem or network.
+function validateWitnessWindow(spec,h,options={}){
+ validateExpectedPosts(spec);
+ if(h.status!=='COMPLETE'||h.scope!=='current-visible-posts'||h.dateAfter!==spec.dateAfter||!Number.isFinite(Date.parse(h.observedAt))||!Array.isArray(h.observations)||h.observations.length!==h.observedCards||!Array.isArray(h.files)||h.selectedCards!==h.files.length)throw new F.ArchiveError('BAD_RESULT','incomplete witness window');
+ const ids=new Set(),selected=new Map();
+ for(const x of h.observations){
+  if(x.category!=='posts'||typeof x.shortcode!=='string'||!/^[A-Za-z0-9_-]{1,64}$/.test(x.shortcode)||!/^posts__[a-f0-9]{64}$/.test(x.stableId)||ids.has(x.stableId))throw new F.ArchiveError('BAD_RESULT','unbound witness observation');ids.add(x.stableId);
+  const date=x.date||{},expected=estimateDate(date.raw,h.observedAt,options.timeZone||'UTC');
+  if(Object.keys(expected).some(k=>date[k]!==expected[k])||x.selected!==(expected.dayHi>=spec.dateAfter)||(date.precision==='estimated'&&options.allowEstimatedDates!==true))throw new F.ArchiveError('DATE_POLICY','invalid witness date provenance');
+  if(x.selected)selected.set(x.stableId,x);
+ }
+ if(selected.size!==h.files.length)throw new F.ArchiveError('BAD_RESULT','witness selected/file coverage mismatch');
+ const files=new Set();
+ for(const f of h.files){const x=selected.get(f.stableId);if(!x||files.has(f.stableId)||f.shortcode!==x.shortcode||f.profileHandle!==spec.handle||JSON.stringify(f.date)!==JSON.stringify(x.date))throw new F.ArchiveError('BAD_RESULT','witness observation/receipt mismatch');files.add(f.stableId);}
+ const proof=witnessCoverage(spec,h.observations);
+ if(!proof.satisfied||JSON.stringify(h.coverage)!==JSON.stringify(proof))throw new F.ArchiveError('FEED_COVERAGE_GAP','missing or conflicting known-post evidence');
+ return proof;
 }
 async function installGuards(page,budget){
  await page.route('**/*',async route=>{
@@ -100,11 +144,19 @@ async function syncWindow(input,deps={}){
   for(const spec of config.handles){
    budget.assert();if(Date.now()>=deadline)throw new F.ArchiveError('TIME_LIMIT','job deadline reached');
    const page=await context.newPage();let observation;
-   try{observation=await discover(page,spec.handle,budget,deadline,config.maxCards);}finally{await page.close().catch(()=>{});}
+   try{observation=await discover(page,spec.handle,budget,deadline,config.maxCards);
+    if(spec.expectedPosts?.length){const category=await page.locator('#menu-wrapper .menu-item.active').first().getAttribute('data-id').catch(()=>null);if(category!=='POSTS')throw new F.ArchiveError('FEED_COVERAGE_GAP','cannot verify Posts category for known-post witnesses');}
+   }finally{await page.close().catch(()=>{});}
    const rows=select(observation.raw,observation.observedAt,{...config,...spec});
+   const observations=rows.map(({item,date,selected})=>({stableId:item.stableId,shortcode:item.shortcode,category:'posts',mediaType:item.mediaType,date,selected}));
+   const coverage=witnessCoverage(spec,observations);
+   if(!coverage.satisfied){
+    result.handles[spec.handle]={status:'PARTIAL',failed:true,scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,selectedCards:0,observations,coverage,files:[]};
+    throw new F.ArchiveError('FEED_COVERAGE_GAP','known recent post absent or date-conflicting in provider listing for '+spec.handle+'; cutoff must not advance');
+   }
    const paths=F.profilePaths(root,spec.handle);await F.ensureSafeDir(paths.stateDir,root);
    const files=await F.withLock(paths,config.runId,()=>acquireSelection(rows,paths,spec.handle,config.runId,budget,{...config,deadline,dnsLookup:deps.dnsLookup},result.totals));
-   result.handles[spec.handle]={status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations:rows.map(({item,date,selected})=>({stableId:item.stableId,shortcode:item.shortcode,mediaType:item.mediaType,date,selected})),files};
+   result.handles[spec.handle]={status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,files};
    await F.atomicWriteJson(resultFile+'.progress',result);
   }
   result.status='COMPLETE';return result;
@@ -140,15 +192,18 @@ async function combineWindowResults(input,sourceFiles){
    const date=x.date||{},expected=estimateDate(date.raw,h.observedAt,config.timeZone||'UTC');
    if(Object.keys(expected).some(k=>date[k]!==expected[k])||x.selected!==(expected.dayHi>=spec.dateAfter)||(date.precision==='estimated'&&config.allowEstimatedDates!==true))throw new F.ArchiveError('DATE_POLICY','incomplete or mismatched date provenance/selection');
   }
+  const coverage=witnessCoverage(spec,h.observations);
+  if(!coverage.satisfied||(spec.expectedPosts?.length&&JSON.stringify(h.coverage)!==JSON.stringify(coverage)))throw new F.ArchiveError('FEED_COVERAGE_GAP','result parts lack required known-post coverage');
+  if(spec.expectedPosts?.length)validateWitnessWindow(spec,h,config);
   if(h.observations.filter(x=>x.selected).length!==h.files.length)throw new F.ArchiveError('BAD_RESULT','selected coverage mismatch');
   const selected=new Map(h.observations.filter(x=>x.selected).map(x=>[x.stableId,x]));
   if(selected.size!==h.files.length)throw new F.ArchiveError('BAD_RESULT','duplicate selected identity');
   const paths=F.profilePaths(root,spec.handle),ids=new Set();
   for(const f of h.files){if(ids.has(f.stableId)||!selected.has(f.stableId)||JSON.stringify(f.date)!==JSON.stringify(selected.get(f.stableId).date)||f.profileHandle!==spec.handle||!await F.verifyReceipt(paths,f))throw new F.ArchiveError('BAD_RECEIPT','result file failed identity/byte verification');ids.add(f.stableId);}
-  handles[spec.handle]={...h,eligibility:spec.eligibility||'caller-selected',sourceRunId:picked.part.runId};
+  handles[spec.handle]={...h,coverage,eligibility:spec.eligibility||'caller-selected',sourceRunId:picked.part.runId};
  }
  const d={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,output:root,status:'COMPLETE',handles,totals:{downloaded:0,reused:Object.values(handles).reduce((n,h)=>n+h.files.length,0),bytes:0},composition:{maxObservationAgeMs:900000,additionalProviderRequests:0,sourceResults:parts.map(p=>({runId:p.runId,sha256:p.sha256,status:p.doc.status}))},finishedAt:new Date().toISOString()};
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));await F.atomicWriteJson(resultFile,d);return d;
 }
 
-module.exports={syncWindow,combineWindowResults,validate,select,discover,installGuards,acquireSelection};
+module.exports={syncWindow,combineWindowResults,validate,select,discover,installGuards,acquireSelection,validateExpectedPosts,witnessCoverage,validateWitnessWindow};
