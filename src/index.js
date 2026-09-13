@@ -718,6 +718,8 @@ function discoveryCoverageSatisfied({ reportedTotal, uniquePostCount, resumeTarg
   }
   return true;
 }
+// `acceptExistingReceipt(receipt, stableId, handle, paths)` lets callers impose
+// stricter reuse rules; it must tolerate nullish receipts and return false for rejects.
 async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = DEFAULT_NETWORK_TIMEOUT_MS, dnsLookup, timeoutMs, completedMap = {}, handle, stopOnDenial = false, acceptExistingReceipt = () => true } = {}) {
   const observedFingerprint = providerMediaFingerprint(item.href);
   if (item.providerMediaFingerprint && item.providerMediaFingerprint !== observedFingerprint) throw new ArchiveError('IDENTITY_CONFLICT', 'provided fingerprint contradicts supported media locator');

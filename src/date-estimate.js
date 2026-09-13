@@ -1,5 +1,7 @@
 'use strict';
 // Explicit estimate policy for incremental jobs only. Raw archive dateParsed semantics are unchanged.
+// `monthIndex` is JavaScript's 0-based month number, matching Date#getUTCMonth().
+function calendarDay(y,monthIndex,day){return `${String(y).padStart(4,'0')}-${String(monthIndex+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;}
 function estimateDate(raw, observedAt, timeZone='UTC') {
   if (typeof observedAt !== 'string' || !/(Z|[+-][0-9]{2}:[0-9]{2})$/.test(observedAt)) throw new Error('timezone-bearing observation timestamp required');
   const observed=new Date(observedAt);
@@ -19,9 +21,6 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
   if (!y || !mo || !day) throw new Error('Intl returned no year/month/day parts');
   return `${y}-${mo}-${day}`;
 }
-  // `monthIndex` is JavaScript's 0-based month number, matching Date#getUTCMonth().
-  const calendarDay=(y,monthIndex,day)=>`${String(y).padStart(4,'0')}-${String(monthIndex+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
-
   function parseDate(raw, NOW = new Date()) {
   if (raw === undefined || raw === null) return { error: 'card has no date field' };
   const s = String(raw).trim();
@@ -31,7 +30,9 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
   // days ago") yields an Invalid Date whose comparisons are ALL false, so it
   // would be silently dropped and reported as a healthy "nothing new".
   // `basis` and the [lo, hi] window travel with the instant, because the point
-  // estimate alone cannot say how much it is worth.
+  // estimate alone cannot say how much it is worth. `days` supplies precomputed
+  // absolute calendar bounds; those labels already name a source calendar date,
+  // so timezone formatting must not shift them to the previous/next day.
   const finite = (d, why, basis, lo, hi, days) => {
     if (!(d instanceof Date) || !Number.isFinite(d.getTime())) {
       return { error: `date "${s}" does not resolve to a real instant (${why})` };
@@ -48,9 +49,9 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
     }
     let dayLo, dayHi, day;
     try {
-      dayLo = days?.dayLo || amsterdamDay(low);
-      dayHi = days?.dayHi || amsterdamDay(high);
-      day = days?.day || amsterdamDay(d);
+      dayLo = days?.dayLo ?? amsterdamDay(low);
+      dayHi = days?.dayHi ?? amsterdamDay(high);
+      day = days?.day ?? amsterdamDay(d);
     } catch (e) {
       return { error: `date "${s}" has no resolvable Amsterdam day (${e && e.message})` };
     }
