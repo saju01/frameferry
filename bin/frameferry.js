@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 const { archiveProfile, exportProfile, statusProfile, doctor, ArchiveError, DeferredError, redactSignedUrls, VERSION } = require('../src/index.js');
-const COMMANDS = new Set(['doctor', 'archive', 'export', 'status', 'help', 'version', '--help', '--version']);
+const COMMANDS = new Set(['sync-window', 'doctor', 'archive', 'export', 'status', 'help', 'version', '--help', '--version']);
 function allowedFlags(cmd) {
+  if (cmd === 'sync-window') return new Set(['config']);
   if (cmd === 'doctor') return new Set(['attachCdp']);
   if (cmd === 'status') return new Set(['output','json']);
   if (cmd === 'archive') return new Set(['output','mode','categories','mediaTypes','zip','overwriteZip','maxPages','maxTimeMs','maxBytes','maxZipBytes','maxZipEntries','maxZipFiles','delayMs','networkTimeoutMs','browserExecutable','browserChannel','attachCdp','json',"discoveryMaxTimeMs","acquisitionMaxTimeMs","slicePages","sliceTimeMs","checkpointEveryItems","maxAcquireItems","maxAcquireBytes","maxLocatorAgeMs","maxObservedMedia","discoveryOnly","targetIds","targetPosts","byteEvidenceRoot","stopOnItemFailure"]);
@@ -41,6 +42,14 @@ function usage(code) {
   const opts = parse(process.argv.slice(2));
   if (opts.cmd === 'help' || opts.cmd === '--help') return usage(0);
   if (opts.cmd === 'version' || opts.cmd === '--version') { console.log(VERSION); return; }
+  if (opts.cmd === 'sync-window') {
+    if (!opts.config) throw new ArchiveError('BAD_ARGS', 'sync-window requires --config <json>');
+    const config = JSON.parse(await require('node:fs/promises').readFile(opts.config, 'utf8'));
+    const result = await require('../src/sync-window.js').syncWindow(config);
+    console.log(JSON.stringify(result));
+    process.exitCode = result.status === 'COMPLETE' ? 0 : 1;
+    return;
+  }
   if (opts.cmd === 'doctor') {
     const r = await doctor(opts);
     console.log(JSON.stringify(r, null, 2));

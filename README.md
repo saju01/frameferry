@@ -135,6 +135,54 @@ Delegation requires OpenClaw's exposed session tools and existing permissions;
 it is instruction-driven, not a CLI-enforced scheduler or automatic model router.
 No model-selection configuration or schedules are installed by this package.
 
+
+## Receipt-only incremental jobs (explicit visible-window scope)
+
+Use `frameferry sync-window --config /private/job.json` to let FrameFerry own discovery,
+cutoff selection, download and receipt verification in scheduled integrations. This
+command is **posts/current-visible-window only**, not full historical coverage.
+The existing `archive` command and its stricter full-archive semantics are unchanged.
+
+Example private configuration (keep real handles, paths and scheduling outside the package):
+
+```json
+{
+  "runId": "2026-01-15T120000-example",
+  "handles": [{"handle": "example", "dateAfter": "2026-01-01"}],
+  "output": "/archives/window-cache",
+  "resultFile": "/archives/runs/example.json",
+  "requestLedger": "/archives/provider-requests.json",
+  "timeZone": "UTC",
+  "allowEstimatedDates": true,
+  "browserExecutable": "/usr/bin/chromium"
+}
+```
+
+- Explicit `dateAfter` is inclusive and selection retains uncertainty overlap.
+  `allowEstimatedDates` opts in to estimates for this command only; raw archive
+  `dateParsed` behavior does not change. Each selected receipt includes the raw
+  label, observed instant, estimated instant, day bounds, timezone and precision.
+- `COMPLETE` means all requested visible windows were read and their selected
+  media verified. Output always has `fullHistoryComplete:false`. A stopped/empty/
+  unreadable window or partial acquisition is nonzero, never a quiet success.
+- Default ceilings are 120 requests per invocation, 140 per rolling hour, 1 GiB
+  total downloaded bytes, 50 MiB/file, 10 minutes and 1,000 visible cards/handle.
+  Request overrides can only lower the session ceiling. All provider-origin
+  browser requests and every download/redirect are charged; cosmetic previews,
+  styles and fonts are blocked before sending. Denials are sticky across run IDs.
+  Stale ledger locks require explicit operator inspection, never automatic reset.
+- Each completed file is a normal verified FrameFerry receipt. Restarts reuse
+  positively bound, rehashed receipts. Old carousel positions and changing locators
+  are not treated as identity aliases. A separate window cache keeps an unfinished
+  full-history archive's outstanding work intact; the command never marks it complete.
+- The result contains receipt paths/hashes and date provenance, not signed media
+  locators. A destination adapter must validate the run, complete selected scope,
+  handle coverage, path confinement and hashes before importing. Destination
+  success (and cutoffs) must only advance after destination readback succeeds.
+- Browser attachment is optional and explicit loopback-only `attachCdp`. Only the
+  command's context/pages are closed. No schedule, credentials, Immich uploader,
+  metadata rewrite or trash restoration is installed by FrameFerry.
+
 ## Optional Immich export
 
 FrameFerry still writes generic media files and receipts that a future adapter can import elsewhere. It has no Immich dependency and no uploader.
