@@ -718,7 +718,9 @@ function discoveryCoverageSatisfied({ reportedTotal, uniquePostCount, resumeTarg
   }
   return true;
 }
-async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = DEFAULT_NETWORK_TIMEOUT_MS, dnsLookup, timeoutMs, completedMap = {}, handle, stopOnDenial = false } = {}) {
+// `acceptExistingReceipt(receipt, stableId, handle, paths)` lets callers impose
+// stricter reuse rules; it must tolerate nullish receipts and return false to reject reuse.
+async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = DEFAULT_NETWORK_TIMEOUT_MS, dnsLookup, timeoutMs, completedMap = {}, handle, stopOnDenial = false, acceptExistingReceipt = () => true } = {}) {
   const observedFingerprint = providerMediaFingerprint(item.href);
   if (item.providerMediaFingerprint && item.providerMediaFingerprint !== observedFingerprint) throw new ArchiveError('IDENTITY_CONFLICT', 'provided fingerprint contradicts supported media locator');
   const ac = new AbortController();
@@ -757,13 +759,13 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
     const ext = extFor(got.kind);
     const dest = path.join(paths.mediaDir, stableId + '.' + ext);
     let existing = completedMap[stableId];
-    if (!receiptMatchesIdentity(existing, stableId, handle)) {
+    if (!receiptMatchesIdentity(existing, stableId, handle) || !acceptExistingReceipt(existing, stableId, handle, paths)) {
       const onDisk = await readJson(path.join(paths.receiptDir, stableId + '.json'), null);
-      if (receiptMatchesIdentity(onDisk, stableId, handle)) existing = onDisk;
+      if (receiptMatchesIdentity(onDisk, stableId, handle) && acceptExistingReceipt(onDisk, stableId, handle, paths)) existing = onDisk;
     }
     // Matching bytes are not an identity. Without this check a receipt belonging to another handle
     // could be adopted wholesale just because the content happened to hash the same.
-    const existingIsOurs = receiptMatchesIdentity(existing, stableId, handle);
+    const existingIsOurs = receiptMatchesIdentity(existing, stableId, handle) && acceptExistingReceipt(existing, stableId, handle, paths);
     if (existingIsOurs && existing.sha256 === got.sha256 && existing.bytes === got.bytes && await verifyReceipt(paths, existing)) {
       await fsp.rm(tempBase, { force: true }).catch(() => {});
       // Same bytes, so the media is the same, but it was just observed under the current provider

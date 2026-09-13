@@ -135,6 +135,63 @@ Delegation requires OpenClaw's exposed session tools and existing permissions;
 it is instruction-driven, not a CLI-enforced scheduler or automatic model router.
 No model-selection configuration or schedules are installed by this package.
 
+
+## Receipt-only incremental jobs (explicit visible-window scope)
+
+Use `frameferry sync-window --config /private/job.json` to let FrameFerry own discovery,
+cutoff selection, download and receipt verification in scheduled integrations. This
+command is **posts/current-visible-window only**, not full historical coverage.
+The existing `archive` command and its stricter full-archive semantics are unchanged.
+
+Example private configuration (keep real handles, paths and scheduling outside the package):
+
+```json
+{
+  "runId": "2026-01-15T120000-example",
+  "handles": [{"handle": "example", "dateAfter": "2026-01-01"}],
+  "output": "/archives/window-cache",
+  "resultFile": "/archives/runs/example.json",
+  "requestLedger": "/archives/provider-requests.json",
+  "timeZone": "UTC",
+  "allowEstimatedDates": true,
+  "browserExecutable": "/usr/bin/chromium"
+}
+```
+
+- Explicit `dateAfter` is inclusive and selection retains uncertainty overlap.
+  `allowEstimatedDates` opts in to estimates for this command only; raw archive
+  `dateParsed` behavior does not change. Each selected receipt includes the raw
+  label, observed instant, estimated instant, day bounds, timezone and precision.
+- `COMPLETE` means all requested visible windows were read and their selected
+  media verified. Output always has `fullHistoryComplete:false`. A stopped/empty/
+  unreadable window or partial acquisition is nonzero, never a quiet success.
+- There is **no default signed-account-style hourly or per-run request quota**
+  for this public provider. Starts are paced at least 500 ms apart across browser
+  discovery and downloads. Counts remain auditable; an optional `maxRequests`
+  bounds one job only and is not advertised as a provider quota. Default resource
+  bounds remain 1 GiB total download, 50 MiB/file, 10 minutes and 1,000 visible
+  cards/handle. All provider-origin browser requests and download/redirect hops
+  are counted; cosmetic previews, styles and fonts are blocked before sending.
+  Real provider denials (including 429 and its Retry-After evidence) remain
+  sticky across run IDs. Existing accounting/denials are never reset to resume.
+  Stale ledger locks require explicit operator inspection, never automatic reset.
+- Each completed file is a normal verified FrameFerry receipt. Restarts reuse
+  positively bound, rehashed receipts. Old carousel positions and changing locators
+  are not treated as identity aliases. A separate window cache keeps an unfinished
+  full-history archive's outstanding work intact; the command never marks it complete.
+- Optional `resultParts` lists recent FrameFerry result files for local-only composition.
+  Every requested handle must have a matching completed window no older than 15 minutes;
+  policy, cutoff, identity and file bytes are revalidated. Missing/stale/denied
+  parts fail closed. The new result records source hashes and makes zero provider
+  requests; original partial results and their failure status remain untouched.
+- The result contains receipt paths/hashes and date provenance, not signed media
+  locators. A destination adapter must validate the run, complete selected scope,
+  handle coverage, path confinement and hashes before importing. Destination
+  success (and cutoffs) must only advance after destination readback succeeds.
+- Browser attachment is optional and explicit loopback-only `attachCdp`. Only the
+  command's context/pages are closed. No schedule, credentials, Immich uploader,
+  metadata rewrite or trash restoration is installed by FrameFerry.
+
 ## Optional Immich export
 
 FrameFerry still writes generic media files and receipts that a future adapter can import elsewhere. It has no Immich dependency and no uploader.
@@ -150,3 +207,21 @@ Archive only public content you have rights or permission to keep, and stay with
 ## Bounded discovery repair
 
 See [bounded discovery and fingerprint identities](references/bounded-discovery.md) for retained UI slices, discovery-only canaries, validated CLI budgets, legacy aliases, crash recovery and explicit operational limits.
+
+### Known-post coverage guard
+
+A successful `sync-window` result means the returned visible window was processed,
+not that the provider feed is current. A profile listing can omit a recent post
+that its direct-link lookup returns. Private callers can supply up to 50
+`expectedPosts` per handle, each with `shortcode`, `category: "posts"`,
+`minDayHi` (calendar date), `source` (`owner-direct-observation` or
+`verified-receipt`), and timezone-bearing `sourceObservedAt`. No source URLs,
+credentials or account lists belong in the public repository.
+
+For witnesses at or after the job cutoff, the current Posts window must contain
+that shortcode with compatible selected date evidence. Missing or conflicting
+witnesses yield `PARTIAL / FEED_COVERAGE_GAP` before that handle's downloads;
+result composition revalidates the exact witness policy and observations too.
+This guard does not add pagination, refresh upstream caches, or discover unknown
+missing post IDs. It intentionally fails closed on a missing first-window witness.
+A witness match is necessary evidence only, never full-feed or full-history proof.

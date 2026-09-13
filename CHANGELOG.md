@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in `sync-window --config` for bounded, receipt-only current-visible-post jobs, without claiming full-history completion.
+- Share paced request accounting across discovery and download, with sticky provider-denial stops. Do not import signed-account 120/140 quotas into the public provider; retain optional per-job bounds and resource limits.
+- Carry explicit source-observation date estimates for incremental destination adapters while leaving raw archive date semantics unchanged.
+- Reuse FrameFerry DOM extraction, fingerprint identities, downloader and byte-verified receipts; never infer legacy carousel aliases.
+
 ## 0.2.1 - 2026-09-06
 
 - Identify the pagination sentinel by observing which element the provider's own `IntersectionObserver` watches, instead of assuming the last rendered `.post-card`.
