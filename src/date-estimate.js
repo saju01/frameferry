@@ -116,7 +116,8 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
         dayHi: calendarDay(hi.getUTCFullYear(),hi.getUTCMonth(),hi.getUTCDate())
       });
     }
-    return finite(d, 'absolute date with an explicit year', 'absolute_year', undefined, undefined, {day:calendarDay(year,mo,day),dayLo:calendarDay(year,mo,day),dayHi:calendarDay(year,mo,day)});
+    const exact=calendarDay(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate());
+    return finite(d, 'absolute date with an explicit year', 'absolute_year', undefined, undefined, {day:exact,dayLo:exact,dayHi:exact});
   }
 
   return { error: `unparseable date "${s}"` };

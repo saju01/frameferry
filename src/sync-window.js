@@ -214,8 +214,8 @@ async function combineWindowResults(input,sourceFiles){
   const candidates=parts.map(p=>({part:p,value:p.doc.handles?.[spec.handle]})).filter(x=>x.value?.status==='COMPLETE'&&x.value.dateAfter===spec.dateAfter).sort((a,b)=>Date.parse(b.value.observedAt)-Date.parse(a.value.observedAt));
   const picked=candidates[0];if(!picked)throw new F.ArchiveError('MISSING_WINDOW','no verified window for '+spec.handle);
   const h=picked.value,age=Date.now()-Date.parse(h.observedAt);
-  if(!Number.isFinite(age)||age<0||age>15*60000)throw new F.ArchiveError('STALE_WINDOW','window evidence is stale or incomplete');
-  if(!Number.isInteger(h.observedCards)||h.observedCards<1||!Array.isArray(h.files)||h.selectedCards!==h.files.length||!Array.isArray(h.observations)||h.observations.length!==h.observedCards)throw new F.ArchiveError('STALE_WINDOW','window evidence is stale or incomplete');
+  if(!Number.isFinite(age)||age<0||age>15*60000)throw new F.ArchiveError('STALE_WINDOW','window observation is stale');
+  if(!Number.isInteger(h.observedCards)||h.observedCards<1||!Array.isArray(h.files)||h.selectedCards!==h.files.length||!Array.isArray(h.observations)||h.observations.length!==h.observedCards)throw new F.ArchiveError('BAD_RESULT','window evidence is structurally incomplete');
   const coverage=validateWitnessWindow(spec,h,config);
   const selected=new Map(h.observations.filter(x=>x.selected).map(x=>[x.stableId,x]));
   if(selected.size!==h.files.length)throw new F.ArchiveError('BAD_RESULT','duplicate selected identity');
