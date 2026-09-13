@@ -125,8 +125,10 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
   const receiptPath=path.join(paths.receiptDir,item.stableId+'.json');
   let receipt=await F.readJson(receiptPath,null),reused=false;
   // Never alias legacy carousel positions or rotating locators without byte proof.
-  if(receipt&&receipt.providerMediaFingerprint===item.providerMediaFingerprint&&await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))reused=true;
-  else if(receipt&&receipt.profileHandle===handle&&receipt.stableId===item.stableId)throw new F.ArchiveError('BAD_RECEIPT','canonical receipt metadata failed identity/path verification');
+  if(receipt&&receipt.providerMediaFingerprint===item.providerMediaFingerprint){
+   if(await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))reused=true;
+   else throw new F.ArchiveError('BAD_RECEIPT','canonical receipt metadata failed identity/path verification');
+  }
   else {
    const remaining=options.maxBytes-totals.bytes;if(remaining<1)throw new F.ArchiveError('BYTE_LIMIT','incremental byte allowance exhausted');
    const result=await F.downloadOne(item,paths,{handle,runId,fetchImpl:budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{}});

@@ -106,6 +106,9 @@ test('cache reuse and composition require canonical media paths',async t=>{
  let fetched=false;const budget={assert(){},fetch:async()=>{fetched=true;throw Error('must not fetch');}};
  await assert.rejects(W.acquireSelection([{item:{stableId:id,providerMediaFingerprint:'fp'},date:{},selected:true}],paths,'example','run',budget,{maxBytes:1024,maxFileBytes:1024,deadline:Date.now()+1000}, {downloaded:0,reused:0,bytes:0}),/canonical receipt metadata/);
  assert.equal(fetched,false);
+ const changed=crypto.createHash('sha256').update('/media?id=POST').digest('hex');
+ await assert.rejects(W.acquireSelection([{item:{stableId:id,providerMediaFingerprint:changed,href:'https://instacognito.com/media?id=POST',mediaType:'image'},date:{},selected:true}],paths,'example','run',budget,{maxBytes:1024,maxFileBytes:1024,deadline:Date.now()+1000,dnsLookup:async()=>[{address:'93.184.216.34',family:4}]}, {downloaded:0,reused:0,bytes:0}),/must not fetch/);
+ assert.equal(fetched,true);
  const at=new Date().toISOString(),date=estimateDate('1 January 2026',at,'UTC'),obs={stableId:id,shortcode:'POST',category:'posts',selected:true,date},spec={handle:'example',dateAfter:'2026-01-01'};
  const h=completeWindow(spec,at,[obs],[{...receipt,date}]),part={schemaVersion:1,kind:'frameferry-sync-window',runId:'source',scope:'current-visible-posts',fullHistoryComplete:false,output,status:'COMPLETE',requests:{denial:null},handles:{example:h}},file=path.join(root,'part.json');
  await fs.writeFile(file,JSON.stringify(part));

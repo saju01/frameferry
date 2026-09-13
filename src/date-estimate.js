@@ -19,7 +19,7 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
   if (!y || !mo || !day) throw new Error('Intl returned no year/month/day parts');
   return `${y}-${mo}-${day}`;
 }
-  const calendarDay=(y,mo,day)=>`${String(y).padStart(4,'0')}-${String(mo+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+  const calendarDay=(y,monthIndex,day)=>`${String(y).padStart(4,'0')}-${String(monthIndex+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
 
   function parseDate(raw, NOW = new Date()) {
   if (raw === undefined || raw === null) return { error: 'card has no date field' };
