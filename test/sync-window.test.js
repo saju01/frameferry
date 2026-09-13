@@ -34,7 +34,7 @@ async function browserFixture(t,status=200,profileDelay=0){
   requests++;
   const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><script>function show(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@example</span> 1 posts\';document.getElementById("post-container").innerHTML=\'<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>\';}</script>';
   const delayed = profileDelay ? html.replace('document.getElementById("profile-section").innerHTML=', 'setTimeout(()=>document.getElementById("profile-section").innerHTML=').replace(" 1 posts\';document.getElementById", " 1 posts\',"+profileDelay+");document.getElementById") : html;
-  await route.fulfill({status,contentType:'text/html',body:delayed});
+  await route.fulfill({status:Array.isArray(status)?status[requests-1]||200:status,contentType:'text/html',body:delayed.replace('@example', "@'+document.getElementById(\"search-input\").value+'")});
  });return c;},close:async()=>{}};
  return {chromium:{launch:async()=>wrap,connectOverCDP:async()=>wrap},counts:()=>({requests,preview}),dnsLookup:async()=>[{address:"93.184.216.34",family:4}],browser};
 }
@@ -152,4 +152,62 @@ test('pure destination validator recomputes date provenance even with coherent f
  for(const [key,value] of [['raw','13 August'],['iso','2026-09-12T12:00:00.000Z'],['observedAt','2026-09-12T00:00:00Z'],['timeZone','UTC'],['basis','absolute_year'],['precision','day']]){
   const forged=JSON.parse(JSON.stringify(h));forged.observations[0].date[key]=value;forged.files[0].date[key]=value;assert.throws(()=>W.validateWitnessWindow(spec,forged,{timeZone:'Europe/Amsterdam',allowEstimatedDates:true}),/date provenance/);
  }
+});
+
+// All pages are real Chromium DOMs, fulfilled in-process; no provider traffic.
+test('partial middle handle retains witness gap and later healthy handle downloads',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t),old=globalThis.fetch;let calls=0;
+ t.after(()=>{globalThis.fetch=old;});globalThis.fetch=async()=>{calls++;return new Response(jpg,{headers:{'content-type':'image/jpeg'}});};
+ const cfg={handles:[{handle:'alpha',dateAfter:'2020-01-01'},{handle:'middle',dateAfter:'2026-09-08',expectedPosts:[witness()]},{handle:'zulu',dateAfter:'2020-01-01'}],runId:'isolation',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true};
+ const d=await W.syncWindow(cfg,fixture);
+ assert.equal(d.status,'PARTIAL');assert.equal(d.handles.zulu.status,'COMPLETE','later healthy handle must run after a local gap');
+ assert.equal(d.handles.alpha.status,'COMPLETE');assert.equal(d.stoppedGlobally,false);assert.equal(d.failureIsolation,'handle-local-v1');
+ assert.deepEqual(d.handles.middle.coverage.missingWitnesses,['KNOWN']);assert.equal(d.handles.middle.error.code,'FEED_COVERAGE_GAP');assert.equal(d.handles.middle.error.scope,'handle');assert.deepEqual(d.handles.middle.files,[]);
+ assert.equal(calls,2);assert.equal(fixture.counts().requests,3);assert.equal(d.totals.downloaded,2);
+ assert.deepEqual(JSON.parse(await fs.readFile(cfg.resultFile)),d);
+});
+test('healthy zero-selection windows complete around a failed middle handle without downloads',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t),old=globalThis.fetch;t.after(()=>{globalThis.fetch=old;});globalThis.fetch=async()=>{throw Error('unexpected download');};
+ const d=await W.syncWindow({handles:[{handle:'alpha',dateAfter:'2099-01-01'},{handle:'middle',dateAfter:'2026-09-08',expectedPosts:[witness()]},{handle:'zulu',dateAfter:'2099-01-01'}],runId:'empty-healthy',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true},fixture);
+ assert.equal(d.status,'PARTIAL');assert.equal(d.handles.zulu.status,'COMPLETE');assert.equal(d.handles.zulu.selectedCards,0);assert.equal(d.totals.downloaded,0);assert.equal(fixture.counts().requests,3);
+});
+for(const denial of [403,429])test('global '+denial+' after a healthy handle stops later handles',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t,[200,denial,200]);
+ const d=await W.syncWindow({handles:['alpha','middle','zulu'].map(handle=>({handle,dateAfter:'2099-01-01'})),runId:'global-denial',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true,maxTimeMs:6000},fixture);
+ assert.equal(d.status,'BLOCKED');assert.equal(d.stoppedGlobally,true);assert.ok(d.requests.denial);assert.equal(d.handles.alpha.status,'COMPLETE');assert.equal(d.handles.middle.error.scope,'global');assert.equal(d.handles.zulu.status,'NOT_COMPLETED');assert.equal(fixture.counts().requests,2);
+});
+test('byte resource failure stops later handles instead of being isolated',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t),old=globalThis.fetch;t.after(()=>{globalThis.fetch=old;});globalThis.fetch=async()=>new Response(jpg,{headers:{'content-type':'image/jpeg','content-length':'2048'}});
+ const d=await W.syncWindow({handles:['alpha','middle','zulu'].map(handle=>({handle,dateAfter:'2020-01-01'})),runId:'bytes',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true,maxBytes:1024},fixture);
+ assert.equal(d.status,'PARTIAL');assert.equal(d.stoppedGlobally,true);assert.equal(d.error.code,'TOO_LARGE');assert.equal(d.handles.middle.status,'NOT_COMPLETED');assert.equal(fixture.counts().requests,1);
+});
+
+test('browser loss during category verification is global, not a local coverage gap',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t),launch=fixture.chromium.launch;
+ fixture.chromium.launch=async()=>{const b=await launch(),newContext=b.newContext;b.newContext=async opts=>{const c=await newContext(opts),newPage=c.newPage.bind(c);c.newPage=async()=>{const p=await newPage(),locator=p.locator.bind(p);p.locator=selector=>selector==='#menu-wrapper .menu-item.active'?{first:()=>({getAttribute:async()=>{throw new Error('browser connection closed');}})}:locator(selector);return p;};return c;};return b;};
+ const d=await W.syncWindow({handles:[{handle:'alpha',dateAfter:'2020-01-01',expectedPosts:[witness()]},{handle:'zulu',dateAfter:'2020-01-01'}],runId:'closed-browser',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true},fixture);
+ assert.equal(d.status,'PARTIAL');assert.equal(d.stoppedGlobally,true);assert.equal(d.handles.alpha.error.scope,'global');assert.equal(d.handles.zulu.status,'NOT_COMPLETED');assert.equal(fixture.counts().requests,1);
+});
+
+test('authenticated-view middle hold creates no page or provider/media request and later healthy handle runs',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t),launch=fixture.chromium.launch,old=globalThis.fetch;let pages=0,downloads=0;
+ t.after(()=>{globalThis.fetch=old;});globalThis.fetch=async()=>{downloads++;return new Response(jpg,{headers:{'content-type':'image/jpeg'}});};
+ fixture.chromium.launch=async()=>{const b=await launch(),nc=b.newContext;b.newContext=async opts=>{const c=await nc(opts),np=c.newPage.bind(c);c.newPage=async()=>{pages++;return np();};return c;};return b;};
+ const held={handle:'middle',dateAfter:'2026-09-08',accessRequired:'authenticated-view',expectedPosts:[witness()]};
+ const d=await W.syncWindow({handles:[{handle:'alpha',dateAfter:'2020-01-01'},held,{handle:'zulu',dateAfter:'2020-01-01'}],runId:'access-held',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true},fixture);
+ assert.equal(d.status,'PARTIAL');assert.equal(d.stoppedGlobally,false);assert.equal(d.handles.alpha.status,'COMPLETE');assert.equal(d.handles.zulu.status,'COMPLETE');assert.equal(d.handles.middle.error.code,'ACCESS_REQUIRED');assert.equal(d.handles.middle.error.scope,'handle');assert.equal(d.handles.middle.failed,true);assert.equal(d.handles.middle.accessRequired,'authenticated-view');assert.deepEqual(d.handles.middle.coverage,W.witnessCoverage(held,[]));assert.deepEqual(d.handles.middle.files,[]);assert.equal(pages,2);assert.equal(fixture.counts().requests,2);assert.equal(downloads,2);assert.equal(d.requests.session,4);
+});
+test('invalid accessRequired values reject before browser, ledger or network initialization',async t=>{
+ const root=await tmp(t);let launches=0;const deps={chromium:{launch:async()=>{launches++;throw Error('must not launch');}}};
+ for(const accessRequired of [null,false,'','public','AUTHENTICATED-VIEW',42]){
+  await assert.rejects(W.syncWindow({handles:[{handle:'example',dateAfter:'2020-01-01',accessRequired}],runId:'invalid-access',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json')},deps),/accessRequired must be authenticated-view/);
+ }
+ assert.equal(launches,0);assert.equal(await fs.stat(path.join(root,'budget.json')).catch(()=>null),null);
+});
+test('current access hold rejects stale COMPLETE witness evidence and result composition',async t=>{
+ const root=await tmp(t),output=path.join(root,'out');await fs.mkdir(output);
+ const spec={handle:'example',dateAfter:'2020-01-01',accessRequired:'authenticated-view'};
+ assert.throws(()=>W.validateWitnessWindow(spec,{status:'COMPLETE'}),/held handle/);
+ const part=path.join(root,'part.json');await fs.writeFile(part,JSON.stringify({kind:'frameferry-sync-window',schemaVersion:1,scope:'current-visible-posts',fullHistoryComplete:false,output,status:'COMPLETE',handles:{example:{status:'COMPLETE',dateAfter:spec.dateAfter}}}));
+ await assert.rejects(W.combineWindowResults({handles:[spec],runId:'held-compose',output,requestLedger:path.join(root,'unused.json'),resultFile:path.join(root,'result.json')},[part]),/held handle/);
 });

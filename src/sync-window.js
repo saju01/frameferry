@@ -13,6 +13,7 @@ function validate(config){
  const seen=new Set();
  for(const h of config.handles){F.validateHandle(h.handle);if(seen.has(h.handle))throw new F.ArchiveError('BAD_ARGS','duplicate handle');seen.add(h.handle);
   if(typeof h.dateAfter!=='string'||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(h.dateAfter)||new Date(h.dateAfter).toISOString().slice(0,10)!==h.dateAfter)throw new F.ArchiveError('BAD_ARGS','explicit calendar dateAfter required');
+  if(Object.hasOwn(h,'accessRequired')&&h.accessRequired!=='authenticated-view')throw new F.ArchiveError('BAD_ARGS','accessRequired must be authenticated-view when present');
   validateExpectedPosts(h);
  }
  if(typeof config.runId!=='string'||!/^[A-Za-z0-9._-]{1,150}$/.test(config.runId))throw new F.ArchiveError('BAD_ARGS','safe runId required');
@@ -61,6 +62,7 @@ function witnessCoverage(spec,observations){
 // Pure validation shared with receipt destinations; no browser, filesystem or network.
 function validateWitnessWindow(spec,h,options={}){
  validateExpectedPosts(spec);
+ if(spec.accessRequired!==undefined)throw new F.ArchiveError('ACCESS_REQUIRED','held handle cannot supply a complete window');
  if(h.status!=='COMPLETE'||h.scope!=='current-visible-posts'||h.dateAfter!==spec.dateAfter||!Number.isFinite(Date.parse(h.observedAt))||!Array.isArray(h.observations)||h.observations.length!==h.observedCards||!Array.isArray(h.files)||h.selectedCards!==h.files.length)throw new F.ArchiveError('BAD_RESULT','incomplete witness window');
  const ids=new Set(),selected=new Map();
  for(const x of h.observations){
@@ -97,7 +99,7 @@ async function discover(page,handle,budget,deadline,maxCards){
  await page.goto(F.PROVIDER_PHOTO_URL,{waitUntil:'domcontentloaded'});budget.assert();
  await page.fill('input#search-input',handle);await page.click('button#download-btn');
  const ready=await F.waitForProfileReady(page,handle,{started:Date.now(),maxTimeMs:Math.max(1,deadline-Date.now()),waitMs:Math.min(30000,Math.max(1,deadline-Date.now()))});
- budget.assert();if(!ready.ready||ready.blocked)throw new F.ArchiveError('PROFILE_NOT_READY','requested public profile not ready: '+JSON.stringify(ready));
+ budget.assert();if(ready.blocked)throw new F.ArchiveError('DENIED','provider blocked profile discovery');if(!ready.ready)throw new F.ArchiveError('PROFILE_NOT_READY','requested public profile not ready: '+JSON.stringify(ready));
  const end=Math.min(deadline,Date.now()+45000);let last=null;
  while(Date.now()<end){
   budget.assert();const raw=await F.readRawCardsFromPage(page);
@@ -128,12 +130,15 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
  }
  return out;
 }
+// Only positively classified handle-local failures may continue. Unknown errors,
+// browser loss, disk/byte/time limits and denial remain global fail-stops.
+const HANDLE_LOCAL_ERRORS=new Set(['ACCESS_REQUIRED','FEED_COVERAGE_GAP','EMPTY_WINDOW','AMBIGUOUS_WINDOW','BAD_ITEM','DATE_POLICY']);
 async function syncWindow(input,deps={}){
  const config=validate(input),root=await F.safeOutputRoot(config.output),resultFile=path.resolve(config.resultFile);
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));
  if(await fs.lstat(resultFile).catch(e=>e.code==='ENOENT'?null:Promise.reject(e)))throw new F.ArchiveError('EXISTS','result already exists; use a new run result path');
  const budget=openBudget(config.requestLedger,config.runId,config.maxRequests),deadline=Date.now()+config.maxTimeMs;
- const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,output:root,handles:{},totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};
+ const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,failureIsolation:'handle-local-v1',stoppedGlobally:false,output:root,handles:{},totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};
  let browser,context;
  try{
   budget.assert();
@@ -143,24 +148,38 @@ async function syncWindow(input,deps={}){
   context=await browser.newContext({serviceWorkers:'block'});
   for(const spec of config.handles){
    budget.assert();if(Date.now()>=deadline)throw new F.ArchiveError('TIME_LIMIT','job deadline reached');
+   const h=result.handles[spec.handle]={status:'PARTIAL',failed:true,scope:'current-visible-posts',dateAfter:spec.dateAfter,files:[]};
+   try{
+   if(spec.accessRequired==='authenticated-view'){
+    Object.assign(h,{accessRequired:spec.accessRequired,observedCards:0,selectedCards:0,observations:[],coverage:witnessCoverage(spec,[])});
+    throw new F.ArchiveError('ACCESS_REQUIRED','authenticated view required; no provider request attempted for '+spec.handle);
+   }
    const page=await context.newPage();let observation;
    try{observation=await discover(page,spec.handle,budget,deadline,config.maxCards);
-    if(spec.expectedPosts?.length){const category=await page.locator('#menu-wrapper .menu-item.active').first().getAttribute('data-id').catch(()=>null);if(category!=='POSTS')throw new F.ArchiveError('FEED_COVERAGE_GAP','cannot verify Posts category for known-post witnesses');}
+    if(spec.expectedPosts?.length){const category=await page.locator('#menu-wrapper .menu-item.active').first().getAttribute('data-id').catch(e=>{if(e.name==='TimeoutError')return null;throw e;});if(category!=='POSTS')throw new F.ArchiveError('FEED_COVERAGE_GAP','cannot verify Posts category for known-post witnesses');}
    }finally{await page.close().catch(()=>{});}
    const rows=select(observation.raw,observation.observedAt,{...config,...spec});
    const observations=rows.map(({item,date,selected})=>({stableId:item.stableId,shortcode:item.shortcode,category:'posts',mediaType:item.mediaType,date,selected}));
    const coverage=witnessCoverage(spec,observations);
+   Object.assign(h,{observedAt:observation.observedAt,observedCards:rows.length,selectedCards:rows.filter(x=>x.selected).length,observations,coverage});
    if(!coverage.satisfied){
-    result.handles[spec.handle]={status:'PARTIAL',failed:true,scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,selectedCards:0,observations,coverage,files:[]};
     throw new F.ArchiveError('FEED_COVERAGE_GAP','known recent post absent or date-conflicting in provider listing for '+spec.handle+'; cutoff must not advance');
    }
    const paths=F.profilePaths(root,spec.handle);await F.ensureSafeDir(paths.stateDir,root);
    const files=await F.withLock(paths,config.runId,()=>acquireSelection(rows,paths,spec.handle,config.runId,budget,{...config,deadline,dnsLookup:deps.dnsLookup},result.totals));
    result.handles[spec.handle]={status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,files};
+   }catch(e){
+    // A sticky budget stop takes precedence over a coincident local parse gap.
+    try{budget.assert();}catch(stop){e=stop;}
+    const local=HANDLE_LOCAL_ERRORS.has(e.code)&&Date.now()<deadline;
+    h.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:local?'handle':'global'};
+    if(!local)throw e;
+    result.error ||= h.error;
+   }
    await F.atomicWriteJson(resultFile+'.progress',result);
   }
-  result.status='COMPLETE';return result;
- }catch(e){result.status=budget.data.denial?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message)};for(const h of config.handles)if(!result.handles[h.handle])result.handles[h.handle]={status:'NOT_COMPLETED',failed:true,files:[]};return result;}
+  result.status=Object.values(result.handles).every(h=>h.status==='COMPLETE')?'COMPLETE':'PARTIAL';return result;
+ }catch(e){result.stoppedGlobally=true;result.status=budget.data.denial||['DENIED','PROVIDER_DENIED','RATE_LIMITED'].includes(e.code)?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:'global'};for(const h of config.handles)if(!result.handles[h.handle])result.handles[h.handle]={status:'NOT_COMPLETED',failed:true,files:[]};return result;}
  finally{
   if(context)await context.close().catch(()=>{});if(browser)await browser.close().catch(()=>{});
   result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,quotaPolicy:budget.data.quota_policy,minRequestIntervalMs:budget.data.min_request_interval_ms,denial:budget.data.denial};
@@ -182,6 +201,7 @@ async function combineWindowResults(input,sourceFiles){
  }
  const handles={};
  for(const spec of config.handles){
+  if(spec.accessRequired!==undefined)throw new F.ArchiveError('ACCESS_REQUIRED','held handle cannot be completed from result parts');
   const candidates=parts.map(p=>({part:p,value:p.doc.handles?.[spec.handle]})).filter(x=>x.value?.status==='COMPLETE'&&x.value.dateAfter===spec.dateAfter).sort((a,b)=>Date.parse(b.value.observedAt)-Date.parse(a.value.observedAt));
   const picked=candidates[0];if(!picked)throw new F.ArchiveError('MISSING_WINDOW','no verified window for '+spec.handle);
   const h=picked.value,age=Date.now()-Date.parse(h.observedAt);
