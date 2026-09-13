@@ -115,4 +115,40 @@ async function syncWindow(input,deps={}){
   try{await F.atomicWriteJson(resultFile,result);}finally{budget.close();}
  }
 }
-module.exports={syncWindow,validate,select,discover,installGuards,acquireSelection};
+
+// Complete one bounded observation round from immutable recent partial results.
+// This performs NO provider requests and never relabels the original results.
+async function combineWindowResults(input,sourceFiles){
+ const config=validate(input),root=await F.safeOutputRoot(config.output);
+ if(!Array.isArray(sourceFiles)||!sourceFiles.length||sourceFiles.length>10)throw new F.ArchiveError('BAD_ARGS','1..10 result parts required');
+ const resultFile=path.resolve(config.resultFile);
+ if(await fs.lstat(resultFile).catch(e=>e.code==='ENOENT'?null:Promise.reject(e)))throw new F.ArchiveError('EXISTS','result path must be new');
+ const parts=[];
+ for(const file of sourceFiles){const raw=await fs.readFile(file);const d=JSON.parse(raw);
+  if(d.kind!=='frameferry-sync-window'||d.schemaVersion!==1||d.scope!=='current-visible-posts'||d.fullHistoryComplete!==false||path.resolve(d.output)!==root||!['COMPLETE','PARTIAL'].includes(d.status)||d.requests?.denial)throw new F.ArchiveError('BAD_RESULT','incompatible or denied result part');
+  parts.push({doc:d,sha256:crypto.createHash('sha256').update(raw).digest('hex'),runId:d.runId});
+ }
+ const handles={};
+ for(const spec of config.handles){
+  const candidates=parts.map(p=>({part:p,value:p.doc.handles?.[spec.handle]})).filter(x=>x.value?.status==='COMPLETE'&&x.value.dateAfter===spec.dateAfter).sort((a,b)=>Date.parse(b.value.observedAt)-Date.parse(a.value.observedAt));
+  const picked=candidates[0];if(!picked)throw new F.ArchiveError('MISSING_WINDOW','no verified window for '+spec.handle);
+  const h=picked.value,age=Date.now()-Date.parse(h.observedAt);
+  if(!Number.isFinite(age)||age<0||age>15*60000||!Number.isInteger(h.observedCards)||h.observedCards<1||!Array.isArray(h.files)||h.selectedCards!==h.files.length||!Array.isArray(h.observations)||h.observations.length!==h.observedCards)throw new F.ArchiveError('STALE_WINDOW','window evidence is stale or incomplete');
+  const observedIds=new Set();
+  for(const x of h.observations){
+   if(typeof x.stableId!=='string'||!/^posts__[a-f0-9]{64}$/.test(x.stableId)||observedIds.has(x.stableId))throw new F.ArchiveError('BAD_RESULT','missing or duplicate observation identity');observedIds.add(x.stableId);
+   const date=x.date||{},expected=estimateDate(date.raw,h.observedAt,config.timeZone||'UTC');
+   if(Object.keys(expected).some(k=>date[k]!==expected[k])||x.selected!==(expected.dayHi>=spec.dateAfter)||(date.precision==='estimated'&&config.allowEstimatedDates!==true))throw new F.ArchiveError('DATE_POLICY','incomplete or mismatched date provenance/selection');
+  }
+  if(h.observations.filter(x=>x.selected).length!==h.files.length)throw new F.ArchiveError('BAD_RESULT','selected coverage mismatch');
+  const selected=new Map(h.observations.filter(x=>x.selected).map(x=>[x.stableId,x]));
+  if(selected.size!==h.files.length)throw new F.ArchiveError('BAD_RESULT','duplicate selected identity');
+  const paths=F.profilePaths(root,spec.handle),ids=new Set();
+  for(const f of h.files){if(ids.has(f.stableId)||!selected.has(f.stableId)||JSON.stringify(f.date)!==JSON.stringify(selected.get(f.stableId).date)||f.profileHandle!==spec.handle||!await F.verifyReceipt(paths,f))throw new F.ArchiveError('BAD_RECEIPT','result file failed identity/byte verification');ids.add(f.stableId);}
+  handles[spec.handle]={...h,eligibility:spec.eligibility||'caller-selected',sourceRunId:picked.part.runId};
+ }
+ const d={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,output:root,status:'COMPLETE',handles,totals:{downloaded:0,reused:Object.values(handles).reduce((n,h)=>n+h.files.length,0),bytes:0},composition:{maxObservationAgeMs:900000,additionalProviderRequests:0,sourceResults:parts.map(p=>({runId:p.runId,sha256:p.sha256,status:p.doc.status}))},finishedAt:new Date().toISOString()};
+ await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));await F.atomicWriteJson(resultFile,d);return d;
+}
+
+module.exports={syncWindow,combineWindowResults,validate,select,discover,installGuards,acquireSelection};

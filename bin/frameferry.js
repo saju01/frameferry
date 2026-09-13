@@ -45,7 +45,8 @@ function usage(code) {
   if (opts.cmd === 'sync-window') {
     if (!opts.config) throw new ArchiveError('BAD_ARGS', 'sync-window requires --config <json>');
     const config = JSON.parse(await require('node:fs/promises').readFile(opts.config, 'utf8'));
-    const result = await require('../src/sync-window.js').syncWindow(config);
+    const window = require('../src/sync-window.js');
+    const result = config.resultParts ? await window.combineWindowResults(config, config.resultParts) : await window.syncWindow(config);
     console.log(JSON.stringify(result));
     process.exitCode = result.status === 'COMPLETE' ? 0 : 1;
     return;

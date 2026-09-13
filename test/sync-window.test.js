@@ -70,3 +70,23 @@ test('profile metadata arriving after eight seconds is awaited, not retried or f
  const result=await W.syncWindow({handles:[{handle:'example',dateAfter:'2099-01-01'}],runId:'slow',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true,maxTimeMs:20000},fixture);
  assert.equal(result.status,'COMPLETE',JSON.stringify(result));assert.equal(result.handles.example.observedCards,1);assert.equal(result.totals.downloaded,0);
 });
+
+test('composition requires every recent complete window and never promotes original partial result',async t=>{
+ const root=await tmp(t),output=path.join(root,'cache');await fs.mkdir(output);const at=new Date().toISOString();
+ const part={schemaVersion:1,kind:'frameferry-sync-window',runId:'old',scope:'current-visible-posts',fullHistoryComplete:false,output,status:'PARTIAL',requests:{denial:null},handles:{example:{status:'COMPLETE',dateAfter:'2026-01-01',observedCards:1,observedAt:at,selectedCards:0,files:[],observations:[{stableId:'posts__'+'a'.repeat(64),selected:false,date:estimateDate('1 January 2025',at,'UTC')}]}}};
+ const file=path.join(root,'part.json');await fs.writeFile(file,JSON.stringify(part));
+ const cfg={handles:[{handle:'example',dateAfter:'2026-01-01'}],runId:'combined',output,resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'unused.json'),allowEstimatedDates:true};
+ const d=await W.combineWindowResults(cfg,[file]);assert.equal(d.status,'COMPLETE');assert.equal(d.composition.additionalProviderRequests,0);assert.equal(JSON.parse(await fs.readFile(file)).status,'PARTIAL');
+ await assert.rejects(W.combineWindowResults({...cfg,resultFile:path.join(root,'missing.json'),handles:[...cfg.handles,{handle:'other',dateAfter:'2026-01-01'}]},[file]),/no verified window/);
+ part.handles.example.observedAt='2020-01-01T00:00:00Z';await fs.writeFile(file,JSON.stringify(part));await assert.rejects(W.combineWindowResults({...cfg,resultFile:path.join(root,'stale.json')},[file]),/stale/);
+});
+
+test('composition rejects mismatched selected IDs and malformed date provenance',async t=>{
+ const root=await tmp(t),output=path.join(root,'cache');await fs.mkdir(output);const at=new Date().toISOString(),date=estimateDate('1 January 2026',at,'UTC'),a='posts__'+'a'.repeat(64),b='posts__'+'b'.repeat(64);
+ const h={status:'COMPLETE',dateAfter:'2026-01-01',observedAt:at,observedCards:1,selectedCards:1,observations:[{stableId:a,selected:true,date}],files:[{stableId:b,date,profileHandle:'example',path:'wrong.jpg',sha256:'a'.repeat(64),bytes:1}]};
+ const d={schemaVersion:1,kind:'frameferry-sync-window',runId:'source',scope:'current-visible-posts',fullHistoryComplete:false,output,status:'PARTIAL',requests:{denial:null},handles:{example:h}},file=path.join(root,'part.json');
+ const cfg={handles:[{handle:'example',dateAfter:'2026-01-01'}],runId:'composed',output,resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'unused.json'),allowEstimatedDates:true};
+ await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]),/identity\/byte verification/);
+ h.observations[0].date={timeZone:'UTC'};await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]));
+ h.observations[0].date={...date,observedAt:'2020-01-01T00:00:00Z'};await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]),/date provenance/);
+});

@@ -175,6 +175,11 @@ Example private configuration (keep real handles, paths and scheduling outside t
   positively bound, rehashed receipts. Old carousel positions and changing locators
   are not treated as identity aliases. A separate window cache keeps an unfinished
   full-history archive's outstanding work intact; the command never marks it complete.
+- Optional `resultParts` lists recent FrameFerry result files for local-only composition.
+  Every requested handle must have a matching completed window no older than15minutes;
+  policy, cutoff, identity and file bytes are revalidated. Missing/stale/denied
+  parts fail closed. The new result records source hashes and makes zero provider
+  requests; original partial results and their failure status remain untouched.
 - The result contains receipt paths/hashes and date provenance, not signed media
   locators. A destination adapter must validate the run, complete selected scope,
   handle coverage, path confinement and hashes before importing. Destination
