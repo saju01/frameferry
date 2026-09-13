@@ -180,7 +180,7 @@ Example private configuration (keep real handles, paths and scheduling outside t
   are not treated as identity aliases. A separate window cache keeps an unfinished
   full-history archive's outstanding work intact; the command never marks it complete.
 - Optional `resultParts` lists recent FrameFerry result files for local-only composition.
-  Every requested handle must have a matching completed window no older than15minutes;
+  Every requested handle must have a matching completed window no older than 15 minutes;
   policy, cutoff, identity and file bytes are revalidated. Missing/stale/denied
   parts fail closed. The new result records source hashes and makes zero provider
   requests; original partial results and their failure status remain untouched.

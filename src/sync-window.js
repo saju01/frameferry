@@ -78,6 +78,14 @@ function validateWitnessWindow(spec,h,options={}){
  if(!proof.satisfied||JSON.stringify(h.coverage)!==JSON.stringify(proof))throw new F.ArchiveError('FEED_COVERAGE_GAP','missing or conflicting known-post evidence');
  return proof;
 }
+function canonicalReceiptMediaPath(paths,receipt){
+ if(!receipt||typeof receipt.stableId!=='string'||typeof receipt.path!=='string')return false;
+ const ext=path.extname(receipt.path);
+ return !!ext&&receipt.path===path.relative(paths.root,path.join(paths.mediaDir,receipt.stableId+ext));
+}
+async function verifyCanonicalReceipt(paths,receipt,stableId,handle){
+ return !!receipt&&receipt.stableId===stableId&&receipt.profileHandle===handle&&canonicalReceiptMediaPath(paths,receipt)&&await F.verifyReceipt(paths,receipt);
+}
 async function installGuards(page,budget){
  await page.route('**/*',async route=>{
   const req=route.request();const u=new URL(req.url());
@@ -117,14 +125,15 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
   const receiptPath=path.join(paths.receiptDir,item.stableId+'.json');
   let receipt=await F.readJson(receiptPath,null),reused=false;
   // Never alias legacy carousel positions or rotating locators without byte proof.
-  if(receipt&&receipt.profileHandle===handle&&receipt.stableId===item.stableId&&receipt.providerMediaFingerprint===item.providerMediaFingerprint&&await F.verifyReceipt(paths,receipt))reused=true;
+  if(receipt&&receipt.providerMediaFingerprint===item.providerMediaFingerprint&&await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))reused=true;
+  else if(receipt&&receipt.profileHandle===handle&&receipt.stableId===item.stableId)throw new F.ArchiveError('BAD_RECEIPT','canonical receipt metadata failed identity/path verification');
   else {
    const remaining=options.maxBytes-totals.bytes;if(remaining<1)throw new F.ArchiveError('BYTE_LIMIT','incremental byte allowance exhausted');
    const result=await F.downloadOne(item,paths,{handle,runId,fetchImpl:budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{}});
    if(result.conflict)throw new F.ArchiveError('IDENTITY_CONFLICT','conflicting media bytes held unchanged');
    receipt=result.receipt;totals.downloaded++;totals.bytes+=receipt.bytes;
   }
-  if(!await F.verifyReceipt(paths,receipt))throw new F.ArchiveError('BAD_RECEIPT','selected receipt bytes failed verification');
+  if(!await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))throw new F.ArchiveError('BAD_RECEIPT','selected receipt bytes failed verification');
   if(reused)totals.reused++;
   out.push({stableId:receipt.stableId,shortcode:receipt.shortcode,mediaType:receipt.mediaType,path:receipt.path,bytes:receipt.bytes,sha256:receipt.sha256,profileHandle:receipt.profileHandle,sourceHost:receipt.sourceHost,date,receiptRunId:receipt.runId,reused});
  }
@@ -139,11 +148,12 @@ async function syncWindow(input,deps={}){
  if(await fs.lstat(resultFile).catch(e=>e.code==='ENOENT'?null:Promise.reject(e)))throw new F.ArchiveError('EXISTS','result already exists; use a new run result path');
  const budget=openBudget(config.requestLedger,config.runId,config.maxRequests),deadline=Date.now()+config.maxTimeMs;
  const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,failureIsolation:'handle-local-v1',stoppedGlobally:false,output:root,handles:{},totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};
- let browser,context;
+ let browser,context,ownsBrowser=false;
  try{
   budget.assert();
   const chromium=deps.chromium||require('playwright').chromium;
-  browser=config.attachCdp?await chromium.connectOverCDP(config.attachCdp,{timeout:20000}):await chromium.launch({headless:true,executablePath:config.browserExecutable,timeout:20000});
+  if(config.attachCdp)browser=await chromium.connectOverCDP(config.attachCdp,{timeout:20000});
+  else {browser=await chromium.launch({headless:true,executablePath:config.browserExecutable,timeout:20000});ownsBrowser=true;}
   // Own isolated context with service workers blocked; close only owned resources.
   context=await browser.newContext({serviceWorkers:'block'});
   for(const spec of config.handles){
@@ -181,7 +191,7 @@ async function syncWindow(input,deps={}){
   result.status=Object.values(result.handles).every(h=>h.status==='COMPLETE')?'COMPLETE':'PARTIAL';return result;
  }catch(e){result.stoppedGlobally=true;result.status=budget.data.denial||['DENIED','PROVIDER_DENIED','RATE_LIMITED'].includes(e.code)?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:'global'};for(const h of config.handles)if(!result.handles[h.handle])result.handles[h.handle]={status:'NOT_COMPLETED',failed:true,files:[]};return result;}
  finally{
-  if(context)await context.close().catch(()=>{});if(browser)await browser.close().catch(()=>{});
+  if(context)await context.close().catch(()=>{});if(ownsBrowser&&browser)await browser.close().catch(()=>{});
   result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,quotaPolicy:budget.data.quota_policy,minRequestIntervalMs:budget.data.min_request_interval_ms,denial:budget.data.denial};
   try{await F.atomicWriteJson(resultFile,result);}finally{budget.close();}
  }
@@ -205,21 +215,12 @@ async function combineWindowResults(input,sourceFiles){
   const candidates=parts.map(p=>({part:p,value:p.doc.handles?.[spec.handle]})).filter(x=>x.value?.status==='COMPLETE'&&x.value.dateAfter===spec.dateAfter).sort((a,b)=>Date.parse(b.value.observedAt)-Date.parse(a.value.observedAt));
   const picked=candidates[0];if(!picked)throw new F.ArchiveError('MISSING_WINDOW','no verified window for '+spec.handle);
   const h=picked.value,age=Date.now()-Date.parse(h.observedAt);
-  if(!Number.isFinite(age)||age<0||age>15*60000||!Number.isInteger(h.observedCards)||h.observedCards<1||!Array.isArray(h.files)||h.selectedCards!==h.files.length||!Array.isArray(h.observations)||h.observations.length!==h.observedCards)throw new F.ArchiveError('STALE_WINDOW','window evidence is stale or incomplete');
-  const observedIds=new Set();
-  for(const x of h.observations){
-   if(typeof x.stableId!=='string'||!/^posts__[a-f0-9]{64}$/.test(x.stableId)||observedIds.has(x.stableId))throw new F.ArchiveError('BAD_RESULT','missing or duplicate observation identity');observedIds.add(x.stableId);
-   const date=x.date||{},expected=estimateDate(date.raw,h.observedAt,config.timeZone||'UTC');
-   if(Object.keys(expected).some(k=>date[k]!==expected[k])||x.selected!==(expected.dayHi>=spec.dateAfter)||(date.precision==='estimated'&&config.allowEstimatedDates!==true))throw new F.ArchiveError('DATE_POLICY','incomplete or mismatched date provenance/selection');
-  }
-  const coverage=witnessCoverage(spec,h.observations);
-  if(!coverage.satisfied||(spec.expectedPosts?.length&&JSON.stringify(h.coverage)!==JSON.stringify(coverage)))throw new F.ArchiveError('FEED_COVERAGE_GAP','result parts lack required known-post coverage');
-  if(spec.expectedPosts?.length)validateWitnessWindow(spec,h,config);
-  if(h.observations.filter(x=>x.selected).length!==h.files.length)throw new F.ArchiveError('BAD_RESULT','selected coverage mismatch');
+  if(!Number.isFinite(age)||age<0||age>15*60000)throw new F.ArchiveError('STALE_WINDOW','window evidence is stale or incomplete');
+  const coverage=validateWitnessWindow(spec,h,config);
   const selected=new Map(h.observations.filter(x=>x.selected).map(x=>[x.stableId,x]));
   if(selected.size!==h.files.length)throw new F.ArchiveError('BAD_RESULT','duplicate selected identity');
   const paths=F.profilePaths(root,spec.handle),ids=new Set();
-  for(const f of h.files){if(ids.has(f.stableId)||!selected.has(f.stableId)||JSON.stringify(f.date)!==JSON.stringify(selected.get(f.stableId).date)||f.profileHandle!==spec.handle||!await F.verifyReceipt(paths,f))throw new F.ArchiveError('BAD_RECEIPT','result file failed identity/byte verification');ids.add(f.stableId);}
+  for(const f of h.files){if(ids.has(f.stableId)||!selected.has(f.stableId)||JSON.stringify(f.date)!==JSON.stringify(selected.get(f.stableId).date)||!await verifyCanonicalReceipt(paths,f,f.stableId,spec.handle))throw new F.ArchiveError('BAD_RECEIPT','result file failed identity/byte verification');ids.add(f.stableId);}
   handles[spec.handle]={...h,coverage,eligibility:spec.eligibility||'caller-selected',sourceRunId:picked.part.runId};
  }
  const d={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,output:root,status:'COMPLETE',handles,totals:{downloaded:0,reused:Object.values(handles).reduce((n,h)=>n+h.files.length,0),bytes:0},composition:{maxObservationAgeMs:900000,additionalProviderRequests:0,sourceResults:parts.map(p=>({runId:p.runId,sha256:p.sha256,status:p.doc.status}))},finishedAt:new Date().toISOString()};

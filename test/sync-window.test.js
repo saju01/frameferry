@@ -1,11 +1,13 @@
 'use strict';
-const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path'),crypto=require('node:crypto');
 const F=require('../src/index.js'),W=require('../src/sync-window.js'),{openBudget}=require('../src/request-budget.js'),{estimateDate}=require('../src/date-estimate.js');
 const jpg=Buffer.from([255,216,255,224,1,2,3,4,255,217]);
 async function tmp(t){const p=await fs.mkdtemp(path.join(os.tmpdir(),'ff-window-'));t.after(()=>fs.rm(p,{recursive:true,force:true}));return p;}
 const raw=(code='POST',label='8 hours ago')=>({shortcode:code,href:'https://instacognito.com/media?id='+code,mediaType:'image',dateRaw:label});
+const completeWindow=(spec,observedAt,observations,files=[])=>({status:'COMPLETE',scope:'current-visible-posts',dateAfter:spec.dateAfter,observedAt,observedCards:observations.length,selectedCards:files.length,observations,files,coverage:W.witnessCoverage(spec,observations)});
 test('opt-in estimates anchored to observation; raw core parser stays unchanged',()=>{
  const e=estimateDate('8 hours ago','2026-09-13T01:00:00Z','Europe/Amsterdam');assert.equal(e.iso,'2026-09-12T17:00:00.000Z');assert.equal(e.precision,'estimated');assert.equal(F.parseDateText('8 hours ago'),'8 hours ago');
+ assert.equal(estimateDate('1 January 2026','2026-09-13T01:00:00Z','America/New_York').dayHi,'2026-01-01');
  assert.throws(()=>W.select([raw()],'2026-09-13T01:00:00Z',{dateAfter:'2026-09-12'}),/allowEstimatedDates/);
  assert.equal(W.select([raw()],'2026-09-13T01:00:00Z',{dateAfter:'2026-09-12',allowEstimatedDates:true})[0].selected,true);
 });
@@ -28,15 +30,15 @@ test('all redirect hops count and 429 never retries',async t=>{
 async function browserFixture(t,status=200,profileDelay=0){
  const chromium=require('playwright').chromium;
  const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/chromium'});t.after(()=>browser.close());
- const contexts=[];let requests=0,preview=0;
+ const contexts=[];let requests=0,preview=0,browserCloses=0;
  const wrap={newContext:async opts=>{assert.equal(opts.serviceWorkers,'block');const c=await browser.newContext(opts);contexts.push(c);await c.route('**/*',async route=>{
   const u=new URL(route.request().url());if(u.pathname==='/media'){preview++;return route.abort();}
   requests++;
   const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><script>function show(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@example</span> 1 posts\';document.getElementById("post-container").innerHTML=\'<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>\';}</script>';
   const delayed = profileDelay ? html.replace('document.getElementById("profile-section").innerHTML=', 'setTimeout(()=>document.getElementById("profile-section").innerHTML=').replace(" 1 posts\';document.getElementById", " 1 posts\',"+profileDelay+");document.getElementById") : html;
   await route.fulfill({status:Array.isArray(status)?status[requests-1]||200:status,contentType:'text/html',body:delayed.replace('@example', "@'+document.getElementById(\"search-input\").value+'")});
- });return c;},close:async()=>{}};
- return {chromium:{launch:async()=>wrap,connectOverCDP:async()=>wrap},counts:()=>({requests,preview}),dnsLookup:async()=>[{address:"93.184.216.34",family:4}],browser};
+ });return c;},close:async()=>{browserCloses++;}};
+ return {chromium:{launch:async()=>wrap,connectOverCDP:async()=>wrap},counts:()=>({requests,preview,browserCloses}),dnsLookup:async()=>[{address:"93.184.216.34",family:4}],browser};
 }
 test('full browser discovery -> real downloadOne -> receipts; repeat is cache-only, no history claim',async t=>{
  const root=await tmp(t),fixture=await browserFixture(t);let downloads=0;const original=globalThis.fetch;t.after(()=>{globalThis.fetch=original;});globalThis.fetch=async()=>{downloads++;return new Response(jpg,{headers:{'content-type':'image/jpeg','content-length':String(jpg.length)}});};
@@ -44,6 +46,8 @@ test('full browser discovery -> real downloadOne -> receipts; repeat is cache-on
  const first=await W.syncWindow(config,fixture);assert.equal(first.status,'COMPLETE',JSON.stringify(first));assert.equal(first.fullHistoryComplete,false);assert.equal(first.handles.example.files.length,1);assert.equal(first.totals.downloaded,1);assert.equal(fixture.counts().preview,0);
  assert.equal(JSON.stringify(first).includes('/media?id='),false);
  const second=await W.syncWindow({...config,runId:'second',resultFile:path.join(root,'second.json')},fixture);assert.equal(second.status,'COMPLETE');assert.equal(second.totals.reused,1);assert.equal(downloads,1);assert.equal(fixture.browser.isConnected(),true);
+ const beforeAttachCloses=fixture.counts().browserCloses;
+ const attached=await W.syncWindow({...config,runId:'attached',resultFile:path.join(root,'attached.json'),attachCdp:'http://127.0.0.1:9222'},fixture);assert.equal(attached.status,'COMPLETE');assert.equal(fixture.counts().browserCloses,beforeAttachCloses);
 });
 test('browser denial stops before media, publishes non-success result and preserved ledger',async t=>{
  const root=await tmp(t),fixture=await browserFixture(t,403);let downloads=0;const original=globalThis.fetch;t.after(()=>{globalThis.fetch=original;});globalThis.fetch=async()=>{downloads++;throw new Error('unexpected media fetch');};
@@ -73,22 +77,39 @@ test('profile metadata arriving after eight seconds is awaited, not retried or f
 
 test('composition requires every recent complete window and never promotes original partial result',async t=>{
  const root=await tmp(t),output=path.join(root,'cache');await fs.mkdir(output);const at=new Date().toISOString();
- const part={schemaVersion:1,kind:'frameferry-sync-window',runId:'old',scope:'current-visible-posts',fullHistoryComplete:false,output,status:'PARTIAL',requests:{denial:null},handles:{example:{status:'COMPLETE',dateAfter:'2026-01-01',observedCards:1,observedAt:at,selectedCards:0,files:[],observations:[{stableId:'posts__'+'a'.repeat(64),selected:false,date:estimateDate('1 January 2025',at,'UTC')}]}}};
+ const spec={handle:'example',dateAfter:'2026-01-01'},observations=[{stableId:'posts__'+'a'.repeat(64),shortcode:'OLD',category:'posts',selected:false,date:estimateDate('1 January 2025',at,'UTC')}];
+ const part={schemaVersion:1,kind:'frameferry-sync-window',runId:'old',scope:'current-visible-posts',fullHistoryComplete:false,output,status:'PARTIAL',requests:{denial:null},handles:{example:completeWindow(spec,at,observations)}};
  const file=path.join(root,'part.json');await fs.writeFile(file,JSON.stringify(part));
- const cfg={handles:[{handle:'example',dateAfter:'2026-01-01'}],runId:'combined',output,resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'unused.json'),allowEstimatedDates:true};
+ const cfg={handles:[spec],runId:'combined',output,resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'unused.json'),allowEstimatedDates:true};
  const d=await W.combineWindowResults(cfg,[file]);assert.equal(d.status,'COMPLETE');assert.equal(d.composition.additionalProviderRequests,0);assert.equal(JSON.parse(await fs.readFile(file)).status,'PARTIAL');
+ delete part.handles.example.scope;await fs.writeFile(file,JSON.stringify(part));await assert.rejects(W.combineWindowResults({...cfg,resultFile:path.join(root,'noscope.json')},[file]),/incomplete witness window/);part.handles.example.scope='current-visible-posts';await fs.writeFile(file,JSON.stringify(part));
  await assert.rejects(W.combineWindowResults({...cfg,resultFile:path.join(root,'missing.json'),handles:[...cfg.handles,{handle:'other',dateAfter:'2026-01-01'}]},[file]),/no verified window/);
  part.handles.example.observedAt='2020-01-01T00:00:00Z';await fs.writeFile(file,JSON.stringify(part));await assert.rejects(W.combineWindowResults({...cfg,resultFile:path.join(root,'stale.json')},[file]),/stale/);
 });
 
 test('composition rejects mismatched selected IDs and malformed date provenance',async t=>{
  const root=await tmp(t),output=path.join(root,'cache');await fs.mkdir(output);const at=new Date().toISOString(),date=estimateDate('1 January 2026',at,'UTC'),a='posts__'+'a'.repeat(64),b='posts__'+'b'.repeat(64);
- const h={status:'COMPLETE',dateAfter:'2026-01-01',observedAt:at,observedCards:1,selectedCards:1,observations:[{stableId:a,selected:true,date}],files:[{stableId:b,date,profileHandle:'example',path:'wrong.jpg',sha256:'a'.repeat(64),bytes:1}]};
+ const spec={handle:'example',dateAfter:'2026-01-01'},h=completeWindow(spec,at,[{stableId:a,shortcode:'POST',category:'posts',selected:true,date}],[{stableId:b,shortcode:'POST',date,profileHandle:'example',path:'wrong.jpg',sha256:'a'.repeat(64),bytes:1}]);
  const d={schemaVersion:1,kind:'frameferry-sync-window',runId:'source',scope:'current-visible-posts',fullHistoryComplete:false,output,status:'PARTIAL',requests:{denial:null},handles:{example:h}},file=path.join(root,'part.json');
- const cfg={handles:[{handle:'example',dateAfter:'2026-01-01'}],runId:'composed',output,resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'unused.json'),allowEstimatedDates:true};
- await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]),/identity\/byte verification/);
+ const cfg={handles:[spec],runId:'composed',output,resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'unused.json'),allowEstimatedDates:true};
+ await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]),/witness observation\/receipt mismatch/);
+ h.files[0].stableId=a;h.coverage=W.witnessCoverage(spec,h.observations);
  h.observations[0].date={timeZone:'UTC'};await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]));
  h.observations[0].date={...date,observedAt:'2020-01-01T00:00:00Z'};await fs.writeFile(file,JSON.stringify(d));await assert.rejects(W.combineWindowResults(cfg,[file]),/date provenance/);
+});
+
+test('cache reuse and composition require canonical media paths',async t=>{
+ const root=await tmp(t),output=path.join(root,'cache'),paths=F.profilePaths(output,'example'),id='posts__'+'c'.repeat(64),sha=crypto.createHash('sha256').update(jpg).digest('hex'),badPath=path.relative(output,path.join(paths.mediaDir,'other.jpg'));
+ await fs.mkdir(paths.mediaDir,{recursive:true});await fs.mkdir(paths.receiptDir,{recursive:true});await fs.writeFile(path.join(paths.mediaDir,'other.jpg'),jpg);
+ const receipt={stableId:id,id,profileHandle:'example',providerMediaFingerprint:'fp',shortcode:'POST',mediaType:'image',path:badPath,bytes:jpg.length,sha256:sha,sourceHost:'instacognito.com',runId:'old'};
+ await fs.writeFile(path.join(paths.receiptDir,id+'.json'),JSON.stringify(receipt));
+ let fetched=false;const budget={assert(){},fetch:async()=>{fetched=true;throw Error('must not fetch');}};
+ await assert.rejects(W.acquireSelection([{item:{stableId:id,providerMediaFingerprint:'fp'},date:{},selected:true}],paths,'example','run',budget,{maxBytes:1024,maxFileBytes:1024,deadline:Date.now()+1000}, {downloaded:0,reused:0,bytes:0}),/canonical receipt metadata/);
+ assert.equal(fetched,false);
+ const at=new Date().toISOString(),date=estimateDate('1 January 2026',at,'UTC'),obs={stableId:id,shortcode:'POST',category:'posts',selected:true,date},spec={handle:'example',dateAfter:'2026-01-01'};
+ const h=completeWindow(spec,at,[obs],[{...receipt,date}]),part={schemaVersion:1,kind:'frameferry-sync-window',runId:'source',scope:'current-visible-posts',fullHistoryComplete:false,output,status:'COMPLETE',requests:{denial:null},handles:{example:h}},file=path.join(root,'part.json');
+ await fs.writeFile(file,JSON.stringify(part));
+ await assert.rejects(W.combineWindowResults({handles:[spec],runId:'combined',output,resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'unused.json')},[file]),/identity\/byte verification/);
 });
 
 test('public provider has no inherited 120/140 quota, and history/denial remain intact',async t=>{
@@ -140,8 +161,8 @@ test('real browser witness match succeeds and composition rechecks policy and ob
  const spec={handle:'example',dateAfter:'2020-01-01',expectedPosts:[{...witness('POST'),minDayHi:'2020-01-01'}]},cfg={handles:[spec],runId:'match',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true};
  const d=await W.syncWindow(cfg,fixture);assert.equal(d.status,'COMPLETE',JSON.stringify(d));assert.equal(d.handles.example.coverage.satisfied,true);assert.equal(d.handles.example.coverage.fullFeedComplete,false);
  const combined=await W.combineWindowResults({...cfg,runId:'combined',resultFile:path.join(root,'combined.json')},[cfg.resultFile]);assert.equal(combined.status,'COMPLETE');
- delete d.handles.example.coverage;await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'legacy',resultFile:path.join(root,'legacy.json')},[cfg.resultFile]),/known-post coverage/);
- d.handles.example.coverage=combined.handles.example.coverage;d.handles.example.observations[0].shortcode='OTHER';await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'missing',resultFile:path.join(root,'missing.json')},[cfg.resultFile]),/known-post coverage/);
+ delete d.handles.example.coverage;await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'legacy',resultFile:path.join(root,'legacy.json')},[cfg.resultFile]),/known-post evidence/);
+ d.handles.example.coverage=combined.handles.example.coverage;d.handles.example.observations[0].shortcode='OTHER';await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'missing',resultFile:path.join(root,'missing.json')},[cfg.resultFile]),/known-post evidence|witness observation\/receipt mismatch/);
 });
 
 test('pure destination validator recomputes date provenance even with coherent forged coverage',()=>{

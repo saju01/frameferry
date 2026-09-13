@@ -19,6 +19,7 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
   if (!y || !mo || !day) throw new Error('Intl returned no year/month/day parts');
   return `${y}-${mo}-${day}`;
 }
+  const calendarDay=(y,mo,day)=>`${String(y).padStart(4,'0')}-${String(mo+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
 
   function parseDate(raw, NOW = new Date()) {
   if (raw === undefined || raw === null) return { error: 'card has no date field' };
@@ -30,7 +31,7 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
   // would be silently dropped and reported as a healthy "nothing new".
   // `basis` and the [lo, hi] window travel with the instant, because the point
   // estimate alone cannot say how much it is worth.
-  const finite = (d, why, basis, lo, hi) => {
+  const finite = (d, why, basis, lo, hi, days) => {
     if (!(d instanceof Date) || !Number.isFinite(d.getTime())) {
       return { error: `date "${s}" does not resolve to a real instant (${why})` };
     }
@@ -46,9 +47,9 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
     }
     let dayLo, dayHi, day;
     try {
-      dayLo = amsterdamDay(low);
-      dayHi = amsterdamDay(high);
-      day = amsterdamDay(d);
+      dayLo = days?.dayLo || amsterdamDay(low);
+      dayHi = days?.dayHi || amsterdamDay(high);
+      day = days?.day || amsterdamDay(d);
     } catch (e) {
       return { error: `date "${s}" has no resolvable Amsterdam day (${e && e.message})` };
     }
@@ -108,9 +109,13 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
       const alt = build(year - 1) || d;
       const lo = new Date(Math.min(d.getTime(), alt.getTime()));
       const hi = new Date(Math.max(d.getTime(), alt.getTime()));
-      return finite(d, 'absolute date without a year', 'absolute_noyear', lo, hi);
+      return finite(d, 'absolute date without a year', 'absolute_noyear', lo, hi, {
+        day: calendarDay(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate()),
+        dayLo: calendarDay(lo.getUTCFullYear(),lo.getUTCMonth(),lo.getUTCDate()),
+        dayHi: calendarDay(hi.getUTCFullYear(),hi.getUTCMonth(),hi.getUTCDate())
+      });
     }
-    return finite(d, 'absolute date with an explicit year', 'absolute_year');
+    return finite(d, 'absolute date with an explicit year', 'absolute_year', undefined, undefined, {day:calendarDay(year,mo,day),dayLo:calendarDay(year,mo,day),dayHi:calendarDay(year,mo,day)});
   }
 
   return { error: `unparseable date "${s}"` };
