@@ -125,17 +125,14 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
   const receiptPath=path.join(paths.receiptDir,item.stableId+'.json');
   let receipt=await F.readJson(receiptPath,null),reused=false;
   // Never alias legacy carousel positions or rotating locators without byte proof.
-  if(receipt&&receipt.providerMediaFingerprint===item.providerMediaFingerprint){
-   if(await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))reused=true;
-   else throw new F.ArchiveError('BAD_RECEIPT','canonical receipt metadata failed identity/path verification');
-  }
+  if(receipt&&receipt.providerMediaFingerprint===item.providerMediaFingerprint&&await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))reused=true;
   else {
    const remaining=options.maxBytes-totals.bytes;if(remaining<1)throw new F.ArchiveError('BYTE_LIMIT','incremental byte allowance exhausted');
-   const result=await F.downloadOne(item,paths,{handle,runId,fetchImpl:budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{}});
+   const result=await F.downloadOne(item,paths,{handle,runId,fetchImpl:budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{},acceptExistingReceipt:r=>canonicalReceiptMediaPath(paths,r)});
    if(result.conflict)throw new F.ArchiveError('IDENTITY_CONFLICT','conflicting media bytes held unchanged');
    receipt=result.receipt;totals.downloaded++;totals.bytes+=receipt.bytes;
   }
-  if(!await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))throw new F.ArchiveError('BAD_RECEIPT','selected receipt bytes failed verification');
+  if(!await verifyCanonicalReceipt(paths,receipt,item.stableId,handle))throw new F.ArchiveError('BAD_RECEIPT','selected receipt failed identity/path/byte verification');
   if(reused)totals.reused++;
   out.push({stableId:receipt.stableId,shortcode:receipt.shortcode,mediaType:receipt.mediaType,path:receipt.path,bytes:receipt.bytes,sha256:receipt.sha256,profileHandle:receipt.profileHandle,sourceHost:receipt.sourceHost,date,receiptRunId:receipt.runId,reused});
  }
@@ -218,6 +215,7 @@ async function combineWindowResults(input,sourceFiles){
   const picked=candidates[0];if(!picked)throw new F.ArchiveError('MISSING_WINDOW','no verified window for '+spec.handle);
   const h=picked.value,age=Date.now()-Date.parse(h.observedAt);
   if(!Number.isFinite(age)||age<0||age>15*60000)throw new F.ArchiveError('STALE_WINDOW','window evidence is stale or incomplete');
+  if(!Number.isInteger(h.observedCards)||h.observedCards<1||!Array.isArray(h.files)||h.selectedCards!==h.files.length||!Array.isArray(h.observations)||h.observations.length!==h.observedCards)throw new F.ArchiveError('STALE_WINDOW','window evidence is stale or incomplete');
   const coverage=validateWitnessWindow(spec,h,config);
   const selected=new Map(h.observations.filter(x=>x.selected).map(x=>[x.stableId,x]));
   if(selected.size!==h.files.length)throw new F.ArchiveError('BAD_RESULT','duplicate selected identity');

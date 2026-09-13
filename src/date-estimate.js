@@ -19,6 +19,7 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
   if (!y || !mo || !day) throw new Error('Intl returned no year/month/day parts');
   return `${y}-${mo}-${day}`;
 }
+  // `monthIndex` is JavaScript's 0-based month number, matching Date#getUTCMonth().
   const calendarDay=(y,monthIndex,day)=>`${String(y).padStart(4,'0')}-${String(monthIndex+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
 
   function parseDate(raw, NOW = new Date()) {

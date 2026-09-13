@@ -101,12 +101,10 @@ test('composition rejects mismatched selected IDs and malformed date provenance'
 test('cache reuse and composition require canonical media paths',async t=>{
  const root=await tmp(t),output=path.join(root,'cache'),paths=F.profilePaths(output,'example'),id='posts__'+'c'.repeat(64),sha=crypto.createHash('sha256').update(jpg).digest('hex'),badPath=path.relative(output,path.join(paths.mediaDir,'other.jpg'));
  await fs.mkdir(paths.mediaDir,{recursive:true});await fs.mkdir(paths.receiptDir,{recursive:true});await fs.writeFile(path.join(paths.mediaDir,'other.jpg'),jpg);
- const receipt={stableId:id,id,profileHandle:'example',providerMediaFingerprint:'fp',shortcode:'POST',mediaType:'image',path:badPath,bytes:jpg.length,sha256:sha,sourceHost:'instacognito.com',runId:'old'};
+ const changed=crypto.createHash('sha256').update('/media?id=POST').digest('hex');
+ const receipt={stableId:id,id,profileHandle:'example',providerMediaFingerprint:changed,shortcode:'POST',mediaType:'image',path:badPath,bytes:jpg.length,sha256:sha,sourceHost:'instacognito.com',runId:'old'};
  await fs.writeFile(path.join(paths.receiptDir,id+'.json'),JSON.stringify(receipt));
  let fetched=false;const budget={assert(){},fetch:async()=>{fetched=true;throw Error('must not fetch');}};
- await assert.rejects(W.acquireSelection([{item:{stableId:id,providerMediaFingerprint:'fp'},date:{},selected:true}],paths,'example','run',budget,{maxBytes:1024,maxFileBytes:1024,deadline:Date.now()+1000}, {downloaded:0,reused:0,bytes:0}),/canonical receipt metadata/);
- assert.equal(fetched,false);
- const changed=crypto.createHash('sha256').update('/media?id=POST').digest('hex');
  await assert.rejects(W.acquireSelection([{item:{stableId:id,providerMediaFingerprint:changed,href:'https://instacognito.com/media?id=POST',mediaType:'image'},date:{},selected:true}],paths,'example','run',budget,{maxBytes:1024,maxFileBytes:1024,deadline:Date.now()+1000,dnsLookup:async()=>[{address:'93.184.216.34',family:4}]}, {downloaded:0,reused:0,bytes:0}),/must not fetch/);
  assert.equal(fetched,true);
  const at=new Date().toISOString(),date=estimateDate('1 January 2026',at,'UTC'),obs={stableId:id,shortcode:'POST',category:'posts',selected:true,date},spec={handle:'example',dateAfter:'2026-01-01'};
