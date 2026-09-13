@@ -25,7 +25,7 @@ test('all redirect hops count and 429 never retries',async t=>{
  globalThis.fetch=async()=>{calls++;return new Response(null,{status:429,headers:{'retry-after':'30'}});};
  await assert.rejects(a.fetch('https://instacognito.com/media?id=x',{}),/RATE_LIMITED/);await assert.rejects(a.fetch('https://instacognito.com/media?id=x',{}));assert.equal(calls,1);assert.equal(a.data.requests,1);a.close();
 });
-async function browserFixture(t,status=200){
+async function browserFixture(t,status=200,profileDelay=0){
  const chromium=require('playwright').chromium;
  const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/chromium'});t.after(()=>browser.close());
  const contexts=[];let requests=0,preview=0;
@@ -33,7 +33,8 @@ async function browserFixture(t,status=200){
   const u=new URL(route.request().url());if(u.pathname==='/media'){preview++;return route.abort();}
   requests++;
   const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="post-container"></div><script>function show(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@example</span> 1 posts\';document.getElementById("post-container").innerHTML=\'<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>\';}</script>';
-  await route.fulfill({status,contentType:'text/html',body:html});
+  const delayed = profileDelay ? html.replace('document.getElementById("profile-section").innerHTML=', 'setTimeout(()=>document.getElementById("profile-section").innerHTML=').replace(" 1 posts\';document.getElementById", " 1 posts\',"+profileDelay+");document.getElementById") : html;
+  await route.fulfill({status,contentType:'text/html',body:delayed});
  });return c;},close:async()=>{}};
  return {chromium:{launch:async()=>wrap,connectOverCDP:async()=>wrap},counts:()=>({requests,preview}),dnsLookup:async()=>[{address:"93.184.216.34",family:4}],browser};
 }
@@ -62,4 +63,10 @@ test('redirect chain debits each physical HTTP call',async t=>{
  try {globalThis.fetch=async()=>{calls++;return calls===1?new Response(null,{status:302,headers:{location:'https://instacognito.com/media?id=next'}}):new Response(jpg,{headers:{'content-type':'image/jpeg'}});};
  const response=await F.fetchWithValidatedRedirects('https://instacognito.com/media?id=chain',{fetchImpl:b.fetch,remainingMs:1000,dnsLookup:async()=>[{address:'93.184.216.34',family:4}]});assert.equal(response.status,200);assert.equal(calls,2);assert.equal(b.data.requests,2);
  }finally{globalThis.fetch=original;b.close();}
+});
+
+test('profile metadata arriving after eight seconds is awaited, not retried or falsely completed',async t=>{
+ const root=await tmp(t),fixture=await browserFixture(t,200,9000);
+ const result=await W.syncWindow({handles:[{handle:'example',dateAfter:'2099-01-01'}],runId:'slow',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true,maxTimeMs:20000},fixture);
+ assert.equal(result.status,'COMPLETE',JSON.stringify(result));assert.equal(result.handles.example.observedCards,1);assert.equal(result.totals.downloaded,0);
 });

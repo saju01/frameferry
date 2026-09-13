@@ -52,8 +52,8 @@ async function discover(page,handle,budget,deadline,maxCards){
  await installGuards(page,budget);budget.assert();
  await page.goto(F.PROVIDER_PHOTO_URL,{waitUntil:'domcontentloaded'});budget.assert();
  await page.fill('input#search-input',handle);await page.click('button#download-btn');
- const ready=await F.waitForProfileReady(page,handle,{started:Date.now(),maxTimeMs:Math.max(1,deadline-Date.now())});
- budget.assert();if(!ready.ready||ready.blocked)throw new F.ArchiveError('PROFILE_NOT_READY','requested public profile not ready');
+ const ready=await F.waitForProfileReady(page,handle,{started:Date.now(),maxTimeMs:Math.max(1,deadline-Date.now()),waitMs:Math.min(30000,Math.max(1,deadline-Date.now()))});
+ budget.assert();if(!ready.ready||ready.blocked)throw new F.ArchiveError('PROFILE_NOT_READY','requested public profile not ready: '+JSON.stringify(ready));
  const end=Math.min(deadline,Date.now()+45000);let last=null;
  while(Date.now()<end){
   budget.assert();const raw=await F.readRawCardsFromPage(page);
