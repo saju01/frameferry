@@ -163,7 +163,7 @@ test('real browser witness match succeeds and composition rechecks policy and ob
  const d=await W.syncWindow(cfg,fixture);assert.equal(d.status,'COMPLETE',JSON.stringify(d));assert.equal(d.handles.example.coverage.satisfied,true);assert.equal(d.handles.example.coverage.fullFeedComplete,false);
  const combined=await W.combineWindowResults({...cfg,runId:'combined',resultFile:path.join(root,'combined.json')},[cfg.resultFile]);assert.equal(combined.status,'COMPLETE');
  delete d.handles.example.coverage;await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'legacy',resultFile:path.join(root,'legacy.json')},[cfg.resultFile]),/known-post evidence/);
- d.handles.example.coverage=combined.handles.example.coverage;d.handles.example.observations[0].shortcode='OTHER';await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'missing',resultFile:path.join(root,'missing.json')},[cfg.resultFile]),/known-post evidence|witness observation\/receipt mismatch/);
+ d.handles.example.coverage=combined.handles.example.coverage;d.handles.example.observations[0].shortcode='OTHER';await fs.writeFile(cfg.resultFile,JSON.stringify(d));await assert.rejects(W.combineWindowResults({...cfg,runId:'missing',resultFile:path.join(root,'missing.json')},[cfg.resultFile]),/witness observation\/receipt mismatch/);
 });
 
 test('pure destination validator recomputes date provenance even with coherent forged coverage',()=>{
