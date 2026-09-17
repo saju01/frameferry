@@ -2,7 +2,18 @@
 
 ## Unreleased
 
-- Add opt-in `sync-window --config` for bounded, receipt-only current-visible-post jobs, without claiming full-history completion.
+- Complete the bounded incremental-job contract for `sync-window`: per-handle
+  entries are restricted to exactly five fields (`handle`, `dateAfter`,
+  `expectedPosts`, `accessRequired`, `eligibility`) with job-wide policy and
+  bounds rejected on a handle; configuration errors are typed (`BAD_ARGS`,
+  `BAD_CDP`, `DATE_POLICY`) instead of raw platform errors; window readiness now
+  requires positive settled evidence (profile match, reported total, POSTS
+  category, no challenge/refusal, browser open, provider requests settled)
+  rather than a merely stable DOM; the job deadline bounds request admission
+  end-to-end; `resultParts` composition binds each projected file to its
+  immutable on-disk receipt field-for-field; and cached receipt reuse is as
+  strict as the core downloader's own identity gate. This does not change
+  live media transport, full-feed coverage, or history coverage.
 - Share paced request accounting across discovery and download, with sticky provider-denial stops. Do not import signed-account 120/140 quotas into the public provider; retain optional per-job bounds and resource limits.
 - Carry explicit source-observation date estimates for incremental destination adapters while leaving raw archive date semantics unchanged.
 - Reuse FrameFerry DOM extraction, fingerprint identities, downloader and byte-verified receipts; never infer legacy carousel aliases.

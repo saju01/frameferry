@@ -2679,6 +2679,11 @@ module.exports = {
   fetchWithValidatedRedirects,
   streamResponseToPart,
   verifyReceipt,
+  // The downloader's own identity gate, shared so that every reuse path (including
+  // the incremental sync window) is at least as strict as downloadOne's.
+  receiptMatchesIdentity,
+  receiptStableId,
+  receiptCategory,
   downloadOne,
   decideOutcome,
   archiveProfile,

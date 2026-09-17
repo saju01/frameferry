@@ -6,7 +6,9 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
   if (typeof observedAt !== 'string' || !/(Z|[+-][0-9]{2}:[0-9]{2})$/.test(observedAt)) throw new Error('timezone-bearing observation timestamp required');
   const observed=new Date(observedAt);
   if(!Number.isFinite(observed.getTime()))throw new Error('invalid observation timestamp');
-  const AMS_FMT=new Intl.DateTimeFormat('en-US',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'});
+  // The reporting zone is a caller parameter: diagnostics must name the zone that
+  // was actually used, never a hardcoded one.
+  const DAY_FMT=new Intl.DateTimeFormat('en-US',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'});
   const FUTURE_SKEW_MS=86400000;
   const MON = {
   january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6,
@@ -14,8 +16,8 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
 };
 
 
-  function amsterdamDay(d) {
-  const parts = AMS_FMT.formatToParts(d);
+  function zoneDay(d) {
+  const parts = DAY_FMT.formatToParts(d);
   const get = (t) => (parts.find((p) => p.type === t) || {}).value;
   const y = get('year'), mo = get('month'), day = get('day');
   if (!y || !mo || !day) throw new Error('Intl returned no year/month/day parts');
@@ -49,11 +51,11 @@ function estimateDate(raw, observedAt, timeZone='UTC') {
     }
     let dayLo, dayHi, day;
     try {
-      dayLo = days?.dayLo ?? amsterdamDay(low);
-      dayHi = days?.dayHi ?? amsterdamDay(high);
-      day = days?.day ?? amsterdamDay(d);
+      dayLo = days?.dayLo ?? zoneDay(low);
+      dayHi = days?.dayHi ?? zoneDay(high);
+      day = days?.day ?? zoneDay(d);
     } catch (e) {
-      return { error: `date "${s}" has no resolvable Amsterdam day (${e && e.message})` };
+      return { error: `date "${s}" has no resolvable calendar day in time zone "${timeZone}" (${e && e.message})` };
     }
     return { date: d, basis, raw: s, day, dayLo, dayHi };
   };

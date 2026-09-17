@@ -190,7 +190,70 @@ Example private configuration (keep real handles, paths and scheduling outside t
   success (and cutoffs) must only advance after destination readback succeeds.
 - Browser attachment is optional and explicit loopback-only `attachCdp`. Only the
   command's context/pages are closed. No schedule, credentials, Immich uploader,
-  metadata rewrite or trash restoration is installed by FrameFerry.
+  metadata rewrite or trash restoration is installed by FrameFerry. An absent or
+  `null` `attachCdp` still means "launch locally"; an empty string no longer
+  silently does — a non-loopback or unparseable `attachCdp` is `BAD_CDP`.
+- Per-handle entries accept exactly five fields: `handle`, `dateAfter`,
+  `expectedPosts`, `accessRequired`, `eligibility`. Job policy (`timeZone`,
+  `allowEstimatedDates`), resource bounds and transport are job-wide by design and
+  are rejected if placed on a handle, since a per-handle copy would silently
+  weaken the job's stated policy for one handle. Any other per-handle key is
+  `BAD_ARGS` naming the offending keys.
+- Configuration errors are typed, never raw platform errors: unusable dates, time
+  zones, non-string `output`/`resultFile`/`requestLedger` and malformed handle
+  entries are `BAD_ARGS`. An unusable card date is a typed `DATE_POLICY` that
+  isolates that handle instead of stopping the job.
+- Window readiness requires positive settled evidence, not just a stable DOM: a
+  window is accepted only when the profile matches, a reported total is present,
+  the active category is POSTS, no challenge or access refusal is visible, the
+  browser is open, and provider API requests have settled with none in flight or
+  failed. Empty data with zero API requests is NOT readiness and NOT "nothing
+  new". A `WINDOW_NOT_READY` handle carries a `readiness` diagnostics block (no
+  DOM text, caption, API payload or signed URL) and is isolated to that handle
+  only when that evidence is positively local; otherwise it is a global stop.
+- The job deadline bounds request admission: no provider request is reserved or
+  forwarded after the deadline, browser connect/launch timeouts and poll sleeps
+  are clamped to the remaining budget, and a recorded provider denial keeps
+  precedence over a lapsed deadline.
+- Composition (`resultParts`) binds to the immutable on-disk receipt, not to the
+  result document being composed: each projected file must match the receipt at
+  `receipts/<handle>/<stableId>.json` field-for-field, the part's `runId` must be
+  a safe ID before being republished as `sourceRunId`, an unreadable or
+  unparseable part is a typed `BAD_RESULT`, and a witness whose `sourceObservedAt`
+  is later than the window's `observedAt` is rejected as evidence about that
+  window.
+- Cache reuse is as strict as the core downloader's own identity gate: proved
+  bytes are not proof of identity, so corrupt receipt metadata is rejected even
+  when the hash and filename are unchanged.
+- Handles never attempted after a global stop are `NOT_COMPLETED` with the
+  requested `scope` and `dateAfter`, so the result shape is consistent.
+- Releasing the request-ledger lock is idempotent and best-effort; it can never
+  replace the real run outcome. A genuine cleanup failure is published as
+  `requests.ledgerCleanupError` instead of being thrown or silently dropped.
+
+### Honest limitations
+
+- `COMPLETE` remains **only** the existing current-visible-posts contract. This
+  work makes **no** claim to fix live media transport, full-feed coverage, or
+  history coverage.
+- The scheduled runtime remains pinned to an older revision and its previous
+  Node denial still stands; nothing here changes the deployed scheduled runtime.
+- A robust public browser streaming transport is a **separate future design, not
+  delivered here**. Node's global `fetch` and a buffered `BrowserContext`
+  `APIRequestContext` are NOT proven equivalent; a buffered `context.request`
+  candidate was rejected because it allocates before enforcing byte limits and
+  lacks active abort. A future transport would require streaming with
+  backpressure, cancellation, redirect/request accounting, and privacy and
+  denial tests. None of that exists yet, and no release date is implied.
+- Window stability is keyed on the provider media locator fingerprint, falling
+  back to the raw href when that locator is absent. If the provider ever stops
+  emitting the media id, every render differs and no handle can stabilise; each
+  would fail closed as `WINDOW_NOT_READY` for the full readiness wait. Fail-closed
+  is intended, but the effect is fleet-wide rather than per-handle.
+- A non-denial provider HTTP failure during discovery (for example 503) latches
+  `DISCOVERY_TRANSPORT`, which is a **global** stop reported as `PARTIAL`, not
+  `BLOCKED`. Only real denials (401/403/407/451/429, challenge redirects, content
+  walls) produce `BLOCKED`.
 
 ## Optional Immich export
 

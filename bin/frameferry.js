@@ -35,7 +35,7 @@ function num(opts, key, d) {
   return n;
 }
 function usage(code) {
-  console.log('Usage:\n  frameferry doctor [--attach-cdp http://127.0.0.1:9222]\n  frameferry archive <handle> --output <path> [--mode full|sync] [--categories posts,reels,stories,highlights|all] [--media-types image,video] [--zip <dest.zip>]\n  frameferry export <handle> --output <path> --zip <dest.zip> [--overwrite-zip]\n  frameferry status <handle> --output <path>');
+  console.log('Usage:\n  frameferry doctor [--attach-cdp http://127.0.0.1:9222]\n  frameferry archive <handle> --output <path> [--mode full|sync] [--categories posts,reels,stories,highlights|all] [--media-types image,video] [--zip <dest.zip>]\n  frameferry export <handle> --output <path> --zip <dest.zip> [--overwrite-zip]\n  frameferry status <handle> --output <path>\n  frameferry sync-window --config <path-to-json> (JSON may set resultParts for local-only composition)');
   process.exitCode = code;
 }
 (async () => {
