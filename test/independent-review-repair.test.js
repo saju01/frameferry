@@ -92,10 +92,21 @@ test('a visible provider challenge latches a denial that survives ledger reopen'
  assert.throws(()=>later.reserve('discovery'),e=>e.code==='PROVIDER_DENIED');
  assert.throws(()=>later.assert(),e=>e.code==='PROVIDER_DENIED');
 });
+// An untouched budget proves nothing about classification: this control drives real
+// discovery, spends real reservations, and only then asserts that an ordinary settled
+// observation latched no refusal - here or for any later run on the same ledger.
 test('an ordinary window observation is not a provider refusal',async t=>{
  const f=await windowFixture(t,{challenge:false});
- await f.page.goto(F.PROVIDER_PHOTO_URL,{waitUntil:'domcontentloaded'});
- assert.equal(f.budget.data.denial,null,'an untouched budget must hold no denial');
+ const value=await W.discover(f.page,'example',f.budget,Date.now()+20000,10,8000);
+ assert.equal(value.raw.length,1);
+ assert.ok(f.apiRequests()>=2,'the control must really exercise discovery API traffic');
+ assert.ok(f.budget.data.requests>=3,'an untouched budget cannot validate classification');
+ assert.equal(f.budget.data.denial,null,'an ordinary settled observation must latch no provider refusal');
+ await f.page.close();f.budget.close();
+ const later=openBudget(f.ledger,'next-run');t.after(()=>later.close());
+ assert.equal(later.data.denial,null,'no refusal may survive an ordinary observation');
+ later.reserve('discovery');
+ assert.equal(later.data.requests,1,'a later run must still be admitted after an ordinary observation');
 });
 
 // --- R3: success needs positive settled profile/posts transport evidence --------
@@ -257,22 +268,32 @@ test('malformed handle, policy and path types fail typed before any side effect'
  assert.equal(launches,0);
  assert.equal(fsSync.existsSync(path.join(root,'ledger.json')),false,'no ledger may be created for a rejected configuration');
 });
+// A file-entry case only proves the file guard if the observation it carries is
+// genuinely selected under the job's date policy. Flipping `selected` on an
+// out-of-window card fails DATE_POLICY first and never reaches the guard at all, so the
+// selected cases below use a card the cutoff really admits and demand BAD_RESULT.
 test('null observation and file entries are typed result failures, not TypeErrors',async()=>{
  const at=new Date().toISOString(),spec={handle:'example',dateAfter:'2026-01-01'};
  const id='posts__'+'a'.repeat(64);
  const observation={stableId:id,shortcode:'OLD',category:'posts',selected:false,date:estimateDate('1 January 2025',at,'UTC')};
  const good={status:'COMPLETE',scope:'current-visible-posts',dateAfter:spec.dateAfter,observedAt:at,observedCards:1,selectedCards:0,observations:[observation],files:[],coverage:W.witnessCoverage(spec,[observation])};
  assert.equal(W.validateWitnessWindow(spec,good,{allowEstimatedDates:true}).satisfied,true);
- for(const [label,patch] of [
-  ['null observation',{observations:[null]}],
-  ['array observation',{observations:[[]]}],
-  ['string observation',{observations:['posts']}],
-  ['null file',{observations:[{...observation,selected:true}],selectedCards:1,files:[null]}],
-  ['array file',{observations:[{...observation,selected:true}],selectedCards:1,files:[[]]}]
+ const inWindow={stableId:id,shortcode:'NEW',category:'posts',selected:true,date:estimateDate('1 January 2026',at,'UTC')};
+ assert.equal(inWindow.date.dayHi>=spec.dateAfter,true,'the file-entry fixture must really be selected by the cutoff');
+ const file={stableId:id,shortcode:inWindow.shortcode,profileHandle:spec.handle,date:inWindow.date};
+ const selectedGood={...good,observations:[inWindow],selectedCards:1,files:[file],coverage:W.witnessCoverage(spec,[inWindow])};
+ assert.equal(W.validateWitnessWindow(spec,selectedGood,{allowEstimatedDates:true}).satisfied,true,'the selected baseline must pass date policy and reach the file guard');
+ for(const [label,patch,code] of [
+  ['null observation',{observations:[null]},'BAD_RESULT'],
+  ['array observation',{observations:[[]]},'BAD_RESULT'],
+  ['string observation',{observations:['posts']},'BAD_RESULT'],
+  ['null file',{observations:[inWindow],selectedCards:1,files:[null],coverage:selectedGood.coverage},'BAD_RESULT'],
+  ['array file',{observations:[inWindow],selectedCards:1,files:[[]],coverage:selectedGood.coverage},'BAD_RESULT']
  ]){
   const h={...good,...patch};
   assert.throws(()=>W.validateWitnessWindow(spec,h,{allowEstimatedDates:true}),e=>{
    assert.ok(e instanceof F.ArchiveError,label+' threw an untyped '+e.name+': '+e.message);
+   assert.equal(e.code,code,label+' reported '+e.code+' instead of '+code);
    return true;
   },label);
  }

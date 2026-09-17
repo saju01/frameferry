@@ -1118,18 +1118,43 @@ const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="challenge" i]
 // flight, and whether it came back denied. That is exactly what the pagination stop decision needs:
 // a window with no request at all is not evidence of a terminal boundary, a window whose request
 // was answered is, and a denial must never be retried into.
+// Refusal accounting and positive attribution are deliberately NOT the same scope.
+// Everything the Page emits - child frames included, and traffic left over from a
+// superseded document - keeps counting towards the conservative snapshot below, so a
+// denial is never missed and "something is still moving" is never understated. Only
+// requests the intended MAIN frame issued under the CURRENT generation may positively
+// certify the DOM being read: a generation is retired by a main-frame navigation or by
+// the caller announcing a new search, and a retired generation's requests can never be
+// settled into the new one. Unrelated iframe traffic therefore cannot stand in for the
+// main page's own listing response.
 function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUEST_PATH } = {}) {
   let startedCount = 0, settledCount = 0, failedCount = 0;
   const paths = {};
   let denial = null;
   const pending = new Set();
+  let generationCount = 0;
+  const newGeneration = () => ({ generation: ++generationCount, started: 0, settled: 0, failed: 0, paths: {}, pending: new Set() });
+  let attributed = newGeneration();
+  // A Request whose frame cannot be resolved (a worker, a detached frame) is not
+  // evidence about the main document, so it is never attributed.
+  const isMainFrame = request => {
+    try { return typeof page?.mainFrame === 'function' && request.frame() === page.mainFrame(); } catch { return false; }
+  };
   const wanted = pathname == null ? null : String(pathname).replace(/\/+$/, '');
   const matches = request => {
     try { const u = new URL(request.url()); return u.origin === PROVIDER_ORIGIN && (wanted == null ? u.pathname.startsWith('/api/') : u.pathname.replace(/\/+$/, '') === wanted); } catch { return false; }
   };
-  const onRequest = request => { if (!matches(request)) return; startedCount++; pending.add(request); const pathname = new URL(request.url()).pathname; const label = ['/api/profile','/api/posts','/api/reels','/api/stories','/api/highlights'].includes(pathname) ? pathname : 'other-api'; paths[label] = (paths[label] || 0) + 1; };
-  const onSettled = request => { if (pending.delete(request)) settledCount++; };
-  const onFailed = request => { if (pending.has(request)) failedCount++; onSettled(request); };
+  const onRequest = request => {
+    if (!matches(request)) return;
+    startedCount++; pending.add(request);
+    const pathname = new URL(request.url()).pathname;
+    const label = ['/api/profile','/api/posts','/api/reels','/api/stories','/api/highlights'].includes(pathname) ? pathname : 'other-api';
+    paths[label] = (paths[label] || 0) + 1;
+    if (isMainFrame(request)) { attributed.started++; attributed.pending.add(request); attributed.paths[label] = (attributed.paths[label] || 0) + 1; }
+  };
+  const onSettled = request => { if (pending.delete(request)) settledCount++; if (attributed.pending.delete(request)) attributed.settled++; };
+  const onFailed = request => { if (pending.has(request)) failedCount++; if (attributed.pending.has(request)) attributed.failed++; onSettled(request); };
+  const onFrameNavigated = frame => { try { if (typeof page?.mainFrame === 'function' && frame === page.mainFrame()) attributed = newGeneration(); } catch { /* a page being torn down cannot certify anything */ } };
   const onResponse = response => {
     let request;
     try { request = response.request(); } catch { return; }
@@ -1146,11 +1171,19 @@ function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUES
     page.on('response', onResponse);
     page.on('requestfinished', onSettled);
     page.on('requestfailed', onFailed);
+    try { page.on('framenavigated', onFrameNavigated); } catch { /* stub pages need no navigation events */ }
     attached = true;
   }
   return {
     count: () => startedCount,
     snapshot: () => ({ started: startedCount, settled: settledCount, failed: failedCount, inFlight: pending.size, paths: { ...paths } }),
+    // Positive attribution only: main frame, current generation. Never used for
+    // refusals or for deciding that something is in flight.
+    attributed: () => ({ generation: attributed.generation, started: attributed.started, settled: attributed.settled, failed: attributed.failed, inFlight: attributed.pending.size, paths: { ...attributed.paths } }),
+    generation: () => attributed.generation,
+    // Announce a new search/category interaction: whatever the previous generation
+    // observed stops being evidence about the DOM from here on.
+    beginGeneration: () => { attributed = newGeneration(); return attributed.generation; },
     stop: reason => { denial ||= { reason, kind: 'request-limit', status: null, retryAt: null }; },
     inFlight: () => pending.size,
     denial: () => denial,
@@ -1161,7 +1194,9 @@ function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUES
       page.off('response', onResponse);
       page.off('requestfinished', onSettled);
       page.off('requestfailed', onFailed);
+      try { page.off('framenavigated', onFrameNavigated); } catch { /* symmetric with attach */ }
       pending.clear();
+      attributed.pending.clear();
     }
   };
 }
@@ -1562,18 +1597,33 @@ async function waitForSectionReady(page, category, started, maxTimeMs, continuat
   let deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
   const pending = () => (continuationMonitor?.inFlight?.() || 0) > 0;
   const result = value => ({ ...value, transport: continuationMonitor?.snapshot?.() || null });
+  // A boolean sampled on one side of the read answers only half the question. Sampling
+  // "pending" BEFORE the read catches a response that settles during it; sampling it
+  // AFTER catches one that starts during it; neither sees a response that started AND
+  // finished inside the same read, which leaves the counters moved but both booleans
+  // false. The transport epoch - the started/settled/failed/inFlight counters read as
+  // one value - is what actually says "nothing moved while I was looking".
+  const epoch = () => {
+    const t = typeof continuationMonitor?.snapshot === 'function' ? continuationMonitor.snapshot() : null;
+    if (!t) return 'no-transport-evidence';
+    const n = value => (Number.isFinite(value) ? value : 0);
+    return n(t.started) + '/' + n(t.settled) + '/' + n(t.failed) + '/' + n(t.inFlight);
+  };
   while (Date.now() < deadline && elapsedSince(started) < maxTimeMs) {
     const blocked = await detectContinuationDenial(page, continuationMonitor);
     if (blocked) return result({ kind: 'blocked', blocked });
     // Observe the SAME live request without a search/tab/scroll retry. Settlement
     // receives a bounded render grace; the caller deadline always remains hard.
-    // Sample transport BEFORE reading the DOM. A response that settles while the
-    // error read is in flight would otherwise turn an error observed *during* that
-    // pending response into a terminal answer about it.
-    const inFlight = pending();
-    if (inFlight) deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
+    const beforePending = pending(), beforeEpoch = epoch();
     const err = await extractSectionError(page);
-    if (err && (!inFlight || err.status === 'BLOCKED')) return result({ kind: 'error', ...err });
+    const afterPending = pending(), afterEpoch = epoch();
+    // An ORDINARY terminal classification ("this section has no content") is a claim
+    // about a quiet page: nothing pending on either side of the atomic read, and an
+    // unmoved epoch across it. A positively observed refusal (BLOCKED) is a claim about
+    // the provider and still answers immediately, exactly as a latched denial does.
+    const quiet = !beforePending && !afterPending && beforeEpoch === afterEpoch;
+    if (!quiet) deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
+    if (err && (quiet || err.status === 'BLOCKED')) return result({ kind: 'error', ...err });
     if (category === 'highlights') {
       const count = await page.locator('#highlights-container .highlight').count().catch(() => 0);
       if (count > 0 && !pending()) return result({ kind: 'highlights' });

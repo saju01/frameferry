@@ -40,12 +40,28 @@ function openBudget(file, runId, limit) {
   // cleanup below refuses to unlink anything else. If the owner record cannot be
   // written we never held a usable claim, so the lock WE created is removed here
   // rather than left behind as a stale claim nobody owns.
+  //
+  // But that removal is authorized by PROOF of ownership, never by its absence. When
+  // fstat itself fails there is no acquired identity at all, and "I cannot tell whose
+  // this is" must not become "therefore it is mine to delete": an operator who removed
+  // a presumed stale lock and let a replacement run acquire the ledger would otherwise
+  // have THAT run's lock unlinked by this failed one. An ambiguous pathname is left
+  // exactly where it is and reported, with a closed-vocabulary cleanup verdict and no
+  // path, inode or device in the evidence. This is ordinary best-effort cleanup under a
+  // serialized lock protocol, not a claim of atomicity against hostile replacement.
   try { const stat=fs.fstatSync(fd); lockIdentity={dev:stat.dev,ino:stat.ino}; fs.writeSync(fd,JSON.stringify({pid:process.pid,runId})); }
   catch(e) {
     try{fs.closeSync(fd);}catch(ignored){}
-    try{const stat=fs.lstatSync(lock);if(!lockIdentity||(stat.dev===lockIdentity.dev&&stat.ino===lockIdentity.ino))fs.unlinkSync(lock);}catch(ignored){}
+    let cleanup='unknown-identity-left-in-place';
+    if(lockIdentity){
+      try{
+        const stat=fs.lstatSync(lock);
+        if(stat.dev===lockIdentity.dev&&stat.ino===lockIdentity.ino){fs.unlinkSync(lock);cleanup='removed-own-lock';}
+        else cleanup='replaced-by-another-owner-left-in-place';
+      }catch(err){cleanup=err.code==='ENOENT'?'already-absent':'cleanup-failed';}
+    }
     fd=undefined;
-    throw new ArchiveError('BAD_BUDGET','cannot record request ledger ownership ('+(e.code||e.message)+')');
+    throw new ArchiveError('BAD_BUDGET','cannot record request ledger ownership ('+(e.code||e.message)+')',{cleanup});
   }
   let d,stopped=null,closeError=null,jobDeadline=Infinity;
   // Cleanup is the last thing a run does, from a `finally`: a throw here would

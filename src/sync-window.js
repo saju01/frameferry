@@ -232,6 +232,12 @@ async function installGuards(page,budget,deadline=Infinity){
 // browser never issued a request at all, so cached or hand-served markup could stand
 // in for a live listing. The same profile/posts evidence the local-failure classifier
 // already demands is required before a window can be accepted.
+//
+// It is applied to the ATTRIBUTED transport - the intended main frame, current
+// document and current search generation - because a settled request is only evidence
+// about the DOM it actually rendered into. A child frame's /api/posts or a response
+// belonging to a superseded search says nothing about the listing being read here,
+// while still counting for refusals and for the conservative global accounting.
 function settledWindowTransport(transport){
  if(!transport||typeof transport!=='object')return false;
  if(!Number.isInteger(transport.started)||transport.started<1||transport.started!==transport.settled)return false;
@@ -240,6 +246,25 @@ function settledWindowTransport(transport){
  if(!paths||typeof paths!=='object'||Array.isArray(paths))return false;
  const count=key=>Object.hasOwn(paths,key)&&Number.isInteger(paths[key])?paths[key]:0;
  return count('/api/profile')>=1&&count('/api/posts')>=1;
+}
+// A listing often renders from its response handler, so it can appear slightly AFTER
+// the response settled. Two confirmations are therefore not enough on their own:
+// acceptance also requires the settled epoch to have held quiet for a bounded render
+// grace. The sample interval is deliberately shorter than that grace so a healthy
+// window can actually be confirmed inside the caller's wait rather than expiring one
+// sample short of it - sampling is DOM-local and issues no provider request, so a
+// faster cadence costs no allowance.
+const WINDOW_SAMPLE_INTERVAL_MS=250,WINDOW_SETTLED_GRACE_MS=500;
+// The transport epoch of one instant: which generation is current, plus the attributed
+// and the global counters, read as a single value. Two equal epochs around an awaited
+// DOM read mean nothing started, settled or failed while it was in flight and no
+// navigation or new search replaced the document underneath it - so the bytes that came
+// back describe the same settled state on both sides. Any inequality means the read
+// straddled a transition and the sample is discarded, never reused or down-weighted.
+function observationEpoch(monitor){
+ const a=typeof monitor.attributed==='function'?monitor.attributed():{generation:0,started:0,settled:0,failed:0,inFlight:0};
+ const g=monitor.snapshot();
+ return a.generation+'|'+a.started+'/'+a.settled+'/'+a.failed+'/'+a.inFlight+'|'+g.started+'/'+g.settled+'/'+g.failed+'/'+g.inFlight;
 }
 async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
  // Shorter waits are an injected offline-test seam, never an expanded job budget.
@@ -266,14 +291,25 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
   // run on the same ledger - exactly like an HTTP refusal. An empty or inconclusive
   // section (#error-no-content) is NOT a refusal and never latches one.
   if(d.challenge)throw budget.deny('DENIED_CHALLENGE_DOM');
-  if(['error-private','error-not-found'].includes(d.sectionError))throw budget.deny('DENIED_ACCESS_DOM');
+  if(d.sectionError==='error-private')throw budget.deny('DENIED_ACCESS_DOM');
+  // "This profile does not exist" is the absence of one handle, not the provider
+  // refusing this client: nothing here was authenticated, challenged or walled off. It
+  // still stops this run fail-closed with a truthful cause, but persisting it as a
+  // provider-wide denial would refuse every LATER run ID on the shared ledger on the
+  // strength of one missing handle. fail() still yields to a recorded PROVIDER_DENIED,
+  // so a genuine historical refusal is neither cleared nor downgraded by this.
+  if(d.sectionError==='error-not-found')throw budget.fail('HANDLE_UNAVAILABLE','requested public profile is not available');
   assertTime();
   if(!d.browserOpen)throw new F.ArchiveError('BROWSER_CLOSED','browser closed during window readiness');
  };
  try{
   statuses=await installGuards(page,budget,deadline);assertTime();
   await page.goto(F.PROVIDER_PHOTO_URL,{waitUntil:'domcontentloaded'});assertTime();
-  await page.fill('input#search-input',handle);await page.click('button#download-btn');
+  await page.fill('input#search-input',handle);
+  // Everything the previous document/search observed stops being evidence about the
+  // listing from here on: this search opens a new attribution generation.
+  monitor.beginGeneration?.();
+  await page.click('button#download-btn');
   const ready=await F.waitForProfileReady(page,handle,{started:Date.now(),maxTimeMs:Math.max(1,deadline-Date.now()),waitMs:Math.min(30000,Math.max(1,deadline-Date.now())),continuationMonitor:monitor});
   Object.assign(d,{profileMatched:ready.matched,profileHasTotal:ready.hasTotal});
   await inspect();
@@ -283,25 +319,47 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
   if(ready.blocked)throw budget.deny('DENIED_CHALLENGE_DOM');
   if(!ready.ready)throw new F.ArchiveError('PROFILE_NOT_READY','requested public profile not ready');
   windowStarted=Date.now();d.phase='window';const end=Math.min(deadline,windowStarted+waitMs);
+  // Positive evidence must be settled in the CURRENT generation AND globally quiet:
+  // anything still moving anywhere could be about to redraw the listing being read.
+  const settledNow=()=>{const g=monitor.snapshot();return settledWindowTransport(typeof monitor.attributed==='function'?monitor.attributed():null)&&g.inFlight===0&&g.failed===0;};
+  // `d.stableSamples` stays the plain DOM stability of the reported readiness record.
+  // Acceptance uses a SEPARATE counter, because stability accrued while a response was
+  // pending - or before it settled, or across a navigation or a new search - describes
+  // a listing that the transition may already have replaced. Such stability is reset to
+  // zero rather than carried over, so acceptance always rests on fresh samples taken
+  // after the relevant APIs settled.
+  let settledStable=0,settledSignature=null,settledEpoch=null,settledSince=0;
+  const forgetSettledRun=()=>{settledStable=0;settledSignature=null;settledEpoch=null;settledSince=0;};
   while(Date.now()<end){
+   const beforeEpoch=observationEpoch(monitor);
    await inspect();const raw=await F.readRawCardsFromPage(page);
+   const afterEpoch=observationEpoch(monitor);
    d.samples++;d.rawCount=raw.length;d.maxRawCount=Math.max(d.maxRawCount,raw.length);
    if(raw.length>maxCards)throw new F.ArchiveError('WINDOW_LIMIT','visible window exceeds item bound');
    const signature=windowSignature(raw);
    if(last!==null&&signature!==last)d.signatureChanges++;
    d.stableSamples=raw.length?(signature===last?d.stableSamples+1:1):0;last=signature;
-   if(d.stableSamples>=2){
+   // A usable sample: cards present, the relevant APIs already settled, and the epoch
+   // unmoved across both awaited DOM reads of this sample.
+   const fresh=raw.length>0&&beforeEpoch===afterEpoch&&settledNow();
+   if(!fresh)forgetSettledRun();
+   else if(settledEpoch===afterEpoch&&signature===settledSignature)settledStable++;
+   else {settledStable=1;settledSignature=signature;settledEpoch=afterEpoch;settledSince=Date.now();}
+   if(fresh&&settledStable>=2&&Date.now()-settledSince>=WINDOW_SETTLED_GRACE_MS){
     await inspect();
-    const transport=monitor.snapshot();
-    if(d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError&&settledWindowTransport(transport)){return {raw,observedAt:new Date().toISOString()};}
+    // The accepting checks are themselves an awaited read: the cards may only be
+    // returned if the same settled epoch still holds on the far side of it.
+    if(observationEpoch(monitor)===afterEpoch&&settledNow()&&d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError){return {raw,observedAt:new Date().toISOString()};}
+    forgetSettledRun();
    }
-   await sleep(Math.min(1000,Math.max(1,end-Date.now())));
+   await sleep(Math.min(WINDOW_SAMPLE_INTERVAL_MS,Math.max(1,end-Date.now())));
   }
   await inspect();
-  // A window that held still but never produced settled profile/posts transport is
-  // neither empty nor churning: it is unsettled, and localWindowReadiness refuses to
-  // call that positive handle-local evidence.
-  d.cause=d.maxRawCount===0?'empty':(d.stableSamples>=2&&!settledWindowTransport(monitor.snapshot())?'unsettled':'unstable');
+  // A window that held still but never produced settled, attributed profile/posts
+  // transport is neither empty nor churning: it is unsettled, and localWindowReadiness
+  // refuses to call that positive handle-local evidence - including the empty case,
+  // where unattributed traffic could otherwise have supplied the missing evidence.
+  d.cause=!settledNow()?'unsettled':(d.maxRawCount===0?'empty':'unstable');
   throw new F.ArchiveError('WINDOW_NOT_READY','visible post window readiness expired', {readiness:capture()});
  }catch(e){
   // No DOM text, locator, caption, API payload or signed URL is persisted.
