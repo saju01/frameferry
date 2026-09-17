@@ -14,9 +14,27 @@ function number(n,def,min,max,label){n=n===undefined?def:n;if(!Number.isInteger(
 // weaken the whole job's stated policy for one handle, so it is rejected here and
 // never read from a spec below.
 const HANDLE_SPEC_KEYS=['handle','dateAfter','expectedPosts','accessRequired','eligibility'];
+// A handle is provider-chosen text, and `__proto__`, `constructor` and `toString` are
+// all legal provider handles. Keyed into an ordinary object, `__proto__` runs the
+// prototype setter instead of creating an entry, so the requested handle's result
+// silently disappears - and a job that held it back for access then reported COMPLETE
+// over an empty map. Every per-handle result map is written and read through these
+// three, so an entry is always an OWN property and a lookup never reaches
+// Object.prototype. The maps stay ordinary objects: the result document is JSON that
+// destinations compare field by field, not a null-prototype value.
+const handleMap=()=>({});
+const hasHandle=(map,handle)=>!!map&&typeof map==='object'&&!Array.isArray(map)&&Object.hasOwn(map,handle);
+const readHandle=(map,handle)=>hasHandle(map,handle)?map[handle]:undefined;
+function writeHandle(map,handle,value){
+ Object.defineProperty(map,handle,{value,writable:true,enumerable:true,configurable:true});
+ return value;
+}
 function requiredPathString(config,key){
  const value=config[key];
  if(typeof value!=='string'||!value.trim())throw new F.ArchiveError('BAD_ARGS',key+' must be a non-empty path string');
+ // A NUL byte reaches path.resolve as an untyped platform TypeError, after the
+ // caller has been told its configuration was accepted.
+ if(value.includes('\u0000'))throw new F.ArchiveError('BAD_ARGS',key+' must not contain a NUL byte');
  return value;
 }
 function validate(config){
@@ -27,6 +45,11 @@ function validate(config){
   if(!h||typeof h!=='object'||Array.isArray(h))throw new F.ArchiveError('BAD_ARGS','each handle entry must be an object with an explicit handle and dateAfter');
   const unsupported=Object.keys(h).filter(key=>!HANDLE_SPEC_KEYS.includes(key)).sort();
   if(unsupported.length)throw new F.ArchiveError('BAD_ARGS','unsupported per-handle field(s) '+unsupported.join(', ')+'; job policy and resource bounds are job-wide, not per handle');
+  // validateHandle coerces its argument and returns the normalized value; validate
+  // keeps the caller's own value as the result key, so a non-string that coerces to
+  // an acceptable shape (42, an object with a toString) must be refused here rather
+  // than becoming a handle identity nobody asked for.
+  if(typeof h.handle!=='string')throw new F.ArchiveError('BAD_ARGS','each handle entry must carry an explicit string handle');
   F.validateHandle(h.handle);if(seen.has(h.handle))throw new F.ArchiveError('BAD_ARGS','duplicate handle');seen.add(h.handle);
   // Date.parse rejects an out-of-range calendar field with NaN; the round trip
   // catches a well-formed label that the platform silently rolls over instead.
@@ -47,6 +70,13 @@ function validate(config){
   if(typeof config.timeZone!=='string')throw new F.ArchiveError('BAD_ARGS','timeZone must be a supported IANA time zone name');
   try{new Intl.DateTimeFormat('en-US',{timeZone:config.timeZone});}
   catch(e){throw new F.ArchiveError('BAD_ARGS','timeZone must be a supported IANA time zone name');}
+ }
+ // Job-wide policy and the browser binary are contract, not hints: a non-boolean
+ // estimate policy or an unusable executable must be a typed refusal here, not a
+ // truthiness accident or a launch failure raised from deep inside the browser client.
+ if(config.allowEstimatedDates!==undefined&&typeof config.allowEstimatedDates!=='boolean')throw new F.ArchiveError('BAD_ARGS','allowEstimatedDates must be an explicit boolean when present');
+ if(config.browserExecutable!==undefined&&config.browserExecutable!==null){
+  if(typeof config.browserExecutable!=='string'||!config.browserExecutable.trim()||config.browserExecutable.includes('\u0000'))throw new F.ArchiveError('BAD_ARGS','browserExecutable must be a non-empty path string without a NUL byte');
  }
  return {...config,maxTimeMs:number(config.maxTimeMs,600000,1000,1200000,'maxTimeMs'),maxFileBytes:number(config.maxFileBytes,52428800,1024,268435456,'maxFileBytes'),maxBytes:number(config.maxBytes,1073741824,1024,2147483648,'maxBytes'),maxCards:number(config.maxCards,1000,1,10000,'maxCards')};
 }
@@ -110,6 +140,9 @@ function validateWitnessWindow(spec,h,options={}){
  if(h.status!=='COMPLETE'||h.scope!=='current-visible-posts'||h.dateAfter!==spec.dateAfter||!Number.isFinite(Date.parse(h.observedAt))||!Array.isArray(h.observations)||h.observations.length!==h.observedCards||!Array.isArray(h.files)||h.selectedCards!==h.files.length)throw new F.ArchiveError('BAD_RESULT','incomplete witness window');
  const ids=new Set(),selected=new Map();
  for(const x of h.observations){
+  // A caller-supplied part is evidence, not a trusted structure: a null or array
+  // entry must be "this is not an observation", never an untyped member read.
+  if(!x||typeof x!=='object'||Array.isArray(x))throw new F.ArchiveError('BAD_RESULT','unbound witness observation');
   if(x.category!=='posts'||typeof x.shortcode!=='string'||!/^[A-Za-z0-9_-]{1,64}$/.test(x.shortcode)||!/^posts__[a-f0-9]{64}$/.test(x.stableId)||ids.has(x.stableId))throw new F.ArchiveError('BAD_RESULT','unbound witness observation');ids.add(x.stableId);
   const date=x.date||{},expected=typedEstimateDate(date.raw,h.observedAt,options.timeZone||'UTC','invalid witness date provenance');
   if(Object.keys(expected).some(k=>date[k]!==expected[k])||x.selected!==(expected.dayHi>=spec.dateAfter)||(date.precision==='estimated'&&options.allowEstimatedDates!==true))throw new F.ArchiveError('DATE_POLICY','invalid witness date provenance');
@@ -117,7 +150,9 @@ function validateWitnessWindow(spec,h,options={}){
  }
  if(selected.size!==h.files.length)throw new F.ArchiveError('BAD_RESULT','witness selected/file coverage mismatch');
  const files=new Set();
- for(const f of h.files){const x=selected.get(f.stableId);if(!x||files.has(f.stableId)||f.shortcode!==x.shortcode||f.profileHandle!==spec.handle||JSON.stringify(f.date)!==JSON.stringify(x.date))throw new F.ArchiveError('BAD_RESULT','witness observation/receipt mismatch');files.add(f.stableId);}
+ for(const f of h.files){
+  if(!f||typeof f!=='object'||Array.isArray(f))throw new F.ArchiveError('BAD_RESULT','witness observation/receipt mismatch');
+  const x=selected.get(f.stableId);if(!x||files.has(f.stableId)||f.shortcode!==x.shortcode||f.profileHandle!==spec.handle||JSON.stringify(f.date)!==JSON.stringify(x.date))throw new F.ArchiveError('BAD_RESULT','witness observation/receipt mismatch');files.add(f.stableId);}
  const proof=witnessCoverage(spec,h.observations,h.observedAt);
  if(!proof.satisfied||JSON.stringify(h.coverage)!==JSON.stringify(proof))throw new F.ArchiveError('FEED_COVERAGE_GAP','missing or conflicting known-post evidence');
  return proof;
@@ -182,7 +217,7 @@ async function installGuards(page,budget,deadline=Infinity){
   // Cosmetic previews never leave the browser. Media acquisition uses downloadOne.
   if(['image','media','stylesheet','font'].includes(req.resourceType()))return route.abort('blockedbyclient');
   if(u.origin!==F.PROVIDER_ORIGIN)return route.fallback();
-  try{assertTime();await budget.admit('discovery',deadlineSignal());assertTime();}
+  try{assertTime();await budget.admit('discovery',deadlineSignal(),deadline);assertTime();}
   catch(e){return route.abort('blockedbyclient');}
   return route.fallback();
  });
@@ -191,6 +226,20 @@ async function installGuards(page,budget,deadline=Infinity){
   catch(e){budget.fail(e.code||'PROVIDER_DENIED',e.message);}
  });
  return ()=>({...statuses});
+}
+// A window is a positively SETTLED observation of this profile, not merely a DOM that
+// stopped changing. "Nothing in flight and nothing failed" is also true when the
+// browser never issued a request at all, so cached or hand-served markup could stand
+// in for a live listing. The same profile/posts evidence the local-failure classifier
+// already demands is required before a window can be accepted.
+function settledWindowTransport(transport){
+ if(!transport||typeof transport!=='object')return false;
+ if(!Number.isInteger(transport.started)||transport.started<1||transport.started!==transport.settled)return false;
+ if(transport.failed!==0||transport.inFlight!==0)return false;
+ const paths=transport.paths;
+ if(!paths||typeof paths!=='object'||Array.isArray(paths))return false;
+ const count=key=>Object.hasOwn(paths,key)&&Number.isInteger(paths[key])?paths[key]:0;
+ return count('/api/profile')>=1&&count('/api/posts')>=1;
 }
 async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
  // Shorter waits are an injected offline-test seam, never an expanded job budget.
@@ -211,8 +260,13 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
     challenge:[...document.querySelectorAll(selector)].some(visible),sectionError:['error-private','error-not-found','error-no-content'].find(id=>{const el=document.getElementById(id);return el&&visible(el);})||null};
   },{handle,selector:WINDOW_CHALLENGE_SELECTOR});
   Object.assign(d,{profileMatched:seen.matched,profileHasTotal:F.parseReportedTotal(seen.text)!==null,category:seen.category,challenge:seen.challenge,sectionError:seen.sectionError,browserOpen:!page.isClosed()&&page.context().browser().isConnected()});
-  // Latch DOM refusals just like transport refusals, before any later admission.
-  if(d.challenge||['error-private','error-not-found'].includes(d.sectionError))throw budget.fail('DENIED','provider challenge or access refusal during window readiness');
+  // A visible challenge or access wall is a provider refusal that happens to be
+  // spelled in the DOM. It latches through the ledger's one denial operation, so it
+  // is persisted as structured evidence before this throw and still refuses the next
+  // run on the same ledger - exactly like an HTTP refusal. An empty or inconclusive
+  // section (#error-no-content) is NOT a refusal and never latches one.
+  if(d.challenge)throw budget.deny('DENIED_CHALLENGE_DOM');
+  if(['error-private','error-not-found'].includes(d.sectionError))throw budget.deny('DENIED_ACCESS_DOM');
   assertTime();
   if(!d.browserOpen)throw new F.ArchiveError('BROWSER_CLOSED','browser closed during window readiness');
  };
@@ -223,7 +277,10 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
   const ready=await F.waitForProfileReady(page,handle,{started:Date.now(),maxTimeMs:Math.max(1,deadline-Date.now()),waitMs:Math.min(30000,Math.max(1,deadline-Date.now())),continuationMonitor:monitor});
   Object.assign(d,{profileMatched:ready.matched,profileHasTotal:ready.hasTotal});
   await inspect();
-  if(ready.blocked)throw budget.fail('DENIED','provider blocked profile discovery');
+  // An HTTP refusal seen here was already latched by budget.inspect from the response
+  // handler, and deny() keeps the FIRST denial, so this cannot overwrite it; a purely
+  // visible challenge would otherwise have no durable record at all.
+  if(ready.blocked)throw budget.deny('DENIED_CHALLENGE_DOM');
   if(!ready.ready)throw new F.ArchiveError('PROFILE_NOT_READY','requested public profile not ready');
   windowStarted=Date.now();d.phase='window';const end=Math.min(deadline,windowStarted+waitMs);
   while(Date.now()<end){
@@ -236,11 +293,15 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
    if(d.stableSamples>=2){
     await inspect();
     const transport=monitor.snapshot();
-    if(d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError&&!transport.inFlight&&!transport.failed){return {raw,observedAt:new Date().toISOString()};}
+    if(d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError&&settledWindowTransport(transport)){return {raw,observedAt:new Date().toISOString()};}
    }
    await sleep(Math.min(1000,Math.max(1,end-Date.now())));
   }
-  await inspect();d.cause=d.maxRawCount===0?'empty':'unstable';
+  await inspect();
+  // A window that held still but never produced settled profile/posts transport is
+  // neither empty nor churning: it is unsettled, and localWindowReadiness refuses to
+  // call that positive handle-local evidence.
+  d.cause=d.maxRawCount===0?'empty':(d.stableSamples>=2&&!settledWindowTransport(monitor.snapshot())?'unsettled':'unstable');
   throw new F.ArchiveError('WINDOW_NOT_READY','visible post window readiness expired', {readiness:capture()});
  }catch(e){
   // No DOM text, locator, caption, API payload or signed URL is persisted.
@@ -301,7 +362,9 @@ async function syncWindow(input,deps={}){
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));
  if(await fs.lstat(resultFile).catch(e=>e.code==='ENOENT'?null:Promise.reject(e)))throw new F.ArchiveError('EXISTS','result already exists; use a new run result path');
  const budget=openBudget(config.requestLedger,config.runId,config.maxRequests),deadline=Date.now()+config.maxTimeMs;
- const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,failureIsolation:'handle-local-v1',stoppedGlobally:false,output:root,handles:{},totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};
+ // Media admission shares the job's absolute deadline with discovery admission.
+ budget.setDeadline(deadline);
+ const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,failureIsolation:'handle-local-v1',stoppedGlobally:false,output:root,handles:handleMap(),totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};
  let browser,context,ownsBrowser=false;
  try{
   budget.assert();
@@ -314,7 +377,7 @@ async function syncWindow(input,deps={}){
   context=await browser.newContext({serviceWorkers:'block'});
   for(const spec of config.handles){
    budget.assert();if(Date.now()>=deadline)throw new F.ArchiveError('TIME_LIMIT','job deadline reached');
-   const h=result.handles[spec.handle]={status:'PARTIAL',failed:true,scope:'current-visible-posts',dateAfter:spec.dateAfter,files:[]};
+   const h=writeHandle(result.handles,spec.handle,{status:'PARTIAL',failed:true,scope:'current-visible-posts',dateAfter:spec.dateAfter,files:[]});
    try{
    if(spec.accessRequired==='authenticated-view'){
     Object.assign(h,{accessRequired:spec.accessRequired,observedCards:0,selectedCards:0,observations:[],coverage:witnessCoverage(spec,[])});
@@ -334,7 +397,7 @@ async function syncWindow(input,deps={}){
    }
    const paths=F.profilePaths(root,spec.handle);await F.ensureSafeDir(paths.stateDir,root);
    const files=await F.withLock(paths,config.runId,()=>acquireSelection(rows,paths,spec.handle,config.runId,budget,{...config,deadline,dnsLookup:deps.dnsLookup},result.totals));
-   result.handles[spec.handle]={status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,files};
+   writeHandle(result.handles,spec.handle,{status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,files});
    }catch(e){
     // A sticky budget stop takes precedence over a coincident local parse gap.
     try{budget.assert();}catch(stop){e=stop;}
@@ -347,8 +410,11 @@ async function syncWindow(input,deps={}){
    }
    await F.atomicWriteJson(resultFile+'.progress',result);
   }
-  result.status=Object.values(result.handles).every(h=>h.status==='COMPLETE')?'COMPLETE':'PARTIAL';return result;
- }catch(e){result.stoppedGlobally=true;result.status=budget.data.denial||['DENIED','PROVIDER_DENIED','RATE_LIMITED'].includes(e.code)?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:'global'};for(const h of config.handles)if(!result.handles[h.handle])result.handles[h.handle]={status:'NOT_COMPLETED',failed:true,scope:'current-visible-posts',dateAfter:h.dateAfter,files:[]};return result;}
+  // COMPLETE means EVERY requested handle produced its own COMPLETE entry. Reading
+  // the map's values instead would call a job complete whose requested handle never
+  // made it into the map at all.
+  result.status=config.handles.every(spec=>readHandle(result.handles,spec.handle)?.status==='COMPLETE')?'COMPLETE':'PARTIAL';return result;
+ }catch(e){result.stoppedGlobally=true;result.status=budget.data.denial||['DENIED','PROVIDER_DENIED','RATE_LIMITED'].includes(e.code)?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:'global'};for(const h of config.handles)if(!hasHandle(result.handles,h.handle))writeHandle(result.handles,h.handle,{status:'NOT_COMPLETED',failed:true,scope:'current-visible-posts',dateAfter:h.dateAfter,files:[]});return result;}
  finally{
   if(context)await context.close().catch(()=>{});if(ownsBrowser&&browser)await browser.close().catch(()=>{});
   result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,quotaPolicy:budget.data.quota_policy,minRequestIntervalMs:budget.data.min_request_interval_ms,denial:budget.data.denial};
@@ -387,10 +453,13 @@ async function combineWindowResults(input,sourceFiles){
   if(d.kind!=='frameferry-sync-window'||d.schemaVersion!==1||d.scope!=='current-visible-posts'||d.fullHistoryComplete!==false||typeof d.output!=='string'||path.resolve(d.output)!==root||!['COMPLETE','PARTIAL'].includes(d.status)||d.requests?.denial)throw new F.ArchiveError('BAD_RESULT','incompatible or denied result part');
   parts.push({doc:d,sha256:crypto.createHash('sha256').update(raw).digest('hex'),runId:d.runId});
  }
- const handles={};
+ const handles=handleMap();
  for(const spec of config.handles){
   if(spec.accessRequired!==undefined)throw new F.ArchiveError('ACCESS_REQUIRED','held handle cannot be completed from result parts');
-  const candidates=parts.map(p=>({part:p,value:p.doc.handles?.[spec.handle]})).filter(x=>x.value?.status==='COMPLETE'&&x.value.dateAfter===spec.dateAfter).sort((a,b)=>Date.parse(b.value.observedAt)-Date.parse(a.value.observedAt));
+  // A part document is parsed JSON, so its handle map can carry an own `__proto__`
+  // entry - and a plain lookup on any part would otherwise answer from
+  // Object.prototype for a handle named `constructor` or `toString`.
+  const candidates=parts.map(p=>({part:p,value:readHandle(p.doc.handles,spec.handle)})).filter(x=>x.value?.status==='COMPLETE'&&x.value.dateAfter===spec.dateAfter).sort((a,b)=>Date.parse(b.value.observedAt)-Date.parse(a.value.observedAt));
   const picked=candidates[0];if(!picked)throw new F.ArchiveError('MISSING_WINDOW','no verified window for '+spec.handle);
   const h=picked.value,age=Date.now()-Date.parse(h.observedAt);
   if(!Number.isFinite(age)||age<0||age>15*60000)throw new F.ArchiveError('STALE_WINDOW','window observation is stale');
@@ -411,7 +480,7 @@ async function combineWindowResults(input,sourceFiles){
    if(f.receiptRunId!==receipt.runId)throw new F.ArchiveError('BAD_RECEIPT','result file receiptRunId contradicts the immutable on-disk receipt');
    ids.add(f.stableId);
   }
-  handles[spec.handle]={...h,coverage,eligibility:spec.eligibility||'caller-selected',sourceRunId:picked.part.runId};
+  writeHandle(handles,spec.handle,{...h,coverage,eligibility:spec.eligibility||'caller-selected',sourceRunId:picked.part.runId});
  }
  const d={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,output:root,status:'COMPLETE',handles,totals:{downloaded:0,reused:Object.values(handles).reduce((n,h)=>n+h.files.length,0),bytes:0},composition:{maxObservationAgeMs:900000,additionalProviderRequests:0,sourceResults:parts.map(p=>({runId:p.runId,sha256:p.sha256,status:p.doc.status}))},finishedAt:new Date().toISOString()};
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));await F.atomicWriteJson(resultFile,d);return d;

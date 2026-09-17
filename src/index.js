@@ -1512,20 +1512,36 @@ async function extractReportedTotalFromPage(page, timeoutMs = 2000) {
   const text = await page.locator('#profile-section, [id*=profile], [class*=profile]').first().innerText({ timeout: Math.max(1, timeoutMs) }).catch(() => '');
   return parseReportedTotal(text);
 }
+const SECTION_ERROR_CHECKS = [
+  ['#error-private', 'BLOCKED', 'provider reports private or blocked content'],
+  ['#error-not-found', 'BLOCKED', 'provider reports profile not found'],
+  ['#error-no-content', 'UNAVAILABLE', null]
+];
+// Whether the node is showing and what it says are ONE observation. Asking the page
+// twice - is it visible, then what is its text - lets the provider re-render between
+// the two reads: the second read then waits out the page default timeout (30s in
+// production) on a node that is already gone, and still reports that vanished node
+// as a terminal section error long after the real response landed. That is the
+// readiness race the full suite hit on a pending category response.
 async function extractSectionError(page) {
-  const checks = [
-    ['#error-private', 'BLOCKED', 'provider reports private or blocked content'],
-    ['#error-not-found', 'BLOCKED', 'provider reports profile not found'],
-    ['#error-no-content', 'UNAVAILABLE', null]
-  ];
-  for (const [selector, status, defaultReason] of checks) {
-    const locator = page.locator(selector).first();
-    const visible = await locator.isVisible().catch(() => false);
-    if (!visible) continue;
-    const text = await locator.innerText().catch(() => '');
-    return { status, reason: text.trim() || defaultReason || selector };
-  }
-  return null;
+  const seen = await page.evaluate(selectors => {
+    const visible = el => {
+      const style = el.ownerDocument.defaultView.getComputedStyle(el);
+      if (style.visibility === 'hidden' || style.display === 'none') return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (el && visible(el)) return { selector, text: String(el.innerText || el.textContent || '') };
+    }
+    return null;
+  }, SECTION_ERROR_CHECKS.map(([selector]) => selector)).catch(() => null);
+  if (!seen) return null;
+  const check = SECTION_ERROR_CHECKS.find(([selector]) => selector === seen.selector);
+  if (!check) return null;
+  const [selector, status, defaultReason] = check;
+  return { status, reason: seen.text.trim() || defaultReason || selector };
 }
 async function switchToCategoryTab(page, category, timeoutMs, initialPosts = false) {
   const upper = category.toUpperCase();
@@ -1551,9 +1567,13 @@ async function waitForSectionReady(page, category, started, maxTimeMs, continuat
     if (blocked) return result({ kind: 'blocked', blocked });
     // Observe the SAME live request without a search/tab/scroll retry. Settlement
     // receives a bounded render grace; the caller deadline always remains hard.
-    if (pending()) deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
+    // Sample transport BEFORE reading the DOM. A response that settles while the
+    // error read is in flight would otherwise turn an error observed *during* that
+    // pending response into a terminal answer about it.
+    const inFlight = pending();
+    if (inFlight) deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
     const err = await extractSectionError(page);
-    if (err && (!pending() || err.status === 'BLOCKED')) return result({ kind: 'error', ...err });
+    if (err && (!inFlight || err.status === 'BLOCKED')) return result({ kind: 'error', ...err });
     if (category === 'highlights') {
       const count = await page.locator('#highlights-container .highlight').count().catch(() => 0);
       if (count > 0 && !pending()) return result({ kind: 'highlights' });
@@ -2712,6 +2732,6 @@ module.exports = {
   evaluateOwnerRecord,
   discoveryCoverageSatisfied,
   parseCategories,
-  parseMediaTypes, elapsedSince, providerMediaFingerprint, providerMediaIdentity, switchToCategoryTab, waitForSectionReady, discovery,
+  parseMediaTypes, elapsedSince, providerMediaFingerprint, providerMediaIdentity, switchToCategoryTab, waitForSectionReady, extractSectionError, discovery,
   sanitizeFailedItem,
 };

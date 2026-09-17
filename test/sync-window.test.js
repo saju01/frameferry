@@ -27,18 +27,32 @@ test('all redirect hops count and 429 never retries',async t=>{
  globalThis.fetch=async()=>{calls++;return new Response(null,{status:429,headers:{'retry-after':'30'}});};
  await assert.rejects(a.fetch('https://instacognito.com/media?id=x',{}),/RATE_LIMITED/);await assert.rejects(a.fetch('https://instacognito.com/media?id=x',{}));assert.equal(calls,1);assert.equal(a.data.requests,1);a.close();
 });
+// The real provider page renders its profile metadata and its post cards from
+// responses to browser-issued /api/profile and /api/posts requests. A fixture that
+// paints both straight out of the document asserts a readiness contract no real
+// observation can satisfy - which is exactly how a window with zero API transport
+// used to read as a settled observation. `status` still governs the document
+// response, so the denial fixtures keep refusing at the same request.
+const FIXTURE_CARD='<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>';
 async function browserFixture(t,status=200,profileDelay=0){
  const chromium=require('playwright').chromium;
  const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/chromium'});t.after(()=>browser.close());
- const contexts=[];let requests=0,preview=0,browserCloses=0;
+ const contexts=[];let requests=0,apiRequests=0,preview=0,browserCloses=0;
+ const script='var PROFILE_DELAY='+Number(profileDelay)+';'
+  +'function show(){'
+  +'var h=document.getElementById("search-input").value;'
+  +'fetch("/api/profile",{method:"POST"}).then(function(r){return r.json();}).then(function(p){'
+  +'var render=function(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@\'+h+\'</span> \'+p.posts+\' posts\';};'
+  +'if(PROFILE_DELAY>0)setTimeout(render,PROFILE_DELAY);else render();});'
+  +'fetch("/api/posts",{method:"POST"}).then(function(r){return r.json();}).then(function(d){document.getElementById("post-container").innerHTML=d.html;});}';
+ const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><script>'+script+'</script>';
  const wrap={newContext:async opts=>{assert.equal(opts.serviceWorkers,'block');const c=await browser.newContext(opts);contexts.push(c);await c.route('**/*',async route=>{
   const u=new URL(route.request().url());if(u.pathname==='/media'){preview++;return route.abort();}
+  if(u.pathname.startsWith('/api/')){apiRequests++;return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/profile'?'{"posts":1}':JSON.stringify({html:FIXTURE_CARD})});}
   requests++;
-  const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><script>function show(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@example</span> 1 posts\';document.getElementById("post-container").innerHTML=\'<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>\';}</script>';
-  const delayed = profileDelay ? html.replace('document.getElementById("profile-section").innerHTML=', 'setTimeout(()=>document.getElementById("profile-section").innerHTML=').replace(" 1 posts\';document.getElementById", " 1 posts\',"+profileDelay+");document.getElementById") : html;
-  await route.fulfill({status:Array.isArray(status)?status[requests-1]||200:status,contentType:'text/html',body:delayed.replace('@example', "@'+document.getElementById(\"search-input\").value+'")});
+  await route.fulfill({status:Array.isArray(status)?status[requests-1]||200:status,contentType:'text/html',body:html});
  });return c;},close:async()=>{browserCloses++;}};
- return {chromium:{launch:async()=>wrap,connectOverCDP:async()=>wrap},counts:()=>({requests,preview,browserCloses}),dnsLookup:async()=>[{address:"93.184.216.34",family:4}],browser};
+ return {chromium:{launch:async()=>wrap,connectOverCDP:async()=>wrap},counts:()=>({requests,apiRequests,preview,browserCloses}),dnsLookup:async()=>[{address:"93.184.216.34",family:4}],browser};
 }
 test('full browser discovery -> real downloadOne -> receipts; repeat is cache-only, no history claim',async t=>{
  const root=await tmp(t),fixture=await browserFixture(t);let downloads=0;const original=globalThis.fetch;t.after(()=>{globalThis.fetch=original;});globalThis.fetch=async()=>{downloads++;return new Response(jpg,{headers:{'content-type':'image/jpeg','content-length':String(jpg.length)}});};
@@ -204,7 +218,10 @@ test('releasing the ledger lock is idempotent, best-effort and reports a real cl
  const c=openBudget(p,'blocked-unlink');await fs.unlink(lock);await fs.mkdir(lock);
  assert.doesNotThrow(()=>c.close(),'an unremovable lock must not throw out of cleanup either');
  assert.ok(c.cleanupError,'a non-ENOENT cleanup failure must stay visible');
- assert.equal(c.cleanupError.code,'LEDGER_CLEANUP_FAILED');
+ // Something else now occupies the lock path, so this owner refuses to remove it and
+ // says so. It must never be silently swallowed, and it must never be unlinked.
+ assert.equal(c.cleanupError.code,'LEDGER_OWNERSHIP_LOST');
+ assert.equal((await fs.lstat(lock)).isDirectory(),true,'a replacement at the lock path must be left untouched');
  await fs.rmdir(lock);
 });
 
@@ -221,8 +238,8 @@ test('ledger lock cleanup never replaces the real run outcome',async t=>{
  assert.equal(JSON.parse(await fs.readFile(path.join(root,'gone-result.json'))).error.message,gone.error.message);
  const stuck=await run('stuck',async lock=>{await fs.unlink(lock);await fs.mkdir(lock);});
  assert.match(stuck.error.message,/probe launch failure/,'the real failure must still be the reported outcome');
- assert.equal(stuck.requests.ledgerCleanupError.code,'LEDGER_CLEANUP_FAILED','a genuine cleanup failure must be recorded in the result');
- assert.equal(JSON.parse(await fs.readFile(path.join(root,'stuck-result.json'))).requests.ledgerCleanupError.code,'LEDGER_CLEANUP_FAILED');
+ assert.equal(stuck.requests.ledgerCleanupError.code,'LEDGER_OWNERSHIP_LOST','a genuine cleanup problem must be recorded in the result');
+ assert.equal(JSON.parse(await fs.readFile(path.join(root,'stuck-result.json'))).requests.ledgerCleanupError.code,'LEDGER_OWNERSHIP_LOST');
  await fs.rmdir(path.join(root,'stuck-ledger.json.window-lock'));
 });
 
@@ -306,7 +323,10 @@ test('authenticated-view middle hold creates no page or provider/media request a
  fixture.chromium.launch=async()=>{const b=await launch(),nc=b.newContext;b.newContext=async opts=>{const c=await nc(opts),np=c.newPage.bind(c);c.newPage=async()=>{pages++;return np();};return c;};return b;};
  const held={handle:'middle',dateAfter:'2026-09-08',accessRequired:'authenticated-view',expectedPosts:[witness()]};
  const d=await W.syncWindow({handles:[{handle:'alpha',dateAfter:'2020-01-01'},held,{handle:'zulu',dateAfter:'2020-01-01'}],runId:'access-held',output:path.join(root,'out'),requestLedger:path.join(root,'budget.json'),resultFile:path.join(root,'result.json'),allowEstimatedDates:true},fixture);
- assert.equal(d.status,'PARTIAL');assert.equal(d.stoppedGlobally,false);assert.equal(d.handles.alpha.status,'COMPLETE');assert.equal(d.handles.zulu.status,'COMPLETE');assert.equal(d.handles.middle.error.code,'ACCESS_REQUIRED');assert.equal(d.handles.middle.error.scope,'handle');assert.equal(d.handles.middle.failed,true);assert.equal(d.handles.middle.accessRequired,'authenticated-view');assert.deepEqual(d.handles.middle.coverage,W.witnessCoverage(held,[]));assert.deepEqual(d.handles.middle.files,[]);assert.equal(pages,2);assert.equal(fixture.counts().requests,2);assert.equal(downloads,2);assert.equal(d.requests.session,4);
+ assert.equal(d.status,'PARTIAL');assert.equal(d.stoppedGlobally,false);assert.equal(d.handles.alpha.status,'COMPLETE');assert.equal(d.handles.zulu.status,'COMPLETE');assert.equal(d.handles.middle.error.code,'ACCESS_REQUIRED');assert.equal(d.handles.middle.error.scope,'handle');assert.equal(d.handles.middle.failed,true);assert.equal(d.handles.middle.accessRequired,'authenticated-view');assert.deepEqual(d.handles.middle.coverage,W.witnessCoverage(held,[]));assert.deepEqual(d.handles.middle.files,[]);assert.equal(pages,2);assert.equal(fixture.counts().requests,2);assert.equal(downloads,2);
+ // Two observed handles, each one document plus its /api/profile and /api/posts
+ // responses, and two media acquisitions. The held handle still costs nothing.
+ assert.equal(d.requests.session,8);assert.equal(fixture.counts().apiRequests,4);
 });
 test('invalid accessRequired values reject before browser, ledger or network initialization',async t=>{
  const root=await tmp(t);let launches=0;const deps={chromium:{launch:async()=>{launches++;throw Error('must not launch');}}};
