@@ -2495,9 +2495,16 @@ test('P2-9 a provider denial is preserved as evidence and stops the remaining se
     const monitor = lib.attachContinuationRequestMonitor(page);
     try {
       const started = Date.now();
+      // Wait for the refusal to be LATCHED before scanning, so what is under test is "a latched
+      // denial stops everything and keeps its evidence", not a race over exactly which guard
+      // happens to observe it first. A latched refusal now stops the profile wait itself, which
+      // is the earliest and most fail-closed place it can be recorded.
+      const latchBy = Date.now() + 5000;
+      while (!monitor.denial() && Date.now() < latchBy) await new Promise(r => setTimeout(r, 10));
+      assert.equal(monitor.denial()?.status, 429, 'the fixture must really latch the provider refusal');
       const scan = await lib.scanReadyProfilePage(page, { handle: 'denyhandle', maxPages: 3, maxTimeMs: 20000, categories: ['posts', 'reels'], mediaTypes: ['image', 'video'], started, continuationMonitor: monitor });
       const posts = scan.sections.find(s => s.category === 'posts');
-      assert.equal(posts.status, 'PARTIAL');
+      assert.equal(posts.status, 'BLOCKED', 'a refusal latched before any listing was observed is a refusal, not a partial scan');
       // The cause must survive, not be flattened into a generic bounded-limit reason.
       assert.ok(posts.evidence && posts.evidence.blocked, 'the denial must be persisted as section evidence');
       assert.equal(posts.evidence.blocked.status, 429);

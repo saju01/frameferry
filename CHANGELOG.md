@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+- Observe the provider listing response **passively**, at the page's own consumption boundary,
+  and delete the response-stream interposition that preceded it. FrameFerry no longer creates a
+  `Response`, `ReadableStream`, reader, clone, tee or forwarding queue of its own, and no longer
+  reads a body the page has not read: the page keeps the native `Response` itself, with native
+  `clone()` metadata, immutable headers, byte (BYOB) readers, `bodyUsed` and cancellation
+  semantics intact, delivered by a native promise. For a listing request and for an observed
+  `json()`/`text()` call that promise is one *chained* native promise carrying the same value,
+  the same `Response` or the same rejection reason, so a rejection the page drops still reaches
+  the page's own `unhandledrejection` handler on the promise the page holds; no event is
+  dispatched, suppressed or marked handled on the page's behalf. Evidence admission checks every
+  limit before the allocation it guards — a string value or key on its escaped UTF-8 size before
+  it is escaped, and a wide parsed object one key at a time rather than through a complete key
+  list — and refuses an oversized value whole rather than truncating or summarising it. Those
+  bounds are on FrameFerry's own additional work, not on engine-internal enumeration and not on
+  the browser heap. Listing evidence now comes from the page's own `json()`/`text()` completion. Consumption through any other path — `arrayBuffer()`, `blob()`, `formData()`, the
+  raw body stream, a `clone()`, or no consumption at all — is reported truthfully as inconclusive
+  (`WINDOW_NOT_READY` with `unknown-response-evidence`) rather than certified. The withdrawn
+  design's `peakObserverAllocationBytes` "measured high-water mark" is removed rather than
+  restated: the reported counters are admitted UTF-8 bytes, their UTF-16 upper bound, armed
+  observations and refusals, against the configured ceilings.
+
+- Complete the bounded incremental-job contract for `sync-window`: per-handle
+  entries are restricted to exactly five fields (`handle`, `dateAfter`,
+  `expectedPosts`, `accessRequired`, `eligibility`) with job-wide policy and
+  bounds rejected on a handle; configuration errors are typed (`BAD_ARGS`,
+  `BAD_CDP`, `DATE_POLICY`) instead of raw platform errors; window readiness now
+  requires positive settled evidence (profile match, reported total, POSTS
+  category, no challenge/refusal, browser open, provider requests settled)
+  rather than a merely stable DOM; the job deadline bounds request admission
+  end-to-end; `resultParts` composition binds each projected file to its
+  immutable on-disk receipt field-for-field; and cached receipt reuse is as
+  strict as the core downloader's own identity gate. This does not change
+  live media transport, full-feed coverage, or history coverage.
+- Share paced request accounting across discovery and download, with sticky provider-denial stops. Do not import signed-account 120/140 quotas into the public provider; retain optional per-job bounds and resource limits.
+- Carry explicit source-observation date estimates for incremental destination adapters while leaving raw archive date semantics unchanged.
+- Reuse FrameFerry DOM extraction, fingerprint identities, downloader and byte-verified receipts; never infer legacy carousel aliases.
+
 ## 0.2.1 - 2026-09-06
 
 - Identify the pagination sentinel by observing which element the provider's own `IntersectionObserver` watches, instead of assuming the last rendered `.post-card`.

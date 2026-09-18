@@ -135,6 +135,165 @@ Delegation requires OpenClaw's exposed session tools and existing permissions;
 it is instruction-driven, not a CLI-enforced scheduler or automatic model router.
 No model-selection configuration or schedules are installed by this package.
 
+
+## Receipt-only incremental jobs (explicit visible-window scope)
+
+Use `frameferry sync-window --config /private/job.json` to let FrameFerry own discovery,
+cutoff selection, download and receipt verification in scheduled integrations. This
+command is **posts/current-visible-window only**, not full historical coverage.
+The existing `archive` command and its stricter full-archive semantics are unchanged.
+
+Example private configuration (keep real handles, paths and scheduling outside the package):
+
+```json
+{
+  "runId": "2026-01-15T120000-example",
+  "handles": [{"handle": "example", "dateAfter": "2026-01-01"}],
+  "output": "/archives/window-cache",
+  "resultFile": "/archives/runs/example.json",
+  "requestLedger": "/archives/provider-requests.json",
+  "timeZone": "UTC",
+  "allowEstimatedDates": true,
+  "browserExecutable": "/usr/bin/chromium"
+}
+```
+
+- Explicit `dateAfter` is inclusive and selection retains uncertainty overlap.
+  `allowEstimatedDates` opts in to estimates for this command only; raw archive
+  `dateParsed` behavior does not change. Each selected receipt includes the raw
+  label, observed instant, estimated instant, day bounds, timezone and precision.
+- `COMPLETE` means all requested visible windows were read and their selected
+  media verified. Output always has `fullHistoryComplete:false`. A stopped/empty/
+  unreadable window or partial acquisition is nonzero, never a quiet success.
+- There is **no default signed-account-style hourly or per-run request quota**
+  for this public provider. Starts are paced at least 500 ms apart across browser
+  discovery and downloads. Counts remain auditable; an optional `maxRequests`
+  bounds one job only and is not advertised as a provider quota. Default resource
+  bounds remain 1 GiB total download, 50 MiB/file, 10 minutes and 1,000 visible
+  cards/handle. All provider-origin browser requests and download/redirect hops
+  are counted; cosmetic previews, styles and fonts are blocked before sending.
+  Real provider denials (including 429 and its Retry-After evidence) remain
+  sticky across run IDs. Existing accounting/denials are never reset to resume.
+  Stale ledger locks require explicit operator inspection, never automatic reset.
+- Each completed file is a normal verified FrameFerry receipt. Restarts reuse
+  positively bound, rehashed receipts. Old carousel positions and changing locators
+  are not treated as identity aliases. A separate window cache keeps an unfinished
+  full-history archive's outstanding work intact; the command never marks it complete.
+- Optional `resultParts` lists recent FrameFerry result files for local-only composition.
+  Every requested handle must have a matching completed window no older than 15 minutes;
+  policy, cutoff, identity and file bytes are revalidated. Missing/stale/denied
+  parts fail closed. The new result records source hashes and makes zero provider
+  requests; original partial results and their failure status remain untouched.
+- The result contains receipt paths/hashes and date provenance, not signed media
+  locators. A destination adapter must validate the run, complete selected scope,
+  handle coverage, path confinement and hashes before importing. Destination
+  success (and cutoffs) must only advance after destination readback succeeds.
+- Browser attachment is optional and explicit loopback-only `attachCdp`. Only the
+  command's context/pages are closed. No schedule, credentials, Immich uploader,
+  metadata rewrite or trash restoration is installed by FrameFerry. An absent or
+  `null` `attachCdp` still means "launch locally"; an empty string no longer
+  silently does — a non-loopback or unparseable `attachCdp` is `BAD_CDP`.
+- Per-handle entries accept exactly five fields: `handle`, `dateAfter`,
+  `expectedPosts`, `accessRequired`, `eligibility`. Job policy (`timeZone`,
+  `allowEstimatedDates`), resource bounds and transport are job-wide by design and
+  are rejected if placed on a handle, since a per-handle copy would silently
+  weaken the job's stated policy for one handle. Any other per-handle key is
+  `BAD_ARGS` naming the offending keys.
+- Configuration errors are typed, never raw platform errors: unusable dates, time
+  zones, non-string `output`/`resultFile`/`requestLedger` and malformed handle
+  entries are `BAD_ARGS`. An unusable card date is a typed `DATE_POLICY` that
+  isolates that handle instead of stopping the job.
+- Window readiness requires positive settled evidence, not just a stable DOM: a
+  window is accepted only when the profile matches, a reported total is present,
+  the active category is POSTS, no challenge or access refusal is visible, the
+  browser is open, and provider API requests have settled with none in flight or
+  failed. Empty data with zero API requests is NOT readiness and NOT "nothing
+  new". A `WINDOW_NOT_READY` handle carries a `readiness` diagnostics block (no
+  DOM text, caption, API payload or signed URL) and is isolated to that handle
+  only when that evidence is positively local; otherwise it is a global stop.
+- The job deadline bounds request admission: no provider request is reserved or
+  forwarded after the deadline, browser connect/launch timeouts and poll sleeps
+  are clamped to the remaining budget, and a recorded provider denial keeps
+  precedence over a lapsed deadline.
+- Composition (`resultParts`) binds to the immutable on-disk receipt, not to the
+  result document being composed: each projected file must match the receipt at
+  `receipts/<handle>/<stableId>.json` field-for-field, the part's `runId` must be
+  a safe ID before being republished as `sourceRunId`, an unreadable or
+  unparseable part is a typed `BAD_RESULT`, and a witness whose `sourceObservedAt`
+  is later than the window's `observedAt` is rejected as evidence about that
+  window.
+- Cache reuse is as strict as the core downloader's own identity gate: proved
+  bytes are not proof of identity, so corrupt receipt metadata is rejected even
+  when the hash and filename are unchanged.
+- Handles never attempted after a global stop are `NOT_COMPLETED` with the
+  requested `scope` and `dateAfter`, so the result shape is consistent.
+- Releasing the request-ledger lock is idempotent and best-effort; it can never
+  replace the real run outcome. A genuine cleanup failure is published as
+  `requests.ledgerCleanupError` instead of being thrown or silently dropped.
+
+### Window acceptance and listing-response observation
+
+A visible window is accepted as `COMPLETE` only when the rendered cards are bound, tuple for
+tuple and in order, to the provider listing response the page itself received — shortcode, media
+identity, media type and raw date, with carousel children and multiplicity preserved. FrameFerry
+gets those bytes by **passively observing the page's own consumption** of that response.
+
+- **What is observed.** The page-side probe records which listing responses arrived, and hooks
+  `Response.prototype.json` and `Response.prototype.text`. When the page consumes a listing
+  response through either method, FrameFerry looks at the value the page itself asked for, under
+  an admission ceiling, and decodes it outside the page with a closed, strict grammar.
+- **What is *not* observed, and what that means.** Every other path — `arrayBuffer()`, `blob()`,
+  `formData()`, consuming the raw `response.body` stream, consuming a `clone()`, or not consuming
+  the response at all — is **not observed**. Such a window is reported truthfully as
+  **inconclusive** (`WINDOW_NOT_READY`, with a `binding.reason` of `unknown-response-evidence`),
+  never as a completion. Inconclusive is not a failure of the page; it is the absence of the
+  evidence this contract requires.
+- **What FrameFerry never does to get evidence.** It never reads, clones, tees, cancels, locks or
+  disturbs a response body, never creates a `Response`, `ReadableStream`, reader or queue of its
+  own, and never forces the page to consume a body so that observation can succeed. The page
+  receives the native `Response` itself — identity, immutable headers, `clone()` metadata, byte
+  (BYOB) readers, `bodyUsed` and cancellation semantics are the platform's own — carried by a
+  native promise. For a listing request, and for an observed `json()`/`text()` call on a listing
+  response, that promise is one *chained* native promise rather than the platform's own promise
+  object: it settles with the same value, the same `Response` or the same rejection reason, and a
+  rejection the page drops still raises the page's own `unhandledrejection` event, carrying the
+  promise the page itself holds. Nothing is dispatched, suppressed or silently marked handled on
+  the page's behalf.
+- **What it may allocate.** The `text()` path allocates nothing to measure a body; the `json()`
+  path performs one bounded, faithful re-serialization that admits every limit *before* the
+  allocation it guards — a string value or key on its escaped UTF-8 size before it is escaped,
+  and a wide object one key at a time, so no complete key list of an arbitrarily wide parsed
+  object is ever built. An oversized or unrepresentable value is refused whole, never copied,
+  truncated or summarised. What those ceilings bound is FrameFerry's own additional work: its
+  explicit storage, the bytes it emits and the properties it reads. Enumeration the JavaScript
+  engine performs internally for a walk is the platform's own and is **not** claimed to be
+  bounded by them. Retention has its own separate ceiling. No heap high-water mark is claimed or
+  reported.
+
+### Honest limitations
+
+- `COMPLETE` remains **only** the existing current-visible-posts contract. This
+  work makes **no** claim to fix live media transport, full-feed coverage, or
+  history coverage.
+- The scheduled runtime remains pinned to an older revision and its previous
+  Node denial still stands; nothing here changes the deployed scheduled runtime.
+- A robust public browser streaming transport is a **separate future design, not
+  delivered here**. Node's global `fetch` and a buffered `BrowserContext`
+  `APIRequestContext` are NOT proven equivalent; a buffered `context.request`
+  candidate was rejected because it allocates before enforcing byte limits and
+  lacks active abort. A future transport would require streaming with
+  backpressure, cancellation, redirect/request accounting, and privacy and
+  denial tests. None of that exists yet, and no release date is implied.
+- Window stability is keyed on the provider media locator fingerprint, falling
+  back to the raw href when that locator is absent. If the provider ever stops
+  emitting the media id, every render differs and no handle can stabilise; each
+  would fail closed as `WINDOW_NOT_READY` for the full readiness wait. Fail-closed
+  is intended, but the effect is fleet-wide rather than per-handle.
+- A non-denial provider HTTP failure during discovery (for example 503) latches
+  `DISCOVERY_TRANSPORT`, which is a **global** stop reported as `PARTIAL`, not
+  `BLOCKED`. Only real denials (401/403/407/451/429, challenge redirects, content
+  walls) produce `BLOCKED`.
+
 ## Optional Immich export
 
 FrameFerry still writes generic media files and receipts that a future adapter can import elsewhere. It has no Immich dependency and no uploader.
@@ -150,3 +309,21 @@ Archive only public content you have rights or permission to keep, and stay with
 ## Bounded discovery repair
 
 See [bounded discovery and fingerprint identities](references/bounded-discovery.md) for retained UI slices, discovery-only canaries, validated CLI budgets, legacy aliases, crash recovery and explicit operational limits.
+
+### Known-post coverage guard
+
+A successful `sync-window` result means the returned visible window was processed,
+not that the provider feed is current. A profile listing can omit a recent post
+that its direct-link lookup returns. Private callers can supply up to 50
+`expectedPosts` per handle, each with `shortcode`, `category: "posts"`,
+`minDayHi` (calendar date), `source` (`owner-direct-observation` or
+`verified-receipt`), and timezone-bearing `sourceObservedAt`. No source URLs,
+credentials or account lists belong in the public repository.
+
+For witnesses at or after the job cutoff, the current Posts window must contain
+that shortcode with compatible selected date evidence. Missing or conflicting
+witnesses yield `PARTIAL / FEED_COVERAGE_GAP` before that handle's downloads;
+result composition revalidates the exact witness policy and observations too.
+This guard does not add pagination, refresh upstream caches, or discover unknown
+missing post IDs. It intentionally fails closed on a missing first-window witness.
+A witness match is necessary evidence only, never full-feed or full-history proof.
