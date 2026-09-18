@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-18
+
+### Fixed
+
+- Disconnect the Playwright client after an attached-CDP `sync-window` run, so the CLI exits naturally after publishing its receipt. The external browser and its pre-existing contexts remain open.
+- Add real subprocess/CDP lifecycle regression tests alongside the owned-browser control.
+
 ## 0.3.0 - 2026-09-18
 
 - Observe the provider listing response **passively**, at the page's own consumption boundary,

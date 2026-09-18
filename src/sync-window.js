@@ -574,14 +574,14 @@ async function syncWindow(input,deps={}){
  // Media admission shares the job's absolute deadline with discovery admission.
  budget.setDeadline(deadline);
  const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,failureIsolation:'handle-local-v1',stoppedGlobally:false,output:root,handles:handleMap(),totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};
- let browser,context,ownsBrowser=false;
+ let browser,context;
  try{
   budget.assert();
   const chromium=deps.chromium||require('playwright').chromium;
   // A browser handshake is part of the job, not extra to it: never wait past the deadline.
   const browserTimeout=()=>Math.max(1,Math.min(20000,deadline-Date.now()));
   if(config.attachCdp)browser=await chromium.connectOverCDP(config.attachCdp,{timeout:browserTimeout()});
-  else {browser=await chromium.launch({headless:true,executablePath:config.browserExecutable,timeout:browserTimeout()});ownsBrowser=true;}
+  else {browser=await chromium.launch({headless:true,executablePath:config.browserExecutable,timeout:browserTimeout()});}
   // Own isolated context with service workers blocked; close only owned resources.
   context=await browser.newContext({serviceWorkers:'block'});
   for(const spec of config.handles){
@@ -629,7 +629,9 @@ async function syncWindow(input,deps={}){
   result.status=config.handles.every(spec=>readHandle(result.handles,spec.handle)?.status==='COMPLETE')?'COMPLETE':'PARTIAL';return result;
  }catch(e){result.stoppedGlobally=true;result.status=budget.data.denial||['DENIED','PROVIDER_DENIED','RATE_LIMITED'].includes(e.code)?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:'global'};for(const h of config.handles)if(!hasHandle(result.handles,h.handle))writeHandle(result.handles,h.handle,{status:'NOT_COMPLETED',failed:true,scope:'current-visible-posts',dateAfter:h.dateAfter,files:[]});return result;}
  finally{
-  if(context)await context.close().catch(()=>{});if(ownsBrowser&&browser)await browser.close().catch(()=>{});
+  // Close only our context. For connectOverCDP, browser.close() disconnects
+  // Playwright's client transport; it does not terminate the external browser.
+  if(context)await context.close().catch(()=>{});if(browser)await browser.close().catch(()=>{});
   result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,quotaPolicy:budget.data.quota_policy,minRequestIntervalMs:budget.data.min_request_interval_ms,denial:budget.data.denial};
   // Release the ledger lock first: cleanup is best-effort and cannot throw, so a
   // genuine cleanup failure is published as evidence instead of replacing the

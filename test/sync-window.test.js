@@ -65,7 +65,7 @@ test('full browser discovery -> real downloadOne -> receipts; repeat is cache-on
  assert.equal(JSON.stringify(first).includes('/media?id='),false);
  const second=await W.syncWindow({...config,runId:'second',resultFile:path.join(root,'second.json')},fixture);assert.equal(second.status,'COMPLETE');assert.equal(second.totals.reused,1);assert.equal(downloads,1);assert.equal(fixture.browser.isConnected(),true);
  const beforeAttachCloses=fixture.counts().browserCloses;
- const attached=await W.syncWindow({...config,runId:'attached',resultFile:path.join(root,'attached.json'),attachCdp:'http://127.0.0.1:9222'},fixture);assert.equal(attached.status,'COMPLETE');assert.equal(fixture.counts().browserCloses,beforeAttachCloses);
+ const attached=await W.syncWindow({...config,runId:'attached',resultFile:path.join(root,'attached.json'),attachCdp:'http://127.0.0.1:9222'},fixture);assert.equal(attached.status,'COMPLETE');assert.equal(fixture.counts().browserCloses,beforeAttachCloses+1);
 });
 test('browser denial stops before media, publishes non-success result and preserved ledger',async t=>{
  const root=await tmp(t),fixture=await browserFixture(t,403);let downloads=0;const original=globalThis.fetch;t.after(()=>{globalThis.fetch=original;});globalThis.fetch=async()=>{downloads++;throw new Error('unexpected media fetch');};
