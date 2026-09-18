@@ -99,9 +99,18 @@ test('production 45-second local expiry leaves later handle runnable, without la
  const d=await W.syncWindow(f.config,f.deps);assert.equal(d.stoppedGlobally,false,JSON.stringify(d));assert.equal(d.status,'PARTIAL');assert.equal(d.handles.middle.error.scope,'handle');assert.equal(d.handles.middle.readiness.waitMs,45000);assert.ok(d.handles.middle.readiness.elapsedMs>=45000);assert.equal(d.handles.zulu.status,'COMPLETE');assert.equal(f.downloads(),1);
 });
 test('pure local classifier rejects absent, malformed, transport and global deadline evidence',()=>{
- const d={schemaVersion:1,handle:'middle',phase:'window',cause:'empty',profileMatched:true,profileHasTotal:true,category:'POSTS',challenge:false,sectionError:null,browserOpen:true,rawCount:0,maxRawCount:0,samples:45,signatureChanges:0,stableSamples:0,waitMs:45000,elapsedMs:45000,deadlineRemainingMs:5000,transport:{started:2,settled:2,failed:0,inFlight:0,paths:{'/api/posts':1,'/api/profile':1},statuses:{200:3}}};
+ // `binding` is part of the readiness record under the render-binding contract: an empty window
+ // attempted no binding, so its record carries null, and an unbound/unrendered window is never
+ // positive local evidence at all.
+ const d={schemaVersion:1,handle:'middle',phase:'window',cause:'empty',profileMatched:true,profileHasTotal:true,category:'POSTS',challenge:false,sectionError:null,browserOpen:true,rawCount:0,maxRawCount:0,samples:45,signatureChanges:0,stableSamples:0,binding:null,waitMs:45000,elapsedMs:45000,deadlineRemainingMs:5000,transport:{started:2,settled:2,failed:0,inFlight:0,paths:{'/api/posts':1,'/api/profile':1},statuses:{200:3}}};
  assert.equal(W.localWindowReadiness(d),true);
- for(const value of [null,{},[],{...d,transport:{...d.transport,started:0,settled:0,paths:{}}},{...d,transport:{...d.transport,paths:{'/api/posts':2}}},{...d,transport:{...d.transport,paths:{'/api/profile':2}}},{...d,transport:{...d.transport,started:3,settled:3}},{...d,deadlineRemainingMs:0},{...d,elapsedMs:44999},{...d,waitMs:45001},{...d,challenge:true},{...d,browserOpen:false},{...d,samples:0},{...d,rawCount:1},{...d,stableSamples:2},{...d,profileMatched:false},{...d,transport:{...d.transport,failed:1}},{...d,transport:{...d.transport,statuses:{403:1}}},{...d,transport:{...d.transport,statuses:{429:1}}},{...d,transport:{...d.transport,statuses:{503:1}}}])assert.equal(W.localWindowReadiness(value),false,JSON.stringify(value));
+ const bound={basis:'response-identity',reason:null,responseIdentities:{media:1,shortcodes:1},missingIdentities:{media:0,shortcodes:0},unidentifiedCards:null,commitGen:2,identityGen:1,listingIssueGen:null};
+ assert.equal(W.localWindowReadiness({...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:bound}),true);
+ for(const value of [null,{},[],{...d,binding:undefined},{...d,binding:{}},{...d,binding:bound},
+  {...d,cause:'unbound',binding:null},{...d,cause:'unrendered',binding:null},
+  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,basis:null}},
+  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,reason:'unrendered-response-identity'}},
+  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,commitGen:-1}},{...d,transport:{...d.transport,started:0,settled:0,paths:{}}},{...d,transport:{...d.transport,paths:{'/api/posts':2}}},{...d,transport:{...d.transport,paths:{'/api/profile':2}}},{...d,transport:{...d.transport,started:3,settled:3}},{...d,deadlineRemainingMs:0},{...d,elapsedMs:44999},{...d,waitMs:45001},{...d,challenge:true},{...d,browserOpen:false},{...d,samples:0},{...d,rawCount:1},{...d,stableSamples:2},{...d,profileMatched:false},{...d,transport:{...d.transport,failed:1}},{...d,transport:{...d.transport,statuses:{403:1}}},{...d,transport:{...d.transport,statuses:{429:1}}},{...d,transport:{...d.transport,statuses:{503:1}}}])assert.equal(W.localWindowReadiness(value),false,JSON.stringify(value));
 });
 
 test('empty DOM with zero API requests cannot supply positive local readiness evidence',async t=>{

@@ -1110,8 +1110,230 @@ async function installPaginationSentinelProbe(page) {
     return true;
   }, PAGINATION_SENTINEL_ATTR);
 }
+// ---------------------------------------------------------------------------------------
+// Render observation: the third channel of the readiness contract (see
+// .review-evidence/readiness-contract-design.md). A settled endpoint says the bytes came
+// back; it does not say the page has committed them. This probe observes, INSIDE the page
+// and without issuing anything:
+//   commitGen    - every commit into #post-container, whether or not it changed anything
+//   identityGen  - only the commits that changed selection-relevant identity, so a benign
+//                  engagement/caption/signed-URL rotation cannot invalidate a snapshot
+//   requests     - the commitGen in effect when the page ISSUED each provider API request
+// `window.fetch`/`XMLHttpRequest` are wrapped to read the URL and hand the call straight
+// through; no request is created, delayed or modified. Bounded: 4096 cards, 256 request
+// records; either ceiling sets `overflow`, which the caller treats as inconclusive.
+const RENDER_OBSERVATION_KEY = '__ffWindowObservation';
+const RENDER_OBSERVATION_SOURCE = `(() => {
+  const KEY = '__ffWindowObservation';
+  if (window[KEY] && window[KEY].version === 1) return;
+  const MAX_CARDS = 4096, MAX_REQUESTS = 256;
+  const state = { version: 1, token: String(Date.now()) + '-' + Math.random().toString(36).slice(2),
+    generation: 0, commitGen: 0, listingCommitGen: 0, identityGen: 0, requests: [], counts: {}, overflow: null, signature: null };
+  const cards = () => [...document.querySelectorAll('#post-container .post-card')];
+  const identity = card => {
+    const anchor = card.querySelector('.content-download-btn[href]');
+    let locator = anchor ? anchor.href : '';
+    try {
+      const u = new URL(locator, location.href), ids = u.searchParams.getAll('id');
+      if (u.protocol === 'https:' && u.hostname === 'instacognito.com' && !u.port && u.pathname === '/media' && !u.hash && ids.length === 1) locator = '/media?id=' + ids[0];
+    } catch (e) { /* an unparseable locator stays itself and is never collapsed into another card */ }
+    const likes = card.querySelector('.likes-trigger'), comments = card.querySelector('.comments-trigger');
+    const marked = card.querySelector('[data-id]');
+    const media = card.querySelector('.post-image, .story-image');
+    const group = [...card.querySelectorAll('.post-footer .icon-group')].at(-1);
+    const span = group ? group.querySelector('span') : null;
+    return [
+      (likes && likes.getAttribute('data-id')) || (comments && comments.getAttribute('data-id')) || (marked && marked.getAttribute('data-id')) || '',
+      locator,
+      (media && media.getAttribute('data-type')) || 'unknown',
+      group ? String((span ? span.textContent : group.textContent) || '').trim() : null
+    ];
+  };
+  const signature = () => {
+    const list = cards();
+    if (list.length > MAX_CARDS) { state.overflow = 'listing-exceeds-observation-bound'; return state.signature; }
+    return JSON.stringify(list.map(identity));
+  };
+  const touches = record => {
+    const node = record.target && record.target.nodeType === 1 ? record.target : (record.target ? record.target.parentElement : null);
+    if (node && node.closest && node.closest('#post-container')) return true;
+    return [...record.addedNodes, ...record.removedNodes].some(n => n.nodeType === 1 && (n.id === 'post-container' || (n.querySelector && n.querySelector('#post-container'))));
+  };
+  // A LISTING commit is the container or its cards being added or removed - the page painting a
+  // listing. An engagement counter ticking, a caption changing or a signed URL rotating is a
+  // commit into the container but paints no listing, and must never be able to stand in for one.
+  const structural = record => record.type === 'childList' && [...record.addedNodes, ...record.removedNodes].some(n => n.nodeType === 1
+    && ((n.matches && (n.matches('.post-card') || n.id === 'post-container')) || (n.querySelector && n.querySelector('.post-card, #post-container'))));
+  const commit = records => {
+    const relevant = records.filter(touches);
+    if (!relevant.length) return;
+    state.commitGen++;
+    if (relevant.some(structural)) state.listingCommitGen++;
+    const next = signature();
+    if (next !== state.signature) { state.signature = next; state.identityGen++; }
+  };
+  const observer = new MutationObserver(commit);
+  observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
+  // MutationObserver callbacks are delivered at the microtask checkpoint, so a commit made
+  // earlier in the SAME task is still undelivered when that task goes on to issue a request.
+  // Every ordering decision therefore drains the queue synchronously first: a listing painted
+  // before fetch() was called must never look like one painted after it.
+  const flush = () => commit(observer.takeRecords());
+  const record = url => {
+    try {
+      flush();
+      const u = new URL(String(url), location.href);
+      if (u.origin !== location.origin || !u.pathname.startsWith('/api/')) return;
+      if (state.requests.length >= MAX_REQUESTS) { state.overflow = 'request-observation-overflow'; return; }
+      state.counts[u.pathname] = (state.counts[u.pathname] || 0) + 1;
+      state.requests.push({ path: u.pathname, commitGen: state.commitGen, listingCommitGen: state.listingCommitGen, generation: state.generation });
+    } catch (e) { state.overflow = 'unreadable-request-observation'; }
+  };
+  const fetchImpl = window.fetch;
+  if (typeof fetchImpl === 'function') window.fetch = function (input) {
+    try { record(input && typeof input === 'object' ? input.url : input); } catch (e) { state.overflow = 'unreadable-request-observation'; }
+    return fetchImpl.apply(this, arguments);
+  };
+  const xhr = window.XMLHttpRequest;
+  if (xhr && xhr.prototype && typeof xhr.prototype.open === 'function' && typeof xhr.prototype.send === 'function') {
+    const open = xhr.prototype.open, send = xhr.prototype.send;
+    xhr.prototype.open = function (method, url) { try { this.__ffObservedUrl = url; } catch (e) { /* frozen instance */ } return open.apply(this, arguments); };
+    xhr.prototype.send = function () { try { record(this.__ffObservedUrl); } catch (e) { /* unreadable instance */ } return send.apply(this, arguments); };
+  }
+  state.reset = () => { state.generation++; state.requests = []; state.counts = {}; state.overflow = null; };
+  // The per-path counts are COMPLETE for this generation even when the bounded request list is
+  // truncated, so a caller can prove the wrapper saw every request the transport monitor
+  // attributed to this document.
+  state.report = () => (flush(), { token: state.token, generation: state.generation, commitGen: state.commitGen,
+    listingCommitGen: state.listingCommitGen, identityGen: state.identityGen, overflow: state.overflow,
+    counts: { ...state.counts }, requests: state.requests.slice(-64) });
+  state.signature = signature();
+  window[KEY] = state;
+})()`;
+// Installed BEFORE the first navigation so no commit and no request can predate it. A page
+// that cannot be instrumented leaves the observation unavailable, which is inconclusive at
+// the acceptance seam - never an accepted window.
+async function installRenderObservationProbe(page) {
+  if (!page) return false;
+  let installed = false;
+  if (typeof page.addInitScript === 'function') {
+    try { await page.addInitScript({ content: RENDER_OBSERVATION_SOURCE }); installed = true; } catch { /* reported as unavailable */ }
+  }
+  if (typeof page.evaluate === 'function') {
+    try { await page.evaluate(RENDER_OBSERVATION_SOURCE); installed = true; } catch { /* about:blank or a closing page */ }
+  }
+  return installed;
+}
+// A new search retires what the previous generation's requests said about the listing, exactly
+// as it retires the transport attribution generation.
+async function beginRenderObservationGeneration(page) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  return page.evaluate(key => { const state = window[key]; if (!state || typeof state.reset !== 'function') return null; state.reset(); return state.generation; }, RENDER_OBSERVATION_KEY).catch(() => null);
+}
+async function readRenderObservation(page) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  return page.evaluate(key => { const state = window[key]; return state && typeof state.report === 'function' ? state.report() : null; }, RENDER_OBSERVATION_KEY).catch(() => null);
+}
+// ONE round trip for the cards AND the profile/category/challenge/section-error metadata AND
+// the render generations. A transport epoch cannot detect a local-only DOM change, so the
+// accepting read must not be able to straddle one: everything it compares comes from a single
+// evaluation of a single document state.
+// The card mapping below is deliberately identical to readRawCardsFromPage's; Playwright
+// serializes each evaluated function separately, so they cannot share a closure. The
+// "accepting snapshot reads exactly the cards readRawCardsFromPage reads" regression pins
+// them together permanently.
+async function observeWindowSnapshot(page, { handle, selector = CHALLENGE_SELECTOR } = {}) {
+  return page.evaluate(({ handle, selector, key }) => {
+    const visible = el => {
+      const style = el.ownerDocument.defaultView.getComputedStyle(el);
+      if (style.visibility === 'hidden' || style.display === 'none') return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const section = document.querySelector('#profile-section');
+    const name = (section && section.querySelector('.username-text') ? section.querySelector('.username-text').textContent : '') || '';
+    const active = document.querySelector('#menu-wrapper .menu-item.active');
+    const category = active ? active.getAttribute('data-id') : null;
+    const state = window[key];
+    const cards = [...document.querySelectorAll('#post-container .post-card')].map(card => {
+      const media = card.querySelector('.post-image, .story-image');
+      const download = card.querySelector('.content-download-btn[href]');
+      const caption = card.querySelector('.post-content p')?.textContent?.trim() || null;
+      const likesEl = card.querySelector('.likes-trigger');
+      const commentsEl = card.querySelector('.comments-trigger');
+      const dateGroup = [...card.querySelectorAll('.post-footer .icon-group')].at(-1);
+      const dateText = dateGroup?.querySelector('span')?.textContent?.trim() || dateGroup?.textContent?.trim() || null;
+      const shortcode = likesEl?.getAttribute('data-id') || commentsEl?.getAttribute('data-id') || card.querySelector('[data-id]')?.getAttribute('data-id') || '';
+      return {
+        shortcode,
+        mediaType: media?.getAttribute('data-type') || 'unknown',
+        href: download?.href || '',
+        captionTruncated: caption,
+        dateRaw: dateText,
+        likes: likesEl?.querySelector('span')?.textContent?.trim() || null,
+        comments: commentsEl?.querySelector('span')?.textContent?.trim() || null,
+        permalink: null
+      };
+    });
+    return {
+      matched: name.replace(/^@/, '').trim().toLowerCase() === String(handle).toLowerCase(),
+      text: section ? section.innerText : '',
+      category: ['POSTS', 'REELS', 'STORIES', 'HIGHLIGHTS'].includes(category) ? category : null,
+      challenge: [...document.querySelectorAll(selector)].some(visible),
+      sectionError: ['error-private', 'error-not-found', 'error-no-content'].find(id => { const el = document.getElementById(id); return el && visible(el); }) || null,
+      cards,
+      probe: state && typeof state.report === 'function' ? state.report() : null
+    };
+  }, { handle, selector, key: RENDER_OBSERVATION_KEY });
+}
+// Bounded, schema-free identity scan of a response the PAGE already generated. It recognizes
+// only the two provider grammars this codebase already treats as authoritative for rendered
+// markup - the media locator /media?id=<id> and the card attribute data-id="<shortcode>" - so
+// it makes no assumption about the object shape that carries them. No payload schema is
+// invented, and a body that yields nothing recognizable is reported as such rather than being
+// read as "no items". The decoded text is never retained: only fingerprints and shortcodes
+// survive the scan, and only counts reach any persisted record.
+const RESPONSE_MEDIA_TOKEN = /(?:https?:\/\/[A-Za-z0-9.-]{1,253})?\/media\?[^"'\s<>\\]{1,512}/g;
+const RESPONSE_SHORTCODE_TOKEN = /data-id\s*=\s*\\?["']([^"'\\]{1,256})\\?["']/g;
+// "Carries no identity" must be a POSITIVE fact, not the residue of a scan that failed. A body
+// is inert only if it is parseable JSON with no string or number leaf anywhere: {} and
+// {"ok":true} genuinely assert nothing about a listing, while a payload that carries data this
+// scan could not read is unknown evidence and must be reported as such.
+function jsonCarriesNoData(text) {
+  let value;
+  try { value = JSON.parse(text); } catch { return false; }
+  let nodes = 0;
+  const walk = (node, depth) => {
+    if (++nodes > 10000 || depth > 32) return false;
+    if (typeof node === 'string' || typeof node === 'number') return false;
+    if (Array.isArray(node)) return node.every(entry => walk(entry, depth + 1));
+    if (node && typeof node === 'object') return Object.values(node).every(entry => walk(entry, depth + 1));
+    return true;
+  };
+  return walk(value, 0);
+}
+function responseIdentityEvidence(text, maxMatches = 4096) {
+  const media = new Set(), shortcodes = new Set();
+  let matches = 0, overflow = false, unrecognised = false;
+  if (typeof text !== 'string') return { media: [], shortcodes: [], matches: 0, overflow: true, unrecognised: true, inert: false };
+  for (const match of text.matchAll(RESPONSE_MEDIA_TOKEN)) {
+    if (++matches > maxMatches) { overflow = true; break; }
+    const identity = providerMediaIdentity(match[0].startsWith('http') ? match[0] : PROVIDER_ORIGIN + match[0]);
+    // A media locator this codebase cannot reduce to a provider identity - another host, another
+    // scheme, several ids - is evidence that the body DOES carry media the scan cannot bind.
+    if (identity) media.add(sha256(identity)); else unrecognised = true;
+  }
+  if (!overflow) for (const match of text.matchAll(RESPONSE_SHORTCODE_TOKEN)) {
+    if (++matches > maxMatches) { overflow = true; break; }
+    shortcodes.add(match[1]);
+  }
+  const found = media.size > 0 || shortcodes.size > 0;
+  return { media: [...media], shortcodes: [...shortcodes], matches, overflow, unrecognised,
+    inert: !found && !overflow && !unrecognised && jsonCarriesNoData(text) };
+}
 const CONTINUATION_REQUEST_PATH = '/api/posts';
 const CONTINUATION_DENIAL_STATUSES = new Set([401, 403, 429]);
+const LISTING_API_PATHS = new Set(['/api/posts', '/api/reels', '/api/stories', '/api/highlights']);
 const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="challenge" i], iframe[title*="challenge" i], .g-recaptcha, .h-captcha, #challenge-form, #cf-challenge-running, [data-captcha]';
 // The provider continuation is a single POST to /api/posts with no cursor in either direction, so
 // the only thing that can be observed about it is whether it was issued, whether it is still in
@@ -1127,13 +1349,25 @@ const CHALLENGE_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="challenge" i]
 // the caller announcing a new search, and a retired generation's requests can never be
 // settled into the new one. Unrelated iframe traffic therefore cannot stand in for the
 // main page's own listing response.
-function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUEST_PATH } = {}) {
+function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUEST_PATH, responseEvidence = null } = {}) {
   let startedCount = 0, settledCount = 0, failedCount = 0;
   const paths = {};
   let denial = null;
   const pending = new Set();
   let generationCount = 0;
-  const newGeneration = () => ({ generation: ++generationCount, started: 0, settled: 0, failed: 0, paths: {}, pending: new Set() });
+  // Opt-in identity evidence from the bodies the page has ALREADY received. Off by default:
+  // every existing caller keeps exactly the counters it had.
+  const evidence = responseEvidence && typeof responseEvidence === 'object' ? {
+    maxBytes: asPositiveIntOrDefault(responseEvidence.maxBytes, 1048576, 'responseEvidence.maxBytes'),
+    maxMatches: asPositiveIntOrDefault(responseEvidence.maxMatches, 4096, 'responseEvidence.maxMatches'),
+    maxReceipts: asPositiveIntOrDefault(responseEvidence.maxReceipts, 64, 'responseEvidence.maxReceipts'),
+    timeoutMs: asPositiveIntOrDefault(responseEvidence.timeoutMs, 2000, 'responseEvidence.timeoutMs')
+  } : null;
+  const requestGeneration = new WeakMap();
+  // ISSUE order, not response order: which listing request was made last is what decides which
+  // response is the current one, and a response that came back first can belong to either.
+  const requestIssueSeq = new WeakMap();
+  const newGeneration = () => ({ generation: ++generationCount, started: 0, settled: 0, failed: 0, paths: {}, pending: new Set(), receipts: [], receiptByRequest: new Map(), issueSeq: 0, receiptSeq: 0, finishedSeq: 0, overflow: null });
   let attributed = newGeneration();
   // A Request whose frame cannot be resolved (a worker, a detached frame) is not
   // evidence about the main document, so it is never attributed.
@@ -1150,16 +1384,63 @@ function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUES
     const pathname = new URL(request.url()).pathname;
     const label = ['/api/profile','/api/posts','/api/reels','/api/stories','/api/highlights'].includes(pathname) ? pathname : 'other-api';
     paths[label] = (paths[label] || 0) + 1;
-    if (isMainFrame(request)) { attributed.started++; attributed.pending.add(request); attributed.paths[label] = (attributed.paths[label] || 0) + 1; }
+    if (isMainFrame(request)) { attributed.started++; attributed.pending.add(request); attributed.paths[label] = (attributed.paths[label] || 0) + 1; requestGeneration.set(request, attributed); requestIssueSeq.set(request, ++attributed.issueSeq); }
   };
-  const onSettled = request => { if (pending.delete(request)) settledCount++; if (attributed.pending.delete(request)) attributed.settled++; };
+  const onSettled = request => {
+    if (pending.delete(request)) settledCount++;
+    if (attributed.pending.delete(request)) attributed.settled++;
+    // Settlement ORDER within the generation, so a newest-issued listing response that came
+    // back before an older one is visible as ambiguous rather than binding.
+    const generation = requestGeneration.get(request);
+    const receipt = generation ? generation.receiptByRequest.get(request) : null;
+    if (receipt && !receipt.finishSeq) receipt.finishSeq = ++generation.finishedSeq;
+  };
   const onFailed = request => { if (pending.has(request)) failedCount++; if (attributed.pending.has(request)) attributed.failed++; onSettled(request); };
   const onFrameNavigated = frame => { try { if (typeof page?.mainFrame === 'function' && frame === page.mainFrame()) attributed = newGeneration(); } catch { /* a page being torn down cannot certify anything */ } };
+  let detached = false;
+  // Refusal capture stays synchronous here, so a denial latched while a body is still decoding
+  // keeps its precedence; the body read below never gates it.
+  const captureEvidence = (response, request) => {
+    const generation = requestGeneration.get(request);
+    if (!generation || generation !== attributed) return;
+    let pathname = null;
+    try { pathname = new URL(request.url()).pathname; } catch { return; }
+    // Only the LISTING endpoints carry a listing. Reading every /api/* body would let ordinary
+    // profile or telemetry polling exhaust the receipt bound and make the evidence permanently
+    // unavailable for the one response that matters.
+    if (!LISTING_API_PATHS.has(pathname)) return;
+    if (generation.receipts.length >= evidence.maxReceipts) { generation.overflow = 'receipt-observation-overflow'; return; }
+    const receipt = { seq: requestIssueSeq.get(request) || ++generation.receiptSeq, finishSeq: 0, path: pathname, status: response.status(), state: 'reading', media: [], shortcodes: [] };
+    generation.receipts.push(receipt);
+    generation.receiptByRequest.set(request, receipt);
+    let declared = null;
+    try { declared = Number(response.headers()['content-length']); } catch { declared = null; }
+    if (Number.isFinite(declared) && declared > evidence.maxBytes) { receipt.state = 'oversized'; return; }
+    // Bounded asynchronous lifetime: an evidence read that never lands is unknown evidence,
+    // which is inconclusive at the seam, not an accepted window.
+    const timer = setTimeout(() => { if (receipt.state === 'reading') receipt.state = 'unreadable'; }, evidence.timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    Promise.resolve().then(() => response.text()).then(text => {
+      if (detached || receipt.state !== 'reading') return;
+      if (typeof text !== 'string' || Buffer.byteLength(text) > evidence.maxBytes) { receipt.state = 'oversized'; return; }
+      const found = responseIdentityEvidence(text, evidence.maxMatches);
+      receipt.media = found.media;
+      receipt.shortcodes = found.shortcodes;
+      // An unrecognised provider media locator anywhere in the body means the response DOES
+      // carry media this scan cannot bind: unknown evidence, whatever else it also carried.
+      receipt.state = found.overflow ? 'oversized'
+        : found.unrecognised ? 'unrecognised'
+        : (found.media.length || found.shortcodes.length) ? 'read'
+        : found.inert ? 'inert' : 'unrecognised';
+    }).catch(() => { if (receipt.state === 'reading') receipt.state = 'unreadable'; })
+      .finally(() => clearTimeout(timer));
+  };
   const onResponse = response => {
     let request;
     try { request = response.request(); } catch { return; }
     if (!matches(request)) return;
     const status = response.status();
+    if (evidence && !detached) { try { captureEvidence(response, request); } catch { /* evidence is best effort; absence is inconclusive */ } }
     if (!CONTINUATION_DENIAL_STATUSES.has(status) || denial) return;
     let retryAfter = null;
     try { retryAfter = response.headers()['retry-after'] ?? null; } catch { retryAfter = null; }
@@ -1181,6 +1462,9 @@ function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUES
     // refusals or for deciding that something is in flight.
     attributed: () => ({ generation: attributed.generation, started: attributed.started, settled: attributed.settled, failed: attributed.failed, inFlight: attributed.pending.size, paths: { ...attributed.paths } }),
     generation: () => attributed.generation,
+    // Identity evidence for the CURRENT generation only: a retired generation's bodies say
+    // nothing about the document being read now.
+    receipts: () => ({ generation: attributed.generation, overflow: attributed.overflow, list: attributed.receipts.map(r => ({ seq: r.seq, finishSeq: r.finishSeq, path: r.path, status: r.status, state: r.state, media: [...r.media], shortcodes: [...r.shortcodes] })) }),
     // Announce a new search/category interaction: whatever the previous generation
     // observed stops being evidence about the DOM from here on.
     beginGeneration: () => { attributed = newGeneration(); return attributed.generation; },
@@ -1188,6 +1472,7 @@ function attachContinuationRequestMonitor(page, { pathname = CONTINUATION_REQUES
     inFlight: () => pending.size,
     denial: () => denial,
     detach() {
+      detached = true;
       if (!attached) return;
       attached = false;
       page.off('request', onRequest);
@@ -1533,10 +1818,19 @@ async function waitForProfileReady(page, handle, { started, maxTimeMs, continuat
     // depends on. Rendered cards are the initial /api/posts response and are no evidence at all
     // that /api/profile has landed, which is exactly how the blank-profile run passed its check.
     last = { matched: !!wanted && shown === wanted, hasTotal: parseReportedTotal(seen.text) != null };
-    if (last.matched && last.hasTotal) return { ...last, ready: true, blocked: null };
+    if (last.matched && last.hasTotal) {
+      // A refusal that started AND settled inside the profile read moves no boolean sampled
+      // before it, and returning `blocked: null` here is how such a refusal used to disappear.
+      // The profile really did render, so readiness stays truthful; the denial travels WITH it,
+      // and every caller already refuses to go on while one is present - discover fails closed,
+      // and the section loop records the refusal as evidence instead of attempting a tab.
+      const latched = await detectContinuationDenial(page, continuationMonitor);
+      return { ...last, ready: true, blocked: latched || null };
+    }
     await page.waitForTimeout(Math.min(PROFILE_READY_POLL_MS, Math.max(1, deadline - Date.now())));
   }
-  return { ...last, ready: false, blocked: null };
+  const expired = await detectContinuationDenial(page, continuationMonitor);
+  return { ...last, ready: false, blocked: expired || null };
 }
 async function extractProfileFromPage(page, handle) {
   const text = await page.locator('#profile-section').first().innerText({ timeout: 2000 }).catch(() => '');
@@ -1603,11 +1897,31 @@ async function waitForSectionReady(page, category, started, maxTimeMs, continuat
   // finished inside the same read, which leaves the counters moved but both booleans
   // false. The transport epoch - the started/settled/failed/inFlight counters read as
   // one value - is what actually says "nothing moved while I was looking".
+  // Counters alone do not describe the DOCUMENT an observation came from. A real main-frame
+  // navigation retires the document without moving a single counter when neither document
+  // issues an API request, and the retired document's absence then reads as quiet. The epoch
+  // therefore carries the attribution generation and the attributed counters as well, so any
+  // observation that straddles a navigation or a new search generation is discarded.
   const epoch = () => {
     const t = typeof continuationMonitor?.snapshot === 'function' ? continuationMonitor.snapshot() : null;
     if (!t) return 'no-transport-evidence';
     const n = value => (Number.isFinite(value) ? value : 0);
-    return n(t.started) + '/' + n(t.settled) + '/' + n(t.failed) + '/' + n(t.inFlight);
+    const generation = typeof continuationMonitor?.generation === 'function' ? continuationMonitor.generation() : 0;
+    const a = typeof continuationMonitor?.attributed === 'function' ? continuationMonitor.attributed() : null;
+    const attributed = a ? n(a.started) + '/' + n(a.settled) + '/' + n(a.failed) + '/' + n(a.inFlight) : '-';
+    return n(generation) + '|' + attributed + '|' + n(t.started) + '/' + n(t.settled) + '/' + n(t.failed) + '/' + n(t.inFlight);
+  };
+  // Every return of this function passes through here. A positively observed refusal dominates
+  // the answer whether it was latched before the loop, during an awaited DOM read, or between
+  // two reads of the same iteration: no return path may hand back cards, highlights or an
+  // ordinary terminal error once the provider has refused.
+  const settle = async value => {
+    // A latched HTTP refusal AND a challenge that became visible during the read: the codebase
+    // treats both as the provider refusing, so both dominate the return. If the page cannot be
+    // read at all, the latched transport denial still stands.
+    const latched = await detectContinuationDenial(page, continuationMonitor)
+      .catch(() => (typeof continuationMonitor?.denial === 'function' ? continuationMonitor.denial() : null));
+    return latched ? result({ kind: 'blocked', blocked: latched }) : result(value);
   };
   while (Date.now() < deadline && elapsedSince(started) < maxTimeMs) {
     const blocked = await detectContinuationDenial(page, continuationMonitor);
@@ -1623,11 +1937,13 @@ async function waitForSectionReady(page, category, started, maxTimeMs, continuat
     // the provider and still answers immediately, exactly as a latched denial does.
     const quiet = !beforePending && !afterPending && beforeEpoch === afterEpoch;
     if (!quiet) deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
-    if (err && (quiet || err.status === 'BLOCKED')) return result({ kind: 'error', ...err });
+    if (err && (quiet || err.status === 'BLOCKED')) return await settle({ kind: 'error', ...err });
     if (category === 'highlights') {
+      const highlightsEpoch = epoch();
       const count = await page.locator('#highlights-container .highlight').count().catch(() => 0);
-      if (count > 0 && !pending()) return result({ kind: 'highlights' });
+      if (count > 0 && !pending() && epoch() === highlightsEpoch) return await settle({ kind: 'highlights' });
     }
+    const cardsEpoch = epoch();
     const cards = await page.locator('#post-container .post-card').count().catch(() => 0);
     if (cards > 0) {
       const bound = await page.evaluate(category => {
@@ -1638,11 +1954,16 @@ async function waitForSectionReady(page, category, started, maxTimeMs, continuat
         const cards = [...document.querySelectorAll('#post-container .post-card')];
         return cards.length > 0 && cards.every(card => { const oldIndex = transition.cards.indexOf(card); return oldIndex < 0 || (card.querySelector('.content-download-btn')?.href || '') !== transition.hrefs[oldIndex]; });
       }, category);
-      if (bound && !pending()) return result({ kind: 'cards' });
+      // Counting the cards and proving they belong to this category are two awaited reads: the
+      // listing may only be accepted if the epoch held across both of them.
+      if (bound && !pending() && epoch() === cardsEpoch) return await settle({ kind: 'cards' });
     }
+    // A transition during the card reads is the same evidence as one during the error read: the
+    // sample is discarded and the bounded observation window is re-armed rather than burnt.
+    if (epoch() !== cardsEpoch) deadline = Date.now() + Math.min(8000, remainingTimeout(started, maxTimeMs));
     await page.waitForTimeout(Math.min(200, Math.max(1, remainingTimeout(started, maxTimeMs))));
   }
-  return result({ kind: pending() ? 'awaiting-response' : 'missing-observation', deadlineReached: elapsedSince(started) >= maxTimeMs });
+  return await settle({ kind: pending() ? 'awaiting-response' : 'missing-observation', deadlineReached: elapsedSince(started) >= maxTimeMs });
 }
 // The provider re-renders #post-container in place rather than appending forever: the posts trace
 // shows 22 -> 56 -> 83 -> 22 cards across three steps with every request answered 200. Reading the
@@ -1818,19 +2139,30 @@ async function scrapeHighlightsSection(page, { mediaTypes, started, maxTimeMs, o
   const count = await tiles.count().catch(() => 0);
   if (!count) return makeSectionRecord({ category: 'highlights', status: 'UNAVAILABLE', reason: 'provider exposed no highlight groups', tabPresent: true, itemCount: 0, mediaTypeFilterApplied: mediaTypes, evidence: { source: '#highlights-container .highlight' }, items: [] });
   const allItems = [];
+  // A refusal observed anywhere in this loop - including inside the LAST group's readiness,
+  // where there is no next iteration to recover it - must leave the scan holding the blocked
+  // evidence, and must not let an already-extracted batch reach the caller afterwards.
+  const denied = (blocked, stopCause) => makeSectionRecord({ category: 'highlights', status: 'PARTIAL', hitLimit: true, reason: blocked.reason, tabPresent: true, itemCount: allItems.length, mediaTypeFilterApplied: mediaTypes, evidence: { blocked, stopCause, source: '#highlights-container .highlight + #post-container .post-card' }, items: allItems });
   for (let i = 0; i < count; i++) {
     if (elapsedSince(started) >= maxTimeMs) break;
     const blocked = await detectContinuationDenial(page, continuationMonitor);
-    if (blocked) return makeSectionRecord({ category: 'highlights', status: 'PARTIAL', hitLimit: true, reason: blocked.reason, evidence: { blocked, stopCause: 'denied' }, items: allItems });
+    if (blocked) return denied(blocked, 'denied');
     const title = await tiles.nth(i).locator('span').first().innerText().catch(() => '') || 'highlight-' + (i + 1);
     await page.evaluate(() => { const cards = [...document.querySelectorAll('#post-container .post-card')]; window.__ffCategoryTransition = { category: 'stories', parentCategory: 'highlights', cards, hrefs: cards.map(c => c.querySelector('.content-download-btn')?.href || '') }; });
     await tiles.nth(i).click({ timeout: remainingTimeout(started, maxTimeMs) });
     const ready = await waitForSectionReady(page, 'stories', started, maxTimeMs, continuationMonitor);
+    if (ready.kind === 'blocked') return denied(ready.blocked, 'denied-during-group-readiness');
     if (ready.kind !== 'cards') break;
+    const deniedDuringGroup = await detectContinuationDenial(page, continuationMonitor);
+    if (deniedDuringGroup) return denied(deniedDuringGroup, 'denied-during-group-readiness');
     const extracted = await extractItemsFromPage(page, { category: 'highlights', mediaTypes, highlightGroup: title });
+    const deniedBeforeBatch = await detectContinuationDenial(page, continuationMonitor);
+    if (deniedBeforeBatch) return denied(deniedBeforeBatch, 'denied-before-batch');
     allItems.push(...extracted.items);
     if (onDiscoveryBatch) await onDiscoveryBatch({ items: extracted.items, stopCause: 'visible-highlight-group', frontier: { category: 'highlights', pages: i + 1, elapsedMs: elapsedSince(started), lastSettled: true } });
   }
+  const finalDenial = await detectContinuationDenial(page, continuationMonitor);
+  if (finalDenial) return denied(finalDenial, 'denied');
   return makeSectionRecord({ category: 'highlights', status: 'PARTIAL', hitLimit: true, reason: 'visible highlight groups do not prove deep-history traversal', tabPresent: true, itemCount: allItems.length, mediaTypeFilterApplied: mediaTypes, evidence: { source: '#highlights-container .highlight + #post-container .post-card' }, items: allItems });
 }
 async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp, categories = DEFAULT_CATEGORIES, mediaTypes = DEFAULT_MEDIA_TYPES, resumeTargets = null, onDiscoveryBatch = null, slicePages = 12, sliceTimeMs = 180000, maxObservedMedia = 100000, targetAliases = {}, requireTerminal = true, consumeScan = null, stopWhenTargetsObserved = false, targetPosts = [] }) {
@@ -2721,6 +3053,8 @@ async function doctor({ attachCdp } = {}) {
 }
 
 module.exports = {
+  installRenderObservationProbe, beginRenderObservationGeneration, readRenderObservation, observeWindowSnapshot, responseIdentityEvidence,
+
   VERSION,
   PROVIDER_ORIGIN,
   PROVIDER_PHOTO_URL,

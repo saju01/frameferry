@@ -255,6 +255,86 @@ function settledWindowTransport(transport){
 // sample short of it - sampling is DOM-local and issues no provider request, so a
 // faster cadence costs no allowance.
 const WINDOW_SAMPLE_INTERVAL_MS=250,WINDOW_SETTLED_GRACE_MS=500;
+// The listing endpoint whose response the visible category is rendered from.
+const CATEGORY_LISTING_PATH={POSTS:'/api/posts',REELS:'/api/reels',STORIES:'/api/stories',HIGHLIGHTS:'/api/highlights'};
+// Reasons that describe a DOM which is simply not the current response's listing YET. They are
+// honest non-success, and unlike an ambiguous or unknown evidence state they do not invalidate
+// the settled stability run: the page is quiet, so the next sample re-evaluates cheaply.
+const BINDING_NOT_YET=new Set(['unrendered-response-identity','listing-predates-request','response-evidence-pending','listing-exceeds-response-identity']);
+const BINDING_UNRENDERED=new Set(['unrendered-response-identity','listing-predates-request']);
+// Positive evidence that the listing about to be returned belongs to the CURRENT response/render
+// generation - the question a transport epoch cannot answer, because a browser can have decoded
+// the new bytes while still showing the old cards. Exactly two bases may accept:
+//
+//   response-identity  the current generation's listing response carries recognizable provider
+//                      identities, and every one of them is a member of the rendered listing.
+//                      Direction matters: response -> DOM, so an item that has arrived but has
+//                      not rendered is a miss. A response that legitimately repeats the visible
+//                      listing binds it without requiring any change.
+//   request-generation-provenance
+//                      the listing response carries NO recognizable identity (an inert body, or
+//                      a payload shape this scan cannot read). Identity membership is then
+//                      unavailable, so acceptance instead demands positive causal evidence that
+//                      the rendered listing is not the pre-request one: a commit into the listing
+//                      container AFTER the current listing request was issued.
+//
+// Everything else - evidence still decoding, unreadable/oversized/overflowed evidence, an
+// out-of-order settlement, a missing or retired render observation - is inconclusive and returns
+// unbound. Inconclusive never becomes an empty or nothing-new acceptance.
+function bindWindowRender({receipts,probe,cards,category,attributedPaths}){
+ const fail=(reason,extra={})=>({bound:false,basis:null,reason,...extra});
+ const path=CATEGORY_LISTING_PATH[category];
+ if(!path)return fail('unknown-category');
+ if(!probe||probe.overflow)return fail('render-observation-unavailable');
+ if(!receipts||typeof receipts!=='object'||!Array.isArray(receipts.list))return fail('render-observation-unavailable');
+ if(receipts.overflow)return fail('unknown-response-evidence');
+ const listing=receipts.list.filter(r=>r.path===path);
+ if(!listing.length)return fail('no-listing-response');
+ if(listing.some(r=>r.state==='reading'))return fail('response-evidence-pending');
+ // 'read' carries identity; 'inert' positively carries none. Anything else - oversized,
+ // unreadable, or carrying media locators this codebase cannot reduce to a provider identity -
+ // is unknown evidence, and unknown evidence never accepts.
+ if(listing.some(r=>!['read','inert'].includes(r.state)))return fail('unknown-response-evidence');
+ // Issue order decides which response is the current one; a newest-issued response that is not
+ // also the newest-settled leaves which listing the page rendered genuinely ambiguous.
+ const latest=listing.reduce((a,b)=>b.seq>a.seq?b:a);
+ if(listing.some(r=>r.seq<latest.seq&&r.finishSeq>latest.finishSeq))return fail('out-of-order-response');
+ const identities={media:latest.media.length,shortcodes:latest.shortcodes.length};
+ if(latest.state==='read'){
+  // Full membership in BOTH directions for every token class the response actually carries: a
+  // received-but-unrendered item is a miss, and a rendered card the current response does not
+  // identify is not something this window may certify either.
+  const domMedia=new Set(cards.map(c=>F.providerMediaFingerprint(c.href)).filter(Boolean));
+  const domShortcodes=new Set(cards.map(c=>c.shortcode).filter(Boolean));
+  const responseMedia=new Set(latest.media),responseShortcodes=new Set(latest.shortcodes);
+  const missing={media:[...responseMedia].filter(x=>!domMedia.has(x)).length,shortcodes:[...responseShortcodes].filter(x=>!domShortcodes.has(x)).length};
+  const extra={media:identities.media?[...domMedia].filter(x=>!responseMedia.has(x)).length+cards.filter(c=>!F.providerMediaFingerprint(c.href)).length:0,
+   shortcodes:identities.shortcodes?[...domShortcodes].filter(x=>!responseShortcodes.has(x)).length:0};
+  if(missing.media||missing.shortcodes)return fail('unrendered-response-identity',{identities,missing});
+  if(extra.media||extra.shortcodes)return fail('listing-exceeds-response-identity',{identities,missing:{media:0,shortcodes:0},extra});
+  return {bound:true,basis:'response-identity',reason:null,identities,missing:{media:0,shortcodes:0}};
+ }
+ // Inert body: identity membership is unavailable, so acceptance falls back to causal
+ // provenance. Every listing request the transport monitor attributed to this document must
+ // also have been seen at issue time, or the issue point being compared is the wrong one.
+ const issuedHere=(probe.counts||{})[path]||0;
+ if(issuedHere!==((attributedPaths||{})[path]||0))return fail('render-observation-unavailable',{identities});
+ const issued=(probe.requests||[]).filter(r=>r.path===path&&r.generation===probe.generation).at(-1);
+ if(!issued)return fail('render-observation-unavailable',{identities});
+ // A LISTING commit, not merely a mutation: an engagement/caption/signed-URL rotation inside
+ // the container paints no listing and can never satisfy this.
+ if(!(probe.listingCommitGen>issued.listingCommitGen))return fail('listing-predates-request',{identities,listingIssueGen:issued.listingCommitGen});
+ return {bound:true,basis:'request-generation-provenance',reason:null,identities,listingIssueGen:issued.listingCommitGen};
+}
+// Counters only: no locator, caption, payload text or shortcode ever reaches a persisted record.
+function bindingRecord(binding,probe){
+ return {basis:binding.basis??null,reason:binding.reason??null,
+  responseIdentities:binding.identities?{media:binding.identities.media,shortcodes:binding.identities.shortcodes}:null,
+  missingIdentities:binding.missing?{media:binding.missing.media,shortcodes:binding.missing.shortcodes}:null,
+  unidentifiedCards:binding.extra?{media:binding.extra.media,shortcodes:binding.extra.shortcodes}:null,
+  commitGen:probe?probe.commitGen:null,identityGen:probe?probe.identityGen:null,
+  listingIssueGen:Number.isInteger(binding.listingIssueGen)?binding.listingIssueGen:null};
+}
 // The transport epoch of one instant: which generation is current, plus the attributed
 // and the global counters, read as a single value. Two equal epochs around an awaited
 // DOM read mean nothing started, settled or failed while it was in flight and no
@@ -270,20 +350,16 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
  // Shorter waits are an injected offline-test seam, never an expanded job budget.
  waitMs=number(waitMs,45000,1,45000,'readiness wait');
  page.setDefaultTimeout(Math.max(1,Math.min(45000,deadline-Date.now())));
- const monitor=F.attachContinuationRequestMonitor(page,{pathname:null}),started=Date.now();
+ // Bodies the page has already received are inspected for identity evidence; nothing extra is
+ // requested, and the decoded text never outlives the scan.
+ const monitor=F.attachContinuationRequestMonitor(page,{pathname:null,responseEvidence:{maxBytes:1048576,maxMatches:4096,maxReceipts:64,timeoutMs:2000}}),started=Date.now();
  let statuses=()=>({}),windowStarted=null,last=null;
- const d={schemaVersion:1,handle,phase:'profile',cause:null,profileMatched:false,profileHasTotal:false,category:null,challenge:false,sectionError:null,browserOpen:false,rawCount:0,maxRawCount:0,samples:0,signatureChanges:0,stableSamples:0,waitMs,elapsedMs:0,deadlineRemainingMs:0,transport:null};
+ const d={schemaVersion:1,handle,phase:'profile',cause:null,profileMatched:false,profileHasTotal:false,category:null,challenge:false,sectionError:null,browserOpen:false,rawCount:0,maxRawCount:0,samples:0,signatureChanges:0,stableSamples:0,binding:null,waitMs,elapsedMs:0,deadlineRemainingMs:0,transport:null};
  const capture=()=>{d.browserOpen=!page.isClosed()&&page.context().browser().isConnected();d.elapsedMs=Date.now()-(windowStarted??started);d.deadlineRemainingMs=Math.max(0,deadline-Date.now());d.transport={...monitor.snapshot(),statuses:statuses()};return JSON.parse(JSON.stringify(d));};
  const assertTime=()=>{budget.assert();if(Date.now()>=deadline)throw budget.fail('TIME_LIMIT','incremental job deadline reached');};
- const inspect=async()=>{
-  assertTime();
-  const seen=await page.evaluate(({handle,selector})=>{
-   const visible=el=>{const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;};
-   const section=document.querySelector('#profile-section'),name=section?.querySelector('.username-text')?.textContent||'';
-   const category=document.querySelector('#menu-wrapper .menu-item.active')?.getAttribute('data-id');
-   return {matched:name.replace(/^@/,'').trim().toLowerCase()===handle.toLowerCase(),text:section?.innerText||'',category:['POSTS','REELS','STORIES','HIGHLIGHTS'].includes(category)?category:null,
-    challenge:[...document.querySelectorAll(selector)].some(visible),sectionError:['error-private','error-not-found','error-no-content'].find(id=>{const el=document.getElementById(id);return el&&visible(el);})||null};
-  },{handle,selector:WINDOW_CHALLENGE_SELECTOR});
+ // The metadata half of an observation, applied identically whether it arrived from the
+ // sampling read or from the single coherent snapshot the accepting seam takes.
+ const apply=seen=>{
   Object.assign(d,{profileMatched:seen.matched,profileHasTotal:F.parseReportedTotal(seen.text)!==null,category:seen.category,challenge:seen.challenge,sectionError:seen.sectionError,browserOpen:!page.isClosed()&&page.context().browser().isConnected()});
   // A visible challenge or access wall is a provider refusal that happens to be
   // spelled in the DOM. It latches through the ledger's one denial operation, so it
@@ -302,21 +378,34 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
   assertTime();
   if(!d.browserOpen)throw new F.ArchiveError('BROWSER_CLOSED','browser closed during window readiness');
  };
+ const inspect=async()=>{
+  assertTime();
+  apply(await F.observeWindowSnapshot(page,{handle,selector:WINDOW_CHALLENGE_SELECTOR}));
+ };
  try{
   statuses=await installGuards(page,budget,deadline);assertTime();
+  // Installed BEFORE the first navigation: a commit or a request that predates the render
+  // observation could never be placed in the order that acceptance depends on.
+  await F.installRenderObservationProbe(page);assertTime();
   await page.goto(F.PROVIDER_PHOTO_URL,{waitUntil:'domcontentloaded'});assertTime();
   await page.fill('input#search-input',handle);
   // Everything the previous document/search observed stops being evidence about the
-  // listing from here on: this search opens a new attribution generation.
+  // listing from here on: this search opens a new attribution generation, in the transport
+  // monitor and in the render observation alike.
   monitor.beginGeneration?.();
+  await F.beginRenderObservationGeneration(page);
   await page.click('button#download-btn');
   const ready=await F.waitForProfileReady(page,handle,{started:Date.now(),maxTimeMs:Math.max(1,deadline-Date.now()),waitMs:Math.min(30000,Math.max(1,deadline-Date.now())),continuationMonitor:monitor});
   Object.assign(d,{profileMatched:ready.matched,profileHasTotal:ready.hasTotal});
   await inspect();
-  // An HTTP refusal seen here was already latched by budget.inspect from the response
-  // handler, and deny() keeps the FIRST denial, so this cannot overwrite it; a purely
-  // visible challenge would otherwise have no durable record at all.
-  if(ready.blocked)throw budget.deny('DENIED_CHALLENGE_DOM');
+  if(ready.blocked){
+   // An HTTP refusal was already classified and latched by budget.inspect from the response
+   // handler, so assert() surfaces THAT denial with its real kind, status and Retry-After.
+   // deny('DENIED_CHALLENGE_DOM') is only for a refusal that exists purely in the DOM, which
+   // would otherwise leave no durable record at all; it must not relabel an HTTP status.
+   budget.assert();
+   throw ready.blocked.status!=null?budget.fail('DISCOVERY_TRANSPORT','provider denied discovery with HTTP '+ready.blocked.status):budget.deny('DENIED_CHALLENGE_DOM');
+  }
   if(!ready.ready)throw new F.ArchiveError('PROFILE_NOT_READY','requested public profile not ready');
   windowStarted=Date.now();d.phase='window';const end=Math.min(deadline,windowStarted+waitMs);
   // Positive evidence must be settled in the CURRENT generation AND globally quiet:
@@ -346,11 +435,29 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
    else if(settledEpoch===afterEpoch&&signature===settledSignature)settledStable++;
    else {settledStable=1;settledSignature=signature;settledEpoch=afterEpoch;settledSince=Date.now();}
    if(fresh&&settledStable>=2&&Date.now()-settledSince>=WINDOW_SETTLED_GRACE_MS){
-    await inspect();
-    // The accepting checks are themselves an awaited read: the cards may only be
-    // returned if the same settled epoch still holds on the far side of it.
-    if(observationEpoch(monitor)===afterEpoch&&settledNow()&&d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError){return {raw,observedAt:new Date().toISOString()};}
-    forgetSettledRun();
+    assertTime();
+    // ONE round trip for the cards AND the metadata AND the render generations: a local-only
+    // replacement cannot slip between two halves of the accepting observation, because there
+    // are no two halves.
+    const snapshot=await F.observeWindowSnapshot(page,{handle,selector:WINDOW_CHALLENGE_SELECTOR});
+    apply(snapshot);
+    const binding=bindWindowRender({receipts:monitor.receipts?.(),probe:snapshot.probe,cards:snapshot.cards,category:d.category,attributedPaths:monitor.attributed?.().paths});
+    d.binding=bindingRecord(binding,snapshot.probe);
+    // A separate awaited read on the far side of the snapshot. The transport epoch cannot see
+    // a purely local DOM change; the render observation can, and a benign engagement/caption/
+    // signed-URL rotation deliberately does not move `identityGen`, so an unchanged listing is
+    // not invalidated by one.
+    const confirm=await F.readRenderObservation(page);
+    const coherent=!!snapshot.probe&&!!confirm&&!confirm.overflow&&confirm.token===snapshot.probe.token
+     &&confirm.generation===snapshot.probe.generation&&confirm.identityGen===snapshot.probe.identityGen;
+    const seam=observationEpoch(monitor)===afterEpoch&&settledNow()&&coherent;
+    if(seam&&binding.bound&&windowSignature(snapshot.cards)===signature&&d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError){
+     return {raw:snapshot.cards,observedAt:new Date().toISOString(),binding:d.binding};
+    }
+    // A listing that is merely not the current response's listing YET leaves a quiet, settled
+    // page behind it: keep the settled run and re-evaluate on the next sample. Anything else -
+    // a moved epoch, an incoherent snapshot, unknown or ambiguous evidence - discards the run.
+    if(!(seam&&!binding.bound&&BINDING_NOT_YET.has(binding.reason)))forgetSettledRun();
    }
    await sleep(Math.min(WINDOW_SAMPLE_INTERVAL_MS,Math.max(1,end-Date.now())));
   }
@@ -359,7 +466,14 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
   // transport is neither empty nor churning: it is unsettled, and localWindowReadiness
   // refuses to call that positive handle-local evidence - including the empty case,
   // where unattributed traffic could otherwise have supplied the missing evidence.
-  d.cause=!settledNow()?'unsettled':(d.maxRawCount===0?'empty':'unstable');
+  // `unbound` (evidence unknown, ambiguous or unavailable) and `unrendered` (the current
+  // response's listing has not reached the DOM) are honest non-success states, distinct from a
+  // window that really is empty or really is churning. Like `unsettled`, neither is positive
+  // handle-local evidence.
+  d.cause=!settledNow()?'unsettled'
+   :(d.maxRawCount===0?'empty'
+   :(d.binding&&!d.binding.basis?(BINDING_UNRENDERED.has(d.binding.reason)?'unrendered':'unbound')
+   :'unstable'));
   throw new F.ArchiveError('WINDOW_NOT_READY','visible post window readiness expired', {readiness:capture()});
  }catch(e){
   // No DOM text, locator, caption, API payload or signed URL is persisted.
@@ -373,11 +487,27 @@ function windowSignature(raw){
  return JSON.stringify(raw.map(x=>[x.shortcode||null,F.providerMediaFingerprint(x.href)||x.href||null,x.mediaType||null,x.dateRaw||null]));
 }
 const WINDOW_CHALLENGE_SELECTOR='iframe[src*="captcha" i], iframe[src*="challenge" i], iframe[title*="challenge" i], .g-recaptcha, .h-captcha, #challenge-form, #cf-challenge-running, [data-captcha]';
+// The binding record is counters and typed reasons only - never a locator, caption or payload
+// string. `empty` cannot have attempted a binding at all, and a window whose binding failed is
+// reported under its own cause, so an unbound record can never arrive labelled `unstable`.
+const BINDING_BASES=['response-identity','request-generation-provenance'];
+function validBindingRecord(binding,cause){
+ if(binding===null)return cause!=='unbound'&&cause!=='unrendered';
+ if(cause==='empty')return false;
+ if(!binding||typeof binding!=='object'||Array.isArray(binding))return false;
+ if(Object.keys(binding).sort().join(',')!=='basis,commitGen,identityGen,listingIssueGen,missingIdentities,reason,responseIdentities,unidentifiedCards')return false;
+ if(!BINDING_BASES.includes(binding.basis))return false;
+ if(binding.reason!==null)return false;
+ const pair=v=>v===null||(!!v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(',')==='media,shortcodes'&&Number.isSafeInteger(v.media)&&v.media>=0&&Number.isSafeInteger(v.shortcodes)&&v.shortcodes>=0);
+ const counter=v=>v===null||(Number.isSafeInteger(v)&&v>=0);
+ return pair(binding.responseIdentities)&&pair(binding.missingIdentities)&&pair(binding.unidentifiedCards)&&counter(binding.commitGen)&&counter(binding.identityGen)&&counter(binding.listingIssueGen);
+}
 function localWindowReadiness(d){
- const keys=['schemaVersion','handle','phase','cause','profileMatched','profileHasTotal','category','challenge','sectionError','browserOpen','rawCount','maxRawCount','samples','signatureChanges','stableSamples','waitMs','elapsedMs','deadlineRemainingMs','transport'];
+ const keys=['schemaVersion','handle','phase','cause','profileMatched','profileHasTotal','category','challenge','sectionError','browserOpen','rawCount','maxRawCount','samples','signatureChanges','stableSamples','binding','waitMs','elapsedMs','deadlineRemainingMs','transport'];
  const exact=(value,fields)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).sort().join(',')===[...fields].sort().join(',');
  const count=(n,max=Number.MAX_SAFE_INTEGER)=>Number.isSafeInteger(n)&&n>=0&&n<=max;
  if(!exact(d,keys)||d.schemaVersion!==1||typeof d.handle!=='string'||!/^[A-Za-z0-9._]{1,30}$/.test(d.handle))return false;
+ if(!validBindingRecord(d.binding,d.cause))return false;
  if(d.phase!=='window'||!['empty','unstable'].includes(d.cause)||d.profileMatched!==true||d.profileHasTotal!==true||d.category!=='POSTS'||d.challenge!==false||d.sectionError!==null||d.browserOpen!==true)return false;
  if(!count(d.waitMs,45000)||d.waitMs<1||!count(d.elapsedMs,1200000)||d.elapsedMs<d.waitMs||!count(d.deadlineRemainingMs,1200000)||d.deadlineRemainingMs<1)return false;
  if(!count(d.samples)||d.samples<2||!count(d.rawCount,10000)||!count(d.maxRawCount,10000)||d.maxRawCount<d.rawCount||!count(d.stableSamples,1)||!count(d.signatureChanges)||d.signatureChanges>=d.samples)return false;
@@ -455,7 +585,10 @@ async function syncWindow(input,deps={}){
    }
    const paths=F.profilePaths(root,spec.handle);await F.ensureSafeDir(paths.stateDir,root);
    const files=await F.withLock(paths,config.runId,()=>acquireSelection(rows,paths,spec.handle,config.runId,budget,{...config,deadline,dnsLookup:deps.dnsLookup},result.totals));
-   writeHandle(result.handles,spec.handle,{status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,files});
+   // Which evidence class actually bound this observation travels WITH it: a consumer can see
+   // whether the listing was bound by response identity or only by request-generation
+   // provenance, instead of both looking alike as "COMPLETE".
+   writeHandle(result.handles,spec.handle,{status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,renderBinding:observation.binding??null,files});
    }catch(e){
     // A sticky budget stop takes precedence over a coincident local parse gap.
     try{budget.assert();}catch(stop){e=stop;}
