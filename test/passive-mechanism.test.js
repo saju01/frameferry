@@ -5,9 +5,11 @@
 //
 // The contract proved here is NEGATIVE where it matters: the observer must be invisible to the
 // platform. It creates no Response, no ReadableStream, no reader, no clone, no tee and no queue;
-// it hands the application the native promise and the native Response it already had; it looks
+// it hands the application a native promise carrying the native Response it already had; it looks
 // only at values the application itself asked for. Every assertion is a counterexample and must
-// never be relaxed into a success.
+// never be relaxed into a success. For a listing request that promise is ONE chained native
+// promise rather than the platform's own object - see test/passive-repair.test.js, which proves
+// the global rejection recovery the previous side subscription suppressed (PASSIVE-L2).
 //
 // Real Chromium, real DOM, fulfilled in-process inside the no-network sandbox: no provider
 // traffic, no signed locators, no private strings, no skips.
@@ -108,21 +110,27 @@ test('passive: an unread listing response is pulled exactly as much as with no o
  assert.equal(observed.activeTaps,0);
 });
 
-// === GATE 2: the application keeps the native promise, the native Response and native semantics
-test('passive: fetch returns the native promise and the native Response object unchanged',async t=>{
+// === GATE 2: the application keeps a native promise, the native Response and native semantics
+test('passive: fetch returns a native promise carrying the native Response object unchanged',async t=>{
  const body=JSON.stringify(posts(rec({code:'A',media:'M'})));
  const {page,context}=await pageFixture(t);
  await context.route('**/api/posts',r=>r.fulfill({contentType:'application/json',body}));
  await page.evaluate(INSTRUMENT);
- // An inner wrapper installed BEFORE the probe records the exact promise and the exact Response
- // the layer underneath produced. Whatever the probe hands the application must be those objects.
- await page.evaluate(()=>{const inner=window.fetch;window.madePromise=null;window.madeResponse=null;
-  window.fetch=function(){const p=inner.apply(this,arguments);window.madePromise=p;
+ // An inner wrapper installed BEFORE the probe records the exact Response the layer underneath
+ // produced. Whatever the probe hands the application must carry that very object.
+ await page.evaluate(()=>{const inner=window.fetch;window.madeResponse=null;
+  window.fetch=function(){const p=inner.apply(this,arguments);
    p.then(r=>{window.madeResponse=r;},()=>{});return p;};});
  await F.installRenderObservationProbe(page,LIMITS);
  const identity=await page.evaluate(async()=>{
   const returned=fetch('/api/posts');
-  const samePromise=returned===window.madePromise;
+  // CORRECTED for PASSIVE-L2: a listing fetch now returns ONE chained NATIVE promise carrying the
+  // same native Response, instead of the platform's own promise object with a side rejection
+  // handler attached to it. The withdrawn claim is promise-object identity alone; the Response,
+  // its body, its metadata and the page's own global rejection recovery are all still native, and
+  // test/passive-repair.test.js proves the recovery event that identity claim was costing.
+  const nativePromise=returned instanceof Promise&&Object.getPrototypeOf(returned)===Promise.prototype
+   &&returned.constructor===Promise;
   const response=await returned;
   const sameResponse=response===window.madeResponse;
   const sameBody=response.body===window.madeResponse.body;
@@ -135,14 +143,14 @@ test('passive: fetch returns the native promise and the native Response object u
   catch(e){byob.push('ERROR:'+e.constructor.name);}
   const usedBefore=response.bodyUsed;
   const text=await response.text();
-  return {samePromise,sameResponse,sameBody,own,headersMutable,
+  return {nativePromise,sameResponse,sameBody,own,headersMutable,
    url:response.url,type:response.type,redirected:response.redirected,
    cloneUrl:clone.url,cloneType:clone.type,byobBytes:byob,
    usedBefore,usedAfter:response.bodyUsed,text};
  });
  const m=await meter(page),observed=await report(page);
  console.log('NATIVE_IDENTITY '+JSON.stringify({identity,meter:m,observed}));
- assert.equal(identity.samePromise,true,'fetch must return the promise it was given, not a derived one');
+ assert.equal(identity.nativePromise,true,'fetch must return a native Promise, never a thenable of our own');
  assert.equal(identity.sameResponse,true,'the application must receive the very same Response object');
  assert.equal(identity.sameBody,true,'and the very same body stream object');
  assert.deepEqual(identity.own,[],'the observer must define no own property on the Response');

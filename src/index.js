@@ -1218,13 +1218,25 @@ const renderObservationSource = (limits = {}) => {
   // consumes, cancels, locks or disturbs a body, so it can never force a page to read one.
   //
   // The mechanism is two hooks, both in the same spirit as the window.fetch wrapper above:
-  //   - window.fetch reads the URL, returns the NATIVE promise it was given, and separately
-  //     subscribes to it only to put the arriving NATIVE Response into a WeakMap;
-  //   - Response.prototype.json / .text call through to the native method, return the NATIVE
-  //     promise it returned, and - only for a registered listing response - subscribe to that
-  //     same promise to look at the value the APPLICATION itself asked for.
-  // Because that subscription is attached before the application attaches its own continuation,
-  // the observation is frozen BEFORE any application code can mutate the parsed value.
+  //   - window.fetch reads the URL and, for a LISTING request, returns ONE chained native promise
+  //     carrying the SAME native Response the platform produced - or the SAME rejection reason -
+  //     taking that continuation as its chance to put the Response into a WeakMap;
+  //   - Response.prototype.json / .text call through to the native method and, only for a
+  //     registered listing response, likewise return ONE chained native promise carrying the SAME
+  //     value or the SAME rejection, looking on the way at the value the APPLICATION asked for.
+  // Because the observer's continuation is attached first, the observation is frozen BEFORE any
+  // application code can see - or mutate - the parsed value.
+  //
+  // The chain is DELIBERATE, and is the repair for PASSIVE-L2. A side subscription marks a
+  // rejection the application drops as HANDLED, which silently removes the page's global
+  // 'unhandledrejection' event and any recovery the page performs in it - executable behaviour,
+  // not cosmetics. Handing back the chained promise restores that event, with event.promise being
+  // the promise the application holds, and adds no orphan rejection of its own. What the page can
+  // OBSERVE is therefore unchanged: the same native Response object and body stream, native
+  // headers, clone(), BYOB readers, bodyUsed and cancellation, the same parsed value, the same
+  // rejection reason, the same global rejection event. The one withdrawn claim is the incidental
+  // one that the returned PROMISE OBJECT for a listing request is identical to the platform's
+  // own; it is now a chained native promise, and README/CHANGELOG say so.
   //
   // The interposition this replaces was withdrawn, not repaired: an independent review disproved
   // its acquisition/backing bound, its "measured peak" claim and its Response-equivalence claim.
@@ -1252,16 +1264,56 @@ const renderObservationSource = (limits = {}) => {
     }
     return n;
   };
+  // The UTF-8 byte length of the JSON-ESCAPED form of a string, quotes included, computed WITHOUT
+  // producing that escaped form. The rules are JSON.stringify's own (QuoteJSONString): a quote, a
+  // backslash and the five short escapes cost 2 bytes; any other control character and any LONE
+  // surrogate cost 6 (\\u00XX / \\uXXXX); everything else costs its UTF-8 width, with a
+  // well-formed surrogate PAIR costing 4. Early-exits at the ceiling, so an over-budget string is
+  // refused after a bounded scan and is never materialized, and the size this returns is exactly
+  // the size of the JSON.stringify output it admits.
+  const escapedUtf8LengthWithin = (text, limit) => {
+    let n = 2;
+    if (n > limit) return -1;
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      if (c === 0x22 || c === 0x5C || c === 0x08 || c === 0x09 || c === 0x0A || c === 0x0C || c === 0x0D) n += 2;
+      else if (c < 0x20) n += 6;
+      else if (c < 0x80) n += 1;
+      else if (c < 0x800) n += 2;
+      else if (c >= 0xD800 && c <= 0xDBFF) {
+        const next = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+        if (next >= 0xDC00 && next <= 0xDFFF) { n += 4; i++; } else n += 6;
+      }
+      else if (c >= 0xDC00 && c <= 0xDFFF) n += 6;
+      else n += 3;
+      if (n > limit) return -1;
+    }
+    return n;
+  };
   // Bounded, faithful re-serialization of the value the application's own json() produced, so
   // that the SAME strict decoder validates it outside the page. It is deliberately NOT a summary
   // and NOT a verdict: it emits EVERY own key it finds, so unknown remainder still reaches the
-  // decoder and is still refused there.
+  // decoder and is still refused there. A value that does not fit, or that cannot be represented,
+  // is refused WHOLE - never truncated, summarized or partially accepted.
   //
-  // Every limit is checked BEFORE the allocation it guards: a string value or key is refused on
-  // its raw .length - JSON escaping only ever grows a string - so a huge parsed field aborts the
-  // observation instead of being copied. Each node emits at least one byte before recursing, so
-  // the node count is bounded by the byte budget; depth is capped separately because a deeply
-  // nested value would otherwise exhaust the stack before the budget.
+  // Every limit is checked BEFORE the allocation it guards:
+  //   - a string value or KEY is admitted on its ESCAPED UTF-8 size, computed by an early-exiting
+  //     scan, so the escaped copy is produced only once it is known to fit (PASSIVE-L1: 200 NUL
+  //     characters used to be escaped into 1202 characters before a 256-byte ceiling refused
+  //     them);
+  //   - an object is walked with a BOUNDED for-in that stops at the first key the remaining
+  //     budget cannot pay for, so no complete key list of an arbitrarily wide object is built
+  //     (PASSIVE-S1: Object.keys used to materialize all 50000 keys before admission).
+  // What the second bound covers, precisely, is the OBSERVER's own explicit storage and its own
+  // property visits: one key string and one emitted piece at a time, at most one visit per key it
+  // actually emits, and at most the emitted budget in pieces. The enumeration the ENGINE performs
+  // internally for a for-in walk is the platform's own, is not JS-owned storage here, and is NOT
+  // claimed to be bounded by maxBytes. This is a bound on the observer's additional work, not a
+  // heap-wide guarantee.
+  //
+  // Each node emits at least one byte before recursing, so the node count is bounded by the byte
+  // budget; depth is capped separately because a deeply nested value would otherwise exhaust the
+  // stack before the budget.
   const MAX_SERIALIZE_DEPTH = 16;
   // Returns { text } or a typed { reason }: 'oversized' when a BOUND refused it, 'unreadable'
   // when the value is not something this codebase can represent faithfully. The two are
@@ -1269,21 +1321,24 @@ const renderObservationSource = (limits = {}) => {
   const serializeWithin = (root, limit) => {
     const pieces = [];
     let used = 0, overflowed = false;
-    const emit = piece => {
-      const n = utf8LengthWithin(piece, limit - used);
+    // A caller passes 'bytes' only when it has ALREADY admitted the piece's exact UTF-8 size.
+    const emit = (piece, bytes) => {
+      const n = bytes === undefined ? utf8LengthWithin(piece, limit - used) : bytes;
       if (n < 0) { overflowed = true; return false; }
       used += n; pieces.push(piece); return true;
+    };
+    // A key or a string value: its escaped size is admitted BEFORE JSON.stringify is allowed to
+    // build the escaped copy, so an over-budget string aborts the observation uncopied.
+    const emitString = text => {
+      const n = escapedUtf8LengthWithin(text, limit - used);
+      if (n < 0) { overflowed = true; return false; }
+      return emit(JSON.stringify(text), n);
     };
     const walk = (value, depth) => {
       if (depth > MAX_SERIALIZE_DEPTH) return false;
       if (value === null) return emit('null');
       const type = typeof value;
-      if (type === 'string') {
-        // The RAW length decides, BEFORE any escaping: JSON escaping only ever grows a string,
-        // so a value that cannot fit unescaped is refused without allocating its escaped copy.
-        if (value.length > limit - used) { overflowed = true; return false; }
-        return emit(JSON.stringify(value));
-      }
+      if (type === 'string') return emitString(value);
       if (type === 'number') return Number.isFinite(value) ? emit(String(value)) : false;
       if (type === 'boolean') return emit(value ? 'true' : 'false');
       if (Array.isArray(value)) {
@@ -1298,14 +1353,18 @@ const renderObservationSource = (limits = {}) => {
       // exotic object, a function, a symbol, a bigint, undefined - cannot be represented
       // faithfully here, so it leaves the observation unreadable rather than guessed at.
       if (type !== 'object' || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) return false;
-      const keys = Object.keys(value);
       if (!emit('{')) return false;
-      for (let i = 0; i < keys.length; i++) {
-        if (i && !emit(',')) return false;
-        if (keys[i].length > limit - used) { overflowed = true; return false; }
-        if (!emit(JSON.stringify(keys[i]))) return false;
+      // One key at a time, in the same order Object.keys would report them - which is the order
+      // JSON.stringify would serialize them - and stopping at the first key the budget cannot pay
+      // for. Inherited enumerable keys are skipped, exactly as JSON serialization skips them.
+      let first = true;
+      for (const key in value) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        if (!first && !emit(',')) return false;
+        first = false;
+        if (!emitString(key)) return false;
         if (!emit(':')) return false;
-        if (!walk(value[keys[i]], depth + 1)) return false;
+        if (!walk(value[key], depth + 1)) return false;
       }
       return emit('}');
     };
@@ -1387,11 +1446,19 @@ const renderObservationSource = (limits = {}) => {
     if (typeof native !== 'function') return;
     const patched = function () {
       // The APPLICATION's own read, performed by the platform, returning the platform's own
-      // promise - which is exactly what is handed back below.
+      // promise.
       const result = native.apply(this, arguments);
       let entry = null;
       try { entry = watched.get(this) || null; } catch (e) { entry = null; }
-      if (entry && entry.state === 'unconsumed') { try { apply(entry, result); } catch (e) { entry.state = 'unobserved'; } }
+      if (entry && entry.state === 'unconsumed') {
+        try {
+          // An OBSERVED path hands back the one chained native promise it built; every other
+          // path - unsupported, unarmed, or failed to instrument - hands back the platform's own
+          // promise object untouched.
+          const chained = apply(entry, result);
+          if (chained && typeof chained.then === 'function') return chained;
+        } catch (e) { entry.state = 'unobserved'; }
+      }
       return result;
     };
     try { Object.defineProperty(patched, 'name', { value: name, configurable: true }); } catch (e) { /* frozen function */ }
@@ -1400,10 +1467,22 @@ const renderObservationSource = (limits = {}) => {
   };
   if (typeof Response === 'function' && Response.prototype) {
     for (const name of ['json', 'text']) patch(name, (entry, result) => {
-      if (!result || typeof result.then !== 'function') { entry.state = 'unobserved'; return; }
-      if (!arm(entry, name)) return;
-      // A SIDE subscription: the application still receives the native promise returned above.
-      result.then(value => settle(entry, EXTRACT[name], value), () => close(entry, 'unreadable'));
+      if (!result || typeof result.then !== 'function') { entry.state = 'unobserved'; return null; }
+      if (!arm(entry, name)) return null;
+      // ONE chained native promise, returned to the application in place of the platform's own.
+      // It carries the SAME fulfilment value and the SAME rejection reason, and - because the
+      // application receives the very promise the observer subscribed to, rather than a promise
+      // the observer silently marked handled - a rejection the application drops still reaches
+      // the page's global 'unhandledrejection' handler, with event.promise being the promise the
+      // application itself holds. This is the PASSIVE-L2 repair: a side subscription suppressed
+      // that event and with it whatever recovery the page performs in it. Exactly one promise is
+      // created and exactly one is returned, so no orphan rejection is added either.
+      // The observation still runs in the FIRST continuation, before application code sees the
+      // value, and can never change what the application receives: a throw inside it is
+      // contained, and a rejection is always re-thrown unchanged.
+      return result.then(
+        value => { try { settle(entry, EXTRACT[name], value); } catch (e) { entry.state = 'unobserved'; } return value; },
+        reason => { try { close(entry, 'unreadable'); } catch (e) { /* the rejection still wins */ } throw reason; });
     });
     // Consumption paths this codebase does not observe are LABELLED, never read. Saying
     // "unsupported" out loud is the honest answer; inventing a second read to cover them is the
@@ -1414,21 +1493,24 @@ const renderObservationSource = (limits = {}) => {
   if (typeof fetchImpl === 'function') window.fetch = function (input) {
     try { record(input && typeof input === 'object' ? input.url : input); } catch (e) { state.overflow = 'unreadable-request-observation'; }
     const settled = fetchImpl.apply(this, arguments);
+    let listing = null;
     try {
       const u = new URL(String(input && typeof input === 'object' ? input.url : input), location.href);
-      if (u.origin === location.origin && LISTING.indexOf(u.pathname) >= 0) {
-        const generation = state.generation;
-        // A SIDE subscription, purely to learn which native Response arrived. The caller gets the
-        // NATIVE promise back untouched, so it sees the same fulfilment, the same Response object
-        // and the same rejection it would have seen with no observer present. A retired
-        // generation registers nothing.
-        settled.then(response => {
-          try { if (generation === state.generation) registerBody(u.pathname, response); }
-          catch (e) { state.overflow = 'unreadable-body-observation'; }
-        }, () => { /* a failed request is transport evidence, never body evidence */ });
-      }
+      if (u.origin === location.origin && LISTING.indexOf(u.pathname) >= 0) listing = u.pathname;
     } catch (e) { /* an unparseable URL is simply not observed, and then not evidence either */ }
-    return settled;
+    // Anything that is not a listing request is handed back exactly as the platform produced it.
+    if (listing === null) return settled;
+    const generation = state.generation;
+    // ONE chained native promise, purely to learn which native Response arrived. The caller sees
+    // the same fulfilment, the very same native Response object and the same rejection reason it
+    // would have seen with no observer present - and, for a rejection it drops, the same global
+    // 'unhandledrejection' event on the promise it actually holds (PASSIVE-L2; a side handler
+    // used to suppress the failed-fetch notification). A retired generation registers nothing.
+    return settled.then(response => {
+      try { if (generation === state.generation) registerBody(listing, response); }
+      catch (e) { state.overflow = 'unreadable-body-observation'; }
+      return response;
+    }, reason => { /* a failed request is transport evidence, never body evidence */ throw reason; });
   };
   const xhr = window.XMLHttpRequest;
   if (xhr && xhr.prototype && typeof xhr.prototype.open === 'function' && typeof xhr.prototype.send === 'function') {

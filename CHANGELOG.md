@@ -5,10 +5,18 @@
 - Observe the provider listing response **passively**, at the page's own consumption boundary,
   and delete the response-stream interposition that preceded it. FrameFerry no longer creates a
   `Response`, `ReadableStream`, reader, clone, tee or forwarding queue of its own, and no longer
-  reads a body the page has not read: the page keeps the native promise and the native `Response`,
-  with native `clone()` metadata, immutable headers, byte (BYOB) readers, `bodyUsed` and
-  cancellation semantics intact. Listing evidence now comes from the page's own `json()`/`text()`
-  completion. Consumption through any other path — `arrayBuffer()`, `blob()`, `formData()`, the
+  reads a body the page has not read: the page keeps the native `Response` itself, with native
+  `clone()` metadata, immutable headers, byte (BYOB) readers, `bodyUsed` and cancellation
+  semantics intact, delivered by a native promise. For a listing request and for an observed
+  `json()`/`text()` call that promise is one *chained* native promise carrying the same value,
+  the same `Response` or the same rejection reason, so a rejection the page drops still reaches
+  the page's own `unhandledrejection` handler on the promise the page holds; no event is
+  dispatched, suppressed or marked handled on the page's behalf. Evidence admission checks every
+  limit before the allocation it guards — a string value or key on its escaped UTF-8 size before
+  it is escaped, and a wide parsed object one key at a time rather than through a complete key
+  list — and refuses an oversized value whole rather than truncating or summarising it. Those
+  bounds are on FrameFerry's own additional work, not on engine-internal enumeration and not on
+  the browser heap. Listing evidence now comes from the page's own `json()`/`text()` completion. Consumption through any other path — `arrayBuffer()`, `blob()`, `formData()`, the
   raw body stream, a `clone()`, or no consumption at all — is reported truthfully as inconclusive
   (`WINDOW_NOT_READY` with `unknown-response-evidence`) rather than certified. The withdrawn
   design's `peakObserverAllocationBytes` "measured high-water mark" is removed rather than

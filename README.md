@@ -251,12 +251,24 @@ gets those bytes by **passively observing the page's own consumption** of that r
 - **What FrameFerry never does to get evidence.** It never reads, clones, tees, cancels, locks or
   disturbs a response body, never creates a `Response`, `ReadableStream`, reader or queue of its
   own, and never forces the page to consume a body so that observation can succeed. The page
-  receives the native promise and the native `Response` — identity, immutable headers, `clone()`
-  metadata, byte (BYOB) readers, `bodyUsed` and cancellation semantics are the platform's own.
+  receives the native `Response` itself — identity, immutable headers, `clone()` metadata, byte
+  (BYOB) readers, `bodyUsed` and cancellation semantics are the platform's own — carried by a
+  native promise. For a listing request, and for an observed `json()`/`text()` call on a listing
+  response, that promise is one *chained* native promise rather than the platform's own promise
+  object: it settles with the same value, the same `Response` or the same rejection reason, and a
+  rejection the page drops still raises the page's own `unhandledrejection` event, carrying the
+  promise the page itself holds. Nothing is dispatched, suppressed or silently marked handled on
+  the page's behalf.
 - **What it may allocate.** The `text()` path allocates nothing to measure a body; the `json()`
-  path performs one bounded, faithful re-serialization whose every limit is checked *before* the
-  allocation it guards, so an oversized value is refused rather than copied. Retention has its
-  own separate ceiling. No heap high-water mark is claimed or reported.
+  path performs one bounded, faithful re-serialization that admits every limit *before* the
+  allocation it guards — a string value or key on its escaped UTF-8 size before it is escaped,
+  and a wide object one key at a time, so no complete key list of an arbitrarily wide parsed
+  object is ever built. An oversized or unrepresentable value is refused whole, never copied,
+  truncated or summarised. What those ceilings bound is FrameFerry's own additional work: its
+  explicit storage, the bytes it emits and the properties it reads. Enumeration the JavaScript
+  engine performs internally for a walk is the platform's own and is **not** claimed to be
+  bounded by them. Retention has its own separate ceiling. No heap high-water mark is claimed or
+  reported.
 
 ### Honest limitations
 
