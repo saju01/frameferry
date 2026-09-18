@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-18
+
 - Observe the provider listing response **passively**, at the page's own consumption boundary,
   and delete the response-stream interposition that preceded it. FrameFerry no longer creates a
   `Response`, `ReadableStream`, reader, clone, tee or forwarding queue of its own, and no longer
