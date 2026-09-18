@@ -1,11 +1,26 @@
 'use strict';
 // SANITIZED DERIVATIVE - not a captured live response.
-// Structure, field names, key sets, record count, carousel association, child count,
-// image/video split and ordering, opaque-locator lengths and the reverse(hu|vhu) ->
-// /media?id= mapping are all preserved from the authorized offline capture. Every
-// handle, post id, shortcode, opaque locator, caption and engagement value has been
-// replaced consistently; a private provenance/hash mapping is kept outside this repo.
-// 12 records, one carrying a single `om` child => 13 rendered cards, 6 image / 7 video.
+//
+// PRESERVED from the authorized offline capture, and held to it by a committed structural
+// oracle (test/fixtures/original-structure-oracle.js, equality classes only):
+//   - field names, per-node key sets, record/child counts and per-index ordering:
+//     12 records, exactly one carrying a single `om` child => 13 rendered cards,
+//     6 image / 7 video, `vu === vhu` on every video;
+//   - the reverse(hu|vhu) -> /media?id= mapping and the pd -> dateRaw mapping;
+//   - byte-identical value LENGTHS for every opaque locator, `id`, `c`, `lc`, `cc` and `pc`;
+//   - the EQUALITY and INEQUALITY classes of every field across all 13 nodes, including the
+//     cross-record `pd` classes and the carousel child's relationship to its primary: the
+//     child shares its primary's `co`, `pd`, `c`, `lc` and `cc`, and has its OWN DISTINCT
+//     `id`, `iu` and `hu`.
+// NOT preserved (deliberately): `pd` string lengths, because the substitute dates are drawn
+// from a public alphabet rather than length-matched.
+//
+// Every handle, post id, shortcode, opaque locator, caption, date and engagement value has
+// been replaced; a private provenance/hash mapping is kept outside this repo. An earlier
+// revision wrongly gave the child its primary's `id` and altered four cross-record `pd`
+// relationships and two `cc` relationships, and left `p[1].lc` verbatim from the capture; all
+// seven substitutions are itemised in .review-evidence/SANITIZATION-CORRECTION.json. No
+// sanitized value equals the original value of the same field at any node.
 const RESPONSE={
  "p": [
   {
@@ -25,7 +40,7 @@ const RESPONSE={
      "cc": "321",
      "pd": "07 Feb",
      "c": "moss juniper dusk harbor kelp dusk dusk onyx fern ember cobalt amber juniper qu",
-     "id": "Nb7uAfR0XFOuDfgQmPU9J9MNZmr2LTm",
+     "id": "Kq3sPbW7RdT0mJ9xLcV4hZ6nEy1UoAf",
      "co": "m5BET4RPK9p"
     }
    ]
@@ -33,7 +48,7 @@ const RESPONSE={
   {
    "iu": "bb6Np1rJHHpUZ9wyS4LNgVZxWO6nBU113sfyQjcB0y/zLs4j9/pZRULPecTz7Ueu18AGKdAIOU8F38LfbsJ9Qp4JMsgQFBiv15mbWdiSfodsynymtdfGC2msfIUNsabQVT0bOoBslOyQwV33xz296SWHrqaGygMMUtvqlAEItQGHYAE8GK3wahIyZZCMstRPyIr2l8/aAaV4eHe0ylcvLP/VHtZORq4QXRFxnF/mn9ERFFS/vBJ/A2ZrPsAKYePP/s49CxyZmwN1vql1L8scZMLZyQxGgAIRFLEiPAjp1yWAeNBxoqfDGVSQ3nref3Fb1BLGrmGLDFU0kpAwdgtGm7WHtAbAwOqNfHlLb8MmgcxdP7OSS9p0XCErryxBGtRiJ5mPoC4X67C2wpGnWzsrBD8vTXrgCRGBfCvcuAr38B74VAg0UMppLCXHgrcSgu5LE/1kRi29AcPBUH30ZtadENtwCfG433PFgJZzGkJ5n90s2XqCo/Ko7TGIDIBMLjNr9Sx9td7H6qOmqaBq1Xxsh8b/8EB23YRr9NSVsBgxK/0qZBS99gcgcGogDaI0cQa/w5qvNcjDPsXIBgvj3MhXF/JkDHvgLOwXskAj4TlRzUmymiLcyXkZw4p0SqBNinMFfgdoSbLczkq9cU4TEzarQQSv8k1eDGGaEWdJ2u6hNnUScBTJS2mJtLJ7kn9zBMAY//a/46jDxThcbkJ2ZUvhr3xgUL/czBFhe3skMMJJBdJ3alS2PXfUKgDgaG6wBcUTk1ijZu5xNZe4J56/otlvzO2ZxHn2gU1qrPQ=",
    "hu": "gA4PhWbt1b6IrWCH7099B2MaPtJko2o0bv0CVxCJV/1Dl4nh/43fK679cFGjGHhjM4/K7ECkMAXmPZcPdAphNgvyoHC4vetvvFzpASi3gnKnrq03JGLDWrlzyXcilDxQcVFUnkhxhB1T3wa35snU4I0zs8hpNWJdgb6mC61gt4Yzof916AzqDX3rUyW9ZxFcM1wmsOnnBF5KCvAwYaKPu20p7rW4oVTll238UkI474zj4rMrfNQ/7txVd8TvX2U1cgDUMmNTkkOCtbeigaW3/LxyseOKUqex75gIiKa6sO2c0xVdnTrEb577OOIi3UucU5dDlZFZMVmFkWZZlKUqT8qIbcwwfBkQRibILxzhZX4LgYla2aNpOg/80VzTDrQEIDaaZBLZoLjaP3UhgaHR5u4/hRCtqZX9gnIU5d8el7mpU0eKr8XBWYXdjA1Hgs9LTGBxGqIJFwnKWpbhYYRNBzJJKxUHUGBdg8ON9gg9w7MCXKJPDy15QhEfWQfRS4BA3Jxdj8JDGvjd2O95OiBFR0IUJxVllFQ0FSsvG3P52tJgCD7oglLkOyMT9SDnfW/EoU2XsmksEpaK7JHCXE7Wny6KtCg11fNmKskONJJS6DqfoiZUmNrAqcBOTsRibd2egJ8fvr29bQKM40v9jKwH1uQz7UwIouaXfklhbDnkuORns0aDUaCbp5qfE1V8xWEzT/12NDAeNE9tREjXvuZreT3CI4R6gc4PXzJkvzWPLE81mgUZeAJmh3Y3M7UIlZlWrXOU5m91UvTgR4zdwDaSFHp=",
-   "lc": "16k",
+   "lc": "18k",
    "cc": "189",
    "pd": "24 October 2024",
    "c": "onyx pebble juniper juniper dusk indigo onyx glade thist",
@@ -76,8 +91,8 @@ const RESPONSE={
    "iu": "pTyIuMq7HMTBMKmpmkGqoS9IwNaOGbVC8v2EkpcR84f/hJN3By11Zk235Eq694GbawmyoXwvKLNUgseRCfR9gFlmsgsTNdHoza2KBXyYpmpBlZ8pw7lY/yOhs33cRP/GGdIBqOoc02CmDyxqcisLiaorLpwocvxb/d/cvQzau1wNrKGCV321O1aNsNlMb64r5SwEtRo7w9zhDkGw1rXguNI3xsbAp8DffISnqCq/1qpc8ZDv4xabNn7bQOgwvadaips1pMgllaHDnZS7Muv/G6xYPb3Cw/mYOaK5ANLf32i/aNJwXD6jvXC4csdYnliLVQwgpni9fpYdBGtaNoLqGz3jdb1wt9XtN/RmIzf7yE0D/Qt1yA1PSla2uhGYwh6TLuy/PlTruaXvp8aRzJrzeP56DLCh9uH1vVCTyKfS02ngTACA1QIdZcGePMMWosmICF/XQLsBi02ZgFBO9QdTJs7qfKxfxIP3v8OC2tUZZKNufurE3TArHYq/C5S4XERG9AQxDEzTFRvWrvZozBUA3ZqzqyInuukG/A1DUqiqUQ2FPlNl134rSICv9FfA4KYraiKRmuT/9hsSP3UJJIr4/VvchQw83Xa54yjAv08HbW/1InizT0CoENz8mUPGp9Dd2WrPndW3bDVm43uOESfCwzBrYF9NnH7D41L7O/fSNqY/gCVe/a41Kq7lnljo3IwylD2uKeBfzwubW6nhACtlXyoXg9gwQN5JUs6kG7/jLdnPCnGuhkGYEZ5JpJkCJzj2ztcibW1LTOZTH7pNsjizF6yQYqyFD1XcP1x=",
    "hu": "7uTL2zgydGBEayjXRK0IEz8lzQi63ZsvTNHBN/B1MUeAPtafu00827hgyv7xJj5CIO9jNmm1KbPgD8zQF5Qj6zB3VHcSAyVEeT/SPv0ZFOyTDjePT/eL50ayBJZs11sC7rt7I5Wjj1PgjKzh7WUifjTQAR3SoicMumHcrEGt6/obMeZhIMWNWz9zhWqt4m/TERXiGoOxWF7MOxoeqAVBTdxCwMzZsC7/YBeVnxkMNu2amJBUZg0SRpqGxni21GS3xXrK9hC55SeUmIZWR6VydXzq79LhUQyvRUOGjShYttjJkP9g9xORVte8l6lQk/W2Xx7YXo1fGXvbR17riHOzxXDIy48rPmVRzFD8V2OV9uYjLOFgnoYGHRxYJcj/6QZF3LvI3vs5ZAakJpe0CrxUftBIDKRbDgWqsKXUQO7Yg10a0dK7rIhxR7X47YGj9u/xVMJMFqAzwDAd9Z3rZuUWrNhpnsWkzsg2MsgbNAqmWHow5yuWNvzKOSWnXTRiAAWnb9PY8s/p6gDU8602maL0/xDrqkyrRh0lmVCD//VnWTNR2aNZ6jhSRnOh308qq5HmlxXnC8JP/C6cDYTtp3ANCwYGZmba463o6eFE/bw6mk8rbT7CaLOEeTMy2gJ9a5SB7YjrHzFM332TN56uEc1iWeD1bvNjGWIcWm29DoecxvHThrNS/6C0tQ9zQV3/Queuo0ZrsmTzhmCZjahu36KSaBDQxuZMOyfnjYa8pok3HeFtZlr2ATOqAR37EwGkEwvboq/PfVdqNxV6YWYwwwputVl=",
    "lc": "2169",
-   "cc": "90",
-   "pd": "4 days ago",
+   "cc": "76",
+   "pd": "7 days ago",
    "c": "indigo amber thistle basil kelp harbor moss onyx e",
    "id": "kGm90XLgvZj2XRzQLkHLPJKY_Q52Yc2",
    "co": "Q5oW87TYgrc"
@@ -113,7 +128,7 @@ const RESPONSE={
    "vhu": "NOv1ydvC689BLqAmM3DSQ0uP4kOSxhRs73qWFeMaHQwhtiyCJuGpPdIkhIToWmAyMyO6cSMjWoMsUGJ94hV/04gaD0E0m6mBGH1mJb22dYueUhD7C6dB7Gz76rGd8m8g5tGFbT88DokxPZufYdiLEsO0DPIydRVNRjqnf8bt6Pky3kjW86SZDReQy6/95UaorEP3hvhUccQelNcGnAfhrBTPGHEesneE8et1uQFkJvq1PWWpPbj9TGWKFHmiFhKisa3TX69h49Stp//kDNVYcmkcIERvEWf54ismc5EowwrekeCqfCNkbrqVPqcKlE0GzCD1K4uZa1CrNMMtmIes9N6ZAx/I6LmzW8LLUxD0M9Q90Mf1gQ6Ext2pBQX/Vfr3li4z9QdZF/Xb2kLzUX/IT1Lqirgd1img8RBr5xLelDVEnML0C4A9toMz84egnzfbCJsnVe93D62EJ34Gu0DRWvjJgVwaUZEwPfgZLnpwme0Xp2pyVq1ixmufn6Xe0zAISd3Mc8Q88AA7CmlZBK0OZSzsY59dIFq/NAwJcnmyapVhIAjSaA5oCdTzqwzOy11IekhhdD3UF9z36fI9QSUbGwhrfDEcSDjQlGlyQrdKedGB6eBKRTS6uMgIHDIsML6zLzXAgcaxREQJ3ItFdX4xFqgSYg3odWkYNs215FPmOgOLARrVkiDaTGBIKp83Ez6rXLnOAnpaTwfn14RLxOzTNBIIZqsVQghBddHmB/9HxXJ3L3DVQfxzjBRY71fwfUJSWJ5TjwaVy9UjOOTpD85ndfKV/uHNpM6LkCMWxvHkTFHpXI0ibc2vTPSD8HeZqs2or5iO33LPUQRRqmajwlRDC7OilDS2nB4DYXqLIUqg/dGSW5fQHY3Xldp9VN5F60lvw4pIJM6ryCKzeA2W7liLNFpx2MBdBC828Qtin26Ad1TU6BuqBFSENBGs0j1bYSJl8GxPL15zfy11cc6p3TEEyuS0EFhoco6KGBRKj5mHbCCtKMjSYu8EetEJrZfYqC5zzxedT1XGftGhGqcgS8G8Hby1O2UTv9JjFEUbDC7ILeEQlLod4Qnv2aBRBd46/Z8EJquDOKaZgVnFytP5ecJZ7QgoHqJ66ZIxIxUOMNf0tl/dtHsrSZOJVh3a50CLRyXcjrTd9lUFMRXG3ECf9wZzhDxkT1kB9njtkR8rewm9RCttzWt46z7BfRpmjK9jcthkk3tIpp/obM4qy8AFzIFuPRrbevJrlA8cXvhaPsvr/eMlwAG98YFb7Je1pfnZY2wmDsTw/kh76uxdSupugE3c8BBESHZ650p3BVA4HutyibhYL7gV75P7dQRoH4Mnitm2Hv20pYCrlJfGD2ZbqIWoL6Rtb8NxTv0qWUnYiwioIoqyeXEX1zx/sKCOtGau/h5ReUPbMMA0qJqrfXttXcbp8rpAv4V6l6d8zpLEfOUiphBLwu0GAXzejGgdOeDYFvgLl4utYIwtq/nJdIFtsaOkdyFX5SUGrEg/rNvmZLISn6SnksQUbcHQ41i=",
    "lc": "853",
    "cc": "23",
-   "pd": "1 November",
+   "pd": "3 November",
    "c": "basil slate fern basil basil amber amber slate harbor sla",
    "id": "U-rAuBgzm7j10NqR4MZyDfYcaRw82qJ",
    "co": "vdB22N7T953"
@@ -124,7 +139,7 @@ const RESPONSE={
    "vu": "7LdhIPj7ETb0mxi9df7OpkceKm7YUdOwMY2surip2cIMNBvLj6057lEW7GPsFqxU41O43oHNPVcDgIEboZuM5o3kw9u1vuvCnCGMGJRdAtzhQN7mD5vzXRwxuahdjLdlcWmPJIDyknZwaeJMOcTvtey5A7uOZB232pGnh6GRF0Mh3LQYIB6xGnLj8rgFKulVSBGdrJoxgpxD1ryAiVDOB75OciLLdK2AxJk3R5qzSmTaU5ipm/aDPCLujnD9JU3D64Z0eBKJ7K57lkv9CXSFUlNThfZPHD3eqnySzIDBC09DTmsYOp1ns0nRVL0efpCRKwR8iKCUVKO3feiWXjvwo6trrQNLpgNfKWY90qFWUNdkf0qGLOlt2KpTd3RQdBLnBVQemw1AvTYNWP2Ns/xzti7lSVX8GXYwIxrOqeKREl78l/30pF0fRgXAVn/7OGoG4KCdrNDAGLqvMPhMGFT0197litKsqYDnKrCbTQJrQ9NcNFEy8NzDZLYWdIMHiW5z/uQ8XT/TUyS9jsGlIRHu01TJBgJmcPyo4lGaCNSEvK2lrARa/mgiM2/ZyQtAtNtkNtZliZdEsDvNafxYLuwcH50sLTjidLXDlI/vIn2RIrEsJVmL8WG3sOzLoCup8YSWqaJzBET29/RhgdXuA9Pu6Q74IGJSeDAcR7mZmqOnhJVG2gTidnLr33ZXgV2U81fjzKSwZuCrwuGPQWpLcVWL4QVmGBaPNuU0iil6fVDl9kBPmv0Q6Tib2QOLpdYDAegbfPvl7IoyxcXzel6qa26CLo0lyQjdKzit/NgZuCvdMMC1BZsh6HmF2fyfh64Ux/yZBvZOxiNGvwSmN7canQLxmuGYhQOcvN6FETCPJZKOjZjzu0D3h5MphGrM4hbXDc9j87JPlIOSFuaPmO/mC8W7vPydfS8Rl5aOmAnD1mSydoxB7AN4WWMABEkyGgwSqTOtr8ZYXHwIm36n58R80mg8nPhTshzGO/OH2YZBcDiOA9RT5yzv5bLnTLcL33a9Jagd9mMBa5i/FUZEBlKjw429bffdQjNXjK0yXxze3UCCDMNybdlvxR0WE6r4Vza69OgM5oYDYnGznfA6zZlROkxebzan/AqU7qqv/0oljbWmEkM5LKSxMYU1wBpx9KBWjU94KmfQPSYp8v5HSOl0kZbikU/TL9Cn6sAzzzGe/5TqMtLakkZuFGct3NpywjtbJII9crW7LFNSMcZsJYXKWpC4BJWfxesVwrxdTRf/e7b3wut33kDRRQWXiNFDbBwd2aC9Sv7BDcP0RF2PxlOaqV/MTiJ4/gX84QJS/yaE2ieL6NI4gWvMXBRSSorO5sVuioa/oWBEN6WkzAzWS5EmOJ3wPzhCbm38IRu/4AoApyMSi02HxkYoEcqIDO0u2UA8xKCKqYmTnOiQbdR1sJIy3iZAq5EuqYRPLkDfo3Cu930VnKGaptRcwYRcGGzoyumTU1FJSaXa7UdxfCFP95qDcI13lA/nqeaVxR8P6pcUdTdK/OdTo1doVUqTvN14NgVSLDE=",
    "vhu": "7LdhIPj7ETb0mxi9df7OpkceKm7YUdOwMY2surip2cIMNBvLj6057lEW7GPsFqxU41O43oHNPVcDgIEboZuM5o3kw9u1vuvCnCGMGJRdAtzhQN7mD5vzXRwxuahdjLdlcWmPJIDyknZwaeJMOcTvtey5A7uOZB232pGnh6GRF0Mh3LQYIB6xGnLj8rgFKulVSBGdrJoxgpxD1ryAiVDOB75OciLLdK2AxJk3R5qzSmTaU5ipm/aDPCLujnD9JU3D64Z0eBKJ7K57lkv9CXSFUlNThfZPHD3eqnySzIDBC09DTmsYOp1ns0nRVL0efpCRKwR8iKCUVKO3feiWXjvwo6trrQNLpgNfKWY90qFWUNdkf0qGLOlt2KpTd3RQdBLnBVQemw1AvTYNWP2Ns/xzti7lSVX8GXYwIxrOqeKREl78l/30pF0fRgXAVn/7OGoG4KCdrNDAGLqvMPhMGFT0197litKsqYDnKrCbTQJrQ9NcNFEy8NzDZLYWdIMHiW5z/uQ8XT/TUyS9jsGlIRHu01TJBgJmcPyo4lGaCNSEvK2lrARa/mgiM2/ZyQtAtNtkNtZliZdEsDvNafxYLuwcH50sLTjidLXDlI/vIn2RIrEsJVmL8WG3sOzLoCup8YSWqaJzBET29/RhgdXuA9Pu6Q74IGJSeDAcR7mZmqOnhJVG2gTidnLr33ZXgV2U81fjzKSwZuCrwuGPQWpLcVWL4QVmGBaPNuU0iil6fVDl9kBPmv0Q6Tib2QOLpdYDAegbfPvl7IoyxcXzel6qa26CLo0lyQjdKzit/NgZuCvdMMC1BZsh6HmF2fyfh64Ux/yZBvZOxiNGvwSmN7canQLxmuGYhQOcvN6FETCPJZKOjZjzu0D3h5MphGrM4hbXDc9j87JPlIOSFuaPmO/mC8W7vPydfS8Rl5aOmAnD1mSydoxB7AN4WWMABEkyGgwSqTOtr8ZYXHwIm36n58R80mg8nPhTshzGO/OH2YZBcDiOA9RT5yzv5bLnTLcL33a9Jagd9mMBa5i/FUZEBlKjw429bffdQjNXjK0yXxze3UCCDMNybdlvxR0WE6r4Vza69OgM5oYDYnGznfA6zZlROkxebzan/AqU7qqv/0oljbWmEkM5LKSxMYU1wBpx9KBWjU94KmfQPSYp8v5HSOl0kZbikU/TL9Cn6sAzzzGe/5TqMtLakkZuFGct3NpywjtbJII9crW7LFNSMcZsJYXKWpC4BJWfxesVwrxdTRf/e7b3wut33kDRRQWXiNFDbBwd2aC9Sv7BDcP0RF2PxlOaqV/MTiJ4/gX84QJS/yaE2ieL6NI4gWvMXBRSSorO5sVuioa/oWBEN6WkzAzWS5EmOJ3wPzhCbm38IRu/4AoApyMSi02HxkYoEcqIDO0u2UA8xKCKqYmTnOiQbdR1sJIy3iZAq5EuqYRPLkDfo3Cu930VnKGaptRcwYRcGGzoyumTU1FJSaXa7UdxfCFP95qDcI13lA/nqeaVxR8P6pcUdTdK/OdTo1doVUqTvN14NgVSLDE=",
    "lc": "9890",
-   "cc": "23",
+   "cc": "27",
    "pd": "8 November",
    "c": "cobalt pebble cobalt",
    "id": "qkNk-mrci_t1dFvgCm35iM_W8uHM22j",
@@ -137,7 +152,7 @@ const RESPONSE={
    "vhu": "OhcECEoWKToi3rrZrtM909gvlKp1HDAVQRSXu7K9xAMkRrXYXZLvDmECMYa0v3Tuuiv7pGyxumJPhvfMyw7q9kxhVDIRU7SWvWQ03WgefDInkWaxbodoVhN7rbUq5OQwaPrUxiszWayrM3lDJ4zuzQsnpnFBrCAZgUzlIWQ1WRNTlcsE3pciUDFcNyOQ7t70kKsNg40553yqrQE7aryvVxpWIqBlVFC1TRkfp7Mk4JWm/NNtntLqwDMuk6xkQwUU41LSwz/1rm/lwXBMGJ4MBl0t1uXRDdMD/4QO2LDQVs53N9tlwN1Jp7Bg9aiNOzZi6nxnEWu5cHUM9dVK1uEV85G4RbA9bYNbip0VyJUR7ID2FWnzjHWHD2MsZRjwJCVFsBdRZQeNMppdMmpWhLCaWzNL7eaep1RfrR0u9upq6fV4eLeLWshq/p/r84bB19LkdhpCVZZeEi984VrvKsKsNAQjSRy64DMGTZp839zYWOfq5GDKAlwhJNj5is3iSqMDdnCUZKGDzCXM4juYB1oAFZJQsqvz6RT4vGwgpI/PMBJ3qSTn7MJFN5PPrJlsBSgaMo2D3T3Gxzh5yz9V5iexcEjr6tcJt/4/sUk0uJoLLxRin/uyX1lP2fWi5RO78xx5x1lifztLsNyqaY9PGkJayk56x2IKogxT6leC1bzGAh7V4ubySrtj6Ag2jlNrXnaklJsfuv2ZgnetxgWSmzjlzEELqdAywBt2tfzeh6znYoanNSCguxWNwCl5tD8jxukgCRffiNbYySfOQRhGT75Om853QqmJiQgYsM97QFBuRAXuAaW9D0Jzjr3rsCKv9/t6xyfLqDkbrelGPk5nFHqpiyjYr5dqpDdSJoBCCUVYKm6nXU5s5qyrBMv8XDEjq1B5N1/aI1wwXGaeHxBTt0JqgoEQTc8pXowC6Q78ehF8DAZJVbIFUkTOttVaMLXghuyvllb52GFJwjvRDbtNenilybDMP1LWeTVqJK0CPRtP/yim2fNHTPCTukkAvIsWN0b2xEiwbqFgsbshQCKdSqXA7Ys4KJnlZ/IFsdsF/NF8wxDc4ngtJK6jEsc9Fb6g2gh9IHBlOtSlHudQHLkEkWHZDuDEUbbJQEP04/f5bnwao19M/5ADHem31bk2WSKIDXahR5HsLfTJVOANFl4pFHKeOEuNNKM0XqZSxjx63MMNKN3Ah3eIsdaxZ6ine0/Yc5N66RMeowEasvcxaRvyFJenrNck0LG8xWXKp1zhlalIsX9IPWCtcJmHSIuPpngQbpbpVynLX7NR3nLxu274202cR7rgFXhyz3oirPk8n62NDOHVMgTNZXztS5TVtRtDAaTKKaf8cXbPdFRXRJlolYZoqeZB/G8YuJyHIkADWA9dvBQa/PjDIR8WccBacjNxDGz48GwgpifsEfn28BxDp3esD5nxzvQw7uGCcfUPkpP6ZrnZvRJhSRCFORrUXVgXlqAZ4MVj676PAkDOXMcfxviKkrg1MH1PKooUiSvAhejmYbn2tqddGtnsiqJ=",
    "lc": "673",
    "cc": "776",
-   "pd": "9 November",
+   "pd": "8 November",
    "c": "lumen quartz cobalt kelp thistle quartz",
    "id": "MG6YH2cFT21d_TP0QdrofgHPUT0G6hz",
    "co": "Cgcp5kp5Ubd"
@@ -197,7 +212,7 @@ const TUPLES=[
  {
   "shortcode": "Q5oW87TYgrc",
   "mediaType": "image",
-  "dateRaw": "4 days ago",
+  "dateRaw": "7 days ago",
   "mediaId": "=lVtupwwwYWY6VxNqdVfP/qobvwEkGwE73RAqOTA2rlZtFeH3kop8aYjnfyOMZuxQDBaSK63uhajZCmhzTmsrZ0oueuQ/3VQz9Qt0C6/SNrhTHvxceoD92mWcIWGjNvb1DeWi1cEu65NT233MFzHrjY7BS5a9Jg2yMTeEOLaC7Tbr8km6wb/EFe6o364abmZGYwCNA3ptTYDc6C/PJ8CnXxlmH5qq803hOnRShj6ZNa2RNTWnV//DCVml0hRrykqrDx/0Lam2068UDg6p/s8YP9bnWAAiRTXnWSOKzvNWuy5woHWmqANbgsM2gszkWsnphNrWUuZr3Z9dADwzAqFMJMVx/u9jGY74X7RxhIr7Kd0a01gY7OQUXKsqWgDbRKDIBtfUxrC0epJkaAZ5sv3IvL3FZQ6/jcJYxRHGYongFOLjYu9VO2V8DFzRVmPr84yIDXxzOHir71RbvXGf1oXY7xX2W/kQl6l8etVROx9g9PkJjttYhSjGOURvyQUhL97qzXdyV6RWZImUeS55Ch9KrXx3SG12inxGqpRS0gZUBJma2uNMkxnVeBY/7CsZzMwCxdTBVAqeoxOM7FWxOoGiXRET/m4tqWhz9zWNWMIhZeMbo/6tGErcHmuMcioS3RAQTjfiUW7hzKjgP1jjW5I7tr7Cs11sZJBya05Le/TPejDTyOFZ0vPS/TeEVyAScHV3Bz6jQ5FQz8DgPbK1mmNj9OIC5jJx7vygh72800ufatPAeUM1B/NBHNTvsZ36iQzl8zEI0KRXjyaEBGdygz2LTu7"
  },
  {
@@ -215,7 +230,7 @@ const TUPLES=[
  {
   "shortcode": "vdB22N7T953",
   "mediaType": "video",
-  "dateRaw": "1 November",
+  "dateRaw": "3 November",
   "mediaId": "=i14QHcbUQsknS6nSILZmvNr/gErGUS5XFydkOastFIdJn/qtwIYtu4lLgvFYDeOdgGjezXAG0uwLBhpiUOfELpz8d6l6V4vApr8pbcXttXfrqJq0AMMbPUeR5h/uaGtOCKs/xz1XEXeyqoIoiwiYnUWq0vTxN8btR6LoWIqbZ2DGfJlrCYp02vH2mtinM4HoRQd7P57Vg7LYhbiytuH4AVB3p056ZHSEBB8c3EgupuSdxu67hk/wTsDmw2YZnfp1eJ7bFY89GAwlMe/rvsPahvXc8AlrJvebrRPuFIzFA8yq4Mbo/ppIt3kkhtcj9KjmpRfB7z64tWzttCR9mwer8Rktjn9Bk1TkxDhzZw9fCE3GXRMFUl9dTrjcXyRLC05a3hVJOZSrsHtd/lt0fNMOUxIxIZ66JqHogQ7ZJce5PtyFnVgZaKODuqJE8Z/64dBRBa2vnQ4doLlQEeLI7CDbUEFjJ9vTU2O1ybH8G8SgcqGhGtfGX1Tdexzz5CqYfZrJEteE8uYSjMKtCCbHm5jKRBGK6ocohFE0SuyEET3p6cc11yfz51LPxG8lJSYb1j0sGBNESFBquB6UT1dA62nitQ828CBdBM2xpFNLil7W2AezKCyr6MJIp4wvl06F5NV9pdlX3YHQf5WSGd/gqUILqXYD4Bn2SDliO7CDRlwjamqRRQUPL33Oi5ro2sqZeH8DSPTv2cbi0IXpHFTkHvxWMCkL6MpNHu/VKfdn58DpTOOjU9yVawjT5JWSJUfwf17YRBjzxfQVD3L3JXxH9/BmHddBhgQVsqZIIBNTzOxLR41nfwTapnAOnLXr6zE38pKIBGTaDikVrRALOgOmPF512sNYkWdo3gYSgqFx4XdFtI3JQERxacgAXzLz6LMsIDHIgMu6STRKBe6BGdeKdrQylGlQjDScEDfrhwGbUSQ9If63z9FU3DdhhkeI11yOzwqzTdCo5AaSjAIhVpaymncJwAN/qFId95YszSZO0KBZlmC7AA88Q8cM3dSIAz0eX6nfumxi1qVyp2pX0emwpnLZgfPwEZUawVgJjvWRD0uG43JE26D39eVnsJCbfznge48zMot9A4C0LMnEVDleLx5rBR8gmi1dgriqL1TI/XUzLk2bX/FZdQ9z4il3rfV/XQBp2txE6Qg1fM09Q9M0DxULL8WzmL6I/xAZ6N9seImtMMNrC1aZu4K1DCzG0ElKcqPVqrbkNCfqCekerwwoE5cmsi45fWEvREIckmcYVNDk//ptS94h96XT3asiKhFimHFKWGT9jbPpWWP1qvJkFQu1te8EenseEHGPTBrhfAnGcNleQccUhvh3PEroaU59/6yQeRDZS68Wjk3ykP6tb8fnqjRNVRdyIPD0OsELidYfuZPxkoD88TbFGt5g8m8dGr67zG7Bd6C7DhUeuYd22bJm1HGBm6m0E0Dag40/Vh49JGUsMoWjMSc6OyMyAmWoTIhkIdPpGuJCyithwQHaMeFWq37sRhxSOk4Pu0QSD3MmAqLB986Cvdy1vON"
  },
  {
@@ -227,7 +242,7 @@ const TUPLES=[
  {
   "shortcode": "Cgcp5kp5Ubd",
   "mediaType": "video",
-  "dateRaw": "9 November",
+  "dateRaw": "8 November",
   "mediaId": "=JqisntGddqt2nbYmjehAvSiUooKP1HM1grkKivxfcMXODkAP676jVM4ZAqlXgVXUrROFCRShJRvZnrZ6PpkPUfcCGu7wQvzxn5Dse3pDxB82nfEsfipgwG84zGDxNjcaBccW8RIDjP/aQBvd9AWDAkIHyJuY8G/BZeqoZYlolJRXRFdPbXc8faKKTaADtRtVT5StzXZNTgMVHODN26n8kPrio3zyhXFgr7Rc202472uxLn3RN7XLnyVpbpbQgnpPuISHmJctCWPI9XsIlalhz1pKXWx8GL0kcNrneJFyvRaxcvsaEwoeMR66N5cY/0eni6ZxadsIe3hA3NKNMM36xjxSZqX0MKNNuEOeKHFp4lFNAOVJTfLsH5RhaXDIKSW2kb13meHDA5/M91oawnb5f/40PEQJbbUEDuDZHWkEkLHQduHlStOlBHI9hg2g6bF9csEj6KJtgn4cDxw8FN/FsdsFI/ZlnJK4sY7AXqSdKCQhsbsgFqbwiEx2b0NWsIvAkkuTCPTHNf2miy/PtRPC0KJqVTeWL1PMDbylineNtbDRvjwJFG25bllvyuhgXLMaVttOTkUFIbVJZAD8Fhe87Q6CwoXp8cTQEogqJ0tTBxHeaGXww1Ia/1N5B1qjEDX8vMBryq5s5UXn6mKYVUCCBoJSdDpqd5rYjyipqHFn5kPGlerbkDqLfyx6t/9vKCsr3rjzJ0D9WaAuXARuBFQ79MsYgQiJmqQ358mO57TGhRQOfSyYbNiffRCgkuxj8Dt5lCwNWxugCSNnaoYnz6hezft2tBwyAdqLEEzljzmSWgxtengZ2vufsJlkanXrNlj2gA6jtrSybu4V7hAGzb1Cel6TxgoKI2x65kyaJkGP9YaqyNsLtzfil1x5xx87OR5iWf2Pl1Xyu/niRxLLoJu0kUs/4/tJct6rjEcxei5V9zy5hzxG3T3D2oMagSBslJrPP5NFJM7nTSq3JBMP/IpgwGv4TR6zvqsQJZFAo1BYuj4MXCzDGKZUCndDMqSi3si5jNJhwlAKDG5qfOWYz938pZTGMD46yRSjQANsKsKvrV489iEeZZVCphdkL91Bb48r/p/qhsWLeLe4Vf6qpu9u0RrfR1peae7LNzWaCLhWpmMdppMNeQZRdBsFVCJwjRZsM2DHWHjznWF2DI7RUJyV0pibNYb9AbR4G58VEu1KVd9MUHc5uWEnxn6iZzONia9gB7pJ1Nwlt9N35sVQDL2OQ4/DMdDRXu1t0lBM4JGMBXwl/mr1/zwSL14UUwQkx6kuMDwqLtntNN/mWJ4kM7pfkRT1CFVlBqIWpxVvyra7EQrqy35504gNsKk07t7QOyNcFDUicp3EsclTNRW1QWIlzUgZACrBFnpnsQzuz4JDl3MryaWzsixUrPawQO5qUbr7NhVodobxaWknIDfegW30QWvWS7URIDVhxk9q7wyMfvhPJmuxyGp7viuuT3v0aYMCEmDvLZXYXrRkMAx9K7uXSRQVADH1pKlvg909MtrZrr3ioTKWoECEchO"
  },
  {

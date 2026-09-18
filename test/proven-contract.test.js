@@ -205,7 +205,10 @@ test('proven contract: an out-of-order listing settlement is inconclusive',async
  assert.equal(r.readiness.binding.reason,'out-of-order-response');
 });
 
-// === DR-S1: bounded, cancellable observation of already-generated bodies ==================
+// === DR-S1: bounded observation at the application's own consumption boundary =============
+// The observer duplicates nothing: it never clones or tees a body. It takes the ONE reader of
+// the original, copies a BOUNDED prefix out of each chunk and forwards that chunk unchanged to
+// the application. See .review-evidence/closure-design.md for the measured bound argument.
 test('DR-S1: the transport monitor reads no response bytes of its own',async()=>{
  // The observer must never transfer or decode a body through the Playwright response API:
  // that call is neither bounded nor cancellable. Touching it here fails the test outright.
@@ -230,7 +233,7 @@ test('DR-S1: the transport monitor reads no response bytes of its own',async()=>
 test('DR-S1: a body beyond the observer ceiling is cancelled and never accepts',async t=>{
  const big=posts(...Array.from({length:40},(_,i)=>rec({code:'C'+i,media:'M'+i,c:'x'})));
  const f=await windowFixture(t,{script:responsePage(paintNow),initial:card('OLD'),api:listing(big)});
- // A ceiling far below the payload: the clone reader must cancel rather than buffer it.
+ // A ceiling far below the payload: the observation must be abandoned rather than retain it.
  const r=await outcome(W.discover(f.page,'example',f.budget,Date.now()+16000,200,6000,
   {responseEvidence:{maxBytes:256,timeoutMs:2000,maxReceipts:8,maxActiveReads:2}}));
  assert.equal(r.accepted,false,'an oversized body must be refused, never buffered into acceptance');
@@ -241,9 +244,13 @@ test('DR-S1: a body beyond the observer ceiling is cancelled and never accepts',
  assert.ok(post,'the listing body must have been observed');
  assert.equal(post.state,'oversized');
  assert.equal(post.retainedBytes,0,'a cancelled read retains nothing');
- assert.ok(observed.cancelledReads>=1,'the clone reader must actually be cancelled at the ceiling');
+ assert.ok(observed.cancelledReads>=1,'the observation must actually be abandoned at the ceiling');
+ assert.equal(observed.retainedBackingBytes,0,'no observer allocation may survive the ceiling');
 });
-test('DR-S1: a new generation cancels outstanding reads and drops retained evidence',async t=>{
+// This one drops evidence that has ALREADY been read; a genuinely still-pending observation,
+// released without touching the application's own reader, is covered by
+// test/closure-regressions.test.js 'a still-pending observation is released ...'.
+test('DR-S1: a new generation retires already-read bodies and drops retained evidence',async t=>{
  const f=await windowFixture(t,{script:responsePage(paintNow),initial:card('OLD'),
   api:listing(posts(rec({code:'A',media:'M'})))});
  await F.installRenderObservationProbe(f.page,{maxBytes:65536,timeoutMs:2000,maxActiveReads:2,maxBodies:8});
@@ -251,7 +258,7 @@ test('DR-S1: a new generation cancels outstanding reads and drops retained evide
  await f.page.click('button#download-btn');
  await f.page.waitForFunction(()=>window.trace&&window.trace.includes('rendered'));
  const before=await F.readListingBodyObservation(f.page);
- assert.ok(before.bodies.some(b=>b.path==='/api/posts'&&b.state==='read'),'the clone read must land');
+ assert.ok(before.bodies.some(b=>b.path==='/api/posts'&&b.state==='read'),'the observed body must land');
  await F.beginRenderObservationGeneration(f.page);
  const after=await F.readListingBodyObservation(f.page);
  assert.deepEqual(after.bodies,[],'a new generation drops every retained observer body');

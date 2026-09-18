@@ -363,8 +363,10 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000,option
  page.setDefaultTimeout(Math.max(1,Math.min(45000,deadline-Date.now())));
  // Bodies the page has already received are inspected for identity evidence; nothing extra is
  // requested, and the decoded text never outlives the scan.
- // Admitted observer bounds. The page-side clone reader is installed under exactly these, so
- // what may be looked at and what may be held are one configuration, not two.
+ // Admitted observer bounds. The page-side observer is installed under exactly these, so what
+ // may be looked at, what the observer may allocate and what may be held are one configuration
+ // rather than three. They bound the OBSERVER's own additional allocation; the page's request
+ // memory is its own and is neither created nor prolonged by observing it.
  const evidenceBounds=options.responseEvidence||{maxBytes:1048576,maxReceipts:64,timeoutMs:2000,maxActiveReads:4,maxBodies:64,maxRetainedBytes:4194304};
  const monitor=F.attachContinuationRequestMonitor(page,{pathname:null,responseEvidence:evidenceBounds}),started=Date.now();
  let statuses=()=>({}),windowStarted=null,last=null;
@@ -604,9 +606,10 @@ async function syncWindow(input,deps={}){
    }
    const paths=F.profilePaths(root,spec.handle);await F.ensureSafeDir(paths.stateDir,root);
    const files=await F.withLock(paths,config.runId,()=>acquireSelection(rows,paths,spec.handle,config.runId,budget,{...config,deadline,dnsLookup:deps.dnsLookup},result.totals));
-   // Which evidence class actually bound this observation travels WITH it: a consumer can see
-   // whether the listing was bound by response identity or only by request-generation
-   // provenance, instead of both looking alike as "COMPLETE".
+   // Which evidence class actually bound this observation travels WITH it. There is exactly one
+   // accepting basis - 'response-tuples' - so a consumer can see that this COMPLETE rests on the
+   // decoded current response matching the rendered listing tuple for tuple. Request-generation
+   // provenance is NOT an acceptance basis and no longer appears here.
    writeHandle(result.handles,spec.handle,{status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,renderBinding:observation.binding??null,files});
    }catch(e){
     // A sticky budget stop takes precedence over a coincident local parse gap.
