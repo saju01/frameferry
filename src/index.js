@@ -10,7 +10,7 @@ const { performance } = require('node:perf_hooks');
 const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 const discovery = require('./discovery.js');
 
-const VERSION = '0.2.1';
+const VERSION = '0.3.0';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
