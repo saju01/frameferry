@@ -4,6 +4,9 @@
 // no-network sandbox: no provider traffic, no signed locators, no private strings, no skips.
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs/promises'),fsSync=require('node:fs'),os=require('node:os'),path=require('node:path');
 const F=require('../src/index.js'),W=require('../src/sync-window.js'),{openBudget}=require('../src/request-budget.js');
+// The listing bodies below use the REAL observed representation, built here so a fixture can
+// never be more permissive than the decoder. See test/fixtures/listing-page.js.
+const {rec,posts,RENDERER}=require('./fixtures/listing-page.js');
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const bind=(o,k)=>typeof o[k]==='function'?o[k].bind(o):o[k];
 async function tmp(t){const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-contract-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
@@ -22,10 +25,10 @@ const document_=(script,initial='')=>'<input id="search-input"><button id="downl
  +'<div id="post-container">'+initial+'</div><script>'+script+'</script>';
 // Renders the profile from /api/profile. `body` is whatever the listing handler should do with
 // the decoded /api/posts response, so a fixture decides for itself when (or whether) it commits.
-const responsePage=body=>'window.trace=[];function show(){'
+const responsePage=body=>RENDERER+';window.trace=[];function show(){'
  +'fetch("/api/profile").then(function(r){return r.json();}).then(function(){'+PROFILE+'});'
  +'fetch("/api/posts").then(function(r){return r.json();}).then(function(d){window.trace.push("decoded");'+body+'});}';
-const commit='document.getElementById("post-container").innerHTML=d.html;window.trace.push("rendered");';
+const commit='ffPaint(d);window.trace.push("rendered");';
 async function windowFixture(t,{script,initial='',api}){
  const browser=await launch(t),context=await browser.newContext({serviceWorkers:'block'});
  const seen=[];let page=null;
@@ -51,18 +54,18 @@ const live=page=>page.evaluate(()=>[...document.querySelectorAll('#post-containe
 // --- FR1: a decoded response cannot certify the listing it has not replaced yet ----------
 for(const delay of [100,2000])test('contract FR1: a response-driven render delayed '+delay+'ms cannot certify the pre-request listing',async t=>{
  const f=await windowFixture(t,{
-  script:'window.trace=[];function show(){document.getElementById("post-container").innerHTML='+JSON.stringify(card('OLD'))+';'
+  script:RENDERER+';window.trace=[];function show(){document.getElementById("post-container").innerHTML='+JSON.stringify(card('OLD'))+';'
    +'fetch("/api/profile").then(function(r){return r.json();}).then(function(){'+PROFILE+'});'
    +'fetch("/api/posts").then(function(r){return r.json();}).then(function(d){window.trace.push("decoded");'
    +'setTimeout(function(){'+commit+'},'+delay+');});}',
-  api:json({html:card('NEW')})});
+  api:json(posts(rec({code:'NEW',media:'NEW'})))});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+12000,10,6000));
  await f.page.waitForFunction(()=>window.trace.includes('rendered'));
  assert.deepEqual(await live(f.page),['NEW'],'the fixture must really replace the listing from its response');
  assert.equal(f.api.length,2);assert.ok(f.api.every(x=>x.main),'the fixture must issue its API traffic from the intended main frame');
  if(result.accepted)assert.deepEqual(result.cards,['NEW'],'a decoded response certified its own displaced pre-request listing');
  else assert.equal(result.code,'WINDOW_NOT_READY');
- if(delay===100){assert.equal(result.accepted,true,'the healthy render control must really succeed');assert.equal(result.binding.basis,'response-identity');}
+ if(delay===100){assert.equal(result.accepted,true,'the healthy render control must really succeed');assert.equal(result.binding.basis,'response-tuples');}
 });
 test('contract FR1: syncWindow cannot publish a nothing-new COMPLETE from a pre-request listing',async t=>{
  const root=await tmp(t),browser=await launch(t);let api=[],atClose=null;
@@ -70,9 +73,9 @@ test('contract FR1: syncWindow cannot publish a nothing-new COMPLETE from a pre-
   api=[];
   await context.route('**/*',async route=>{
    const u=new URL(route.request().url());
-   if(u.pathname.startsWith('/api/')){api.push(u.pathname);return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({html:card('NEW')})});}
+   if(u.pathname.startsWith('/api/')){api.push(u.pathname);return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(posts(rec({code:'NEW',media:'NEW'})))});}
    return route.fulfill({status:200,contentType:'text/html',body:document_(
-    'window.trace=[];function show(){document.getElementById("post-container").innerHTML='+JSON.stringify(card('OLD',{year:2025}))+';'
+    RENDERER+';window.trace=[];function show(){document.getElementById("post-container").innerHTML='+JSON.stringify(card('OLD',{year:2025}))+';'
     +'fetch("/api/profile").then(function(r){return r.json();}).then(function(){'+PROFILE+'});'
     +'fetch("/api/posts").then(function(r){return r.json();}).then(function(d){window.trace.push("decoded");setTimeout(function(){'+commit+'},2000);});}')});
   });
@@ -102,13 +105,15 @@ test('contract FR1: syncWindow cannot publish a nothing-new COMPLETE from a pre-
 test('contract FR1: an unchanged listing is acceptable when the response positively binds it',async t=>{
  // "Nothing new" is a legitimate answer. The page never touches the DOM here: the only
  // evidence that the rendered listing is current is that the response identifies it.
- const f=await windowFixture(t,{initial:card('SAME'),script:responsePage(''),api:json({html:card('SAME')})});
+ const f=await windowFixture(t,{initial:card('SAME'),script:responsePage(''),api:json(posts(rec({code:'SAME',media:'SAME'})))});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+15000,10,5000));
  assert.equal(result.accepted,true,'a matching response that required no re-render must still bind its listing');
  assert.deepEqual(result.cards,['SAME']);
- assert.equal(result.binding.basis,'response-identity');
+ assert.equal(result.binding.basis,'response-tuples');
  assert.deepEqual(await live(f.page),['SAME'],'the fixture must really never have re-rendered');
 });
+// An inert body used to be accepted on request-generation provenance. It carries no listing at
+// all, so it is now unsupported evidence and can certify nothing - in either direction.
 test('contract FR1: an inert listing response cannot certify a listing that predates the request',async t=>{
  const f=await windowFixture(t,{
   script:'function show(){document.getElementById("post-container").innerHTML='+JSON.stringify(card('STALE'))+';'
@@ -118,44 +123,49 @@ test('contract FR1: an inert listing response cannot certify a listing that pred
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+10000,10,3000));
  assert.equal(result.accepted,false,'an empty response beside a listing rendered before the request is not evidence');
  assert.equal(result.code,'WINDOW_NOT_READY');
- assert.equal(result.readiness.binding.reason,'listing-predates-request');
- assert.equal(result.readiness.cause,'unrendered');
+ assert.equal(result.readiness.binding.reason,'unknown-response-evidence');
+ assert.equal(result.readiness.cause,'unbound');
  assert.equal(W.localWindowReadiness(result.readiness),false,'an unbound window is not positive handle-local evidence');
 });
-test('contract FR1: an inert listing response is accepted only on disclosed request-generation provenance',async t=>{
+// NEGATIVE control, formerly a positive one. A commit that lands after the request was issued
+// cannot distinguish a genuine new render from a response handler re-painting the OLD cards, so
+// request-generation provenance is no longer an acceptance basis at all.
+test('contract FR1: an inert listing response is never accepted on request-generation provenance',async t=>{
  const f=await windowFixture(t,{script:responsePage('document.getElementById("post-container").innerHTML='+JSON.stringify(card('FRESH'))+';window.trace.push("rendered");'),api:json({})});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+15000,10,5000));
- assert.equal(result.accepted,true);
- assert.deepEqual(result.cards,['FRESH']);
- assert.equal(result.binding.basis,'request-generation-provenance','a degraded basis must be disclosed, never reported as identity evidence');
+ assert.equal(result.accepted,false,'a body carrying no listing identity must never certify a listing');
+ assert.equal(result.code,'WINDOW_NOT_READY');
+ assert.equal(result.readiness.binding.reason,'unknown-response-evidence');
+ assert.equal(result.readiness.binding.basis,null,'there is exactly one acceptance basis and this is not it');
+ assert.equal(W.localWindowReadiness(result.readiness),false);
 });
 test('contract FR1: a partially rendered carousel is not a bound listing',async t=>{
  const f=await windowFixture(t,{
   script:responsePage('document.getElementById("post-container").innerHTML='+JSON.stringify(card('A1',{shortcode:'A'}))+';'
    +'setTimeout(function(){'+commit+'},1500);'),
-  api:json({html:card('A1',{shortcode:'A'})+card('A2',{shortcode:'A'})})});
+  api:json(posts(rec({code:'A',media:'A1',children:[{media:'A2'}]})))});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+20000,10,8000));
  assert.equal(result.accepted,true);
  assert.equal(result.slides,2,'a carousel missing a child from the same response was accepted as the full listing');
- assert.equal(result.binding.basis,'response-identity');
+ assert.equal(result.binding.basis,'response-tuples');
 });
 test('contract FR1: an out-of-order listing settlement is inconclusive, never an accepted window',async t=>{
  let held=null;
  const f=await windowFixture(t,{
-  script:'function show(){fetch("/api/profile").then(function(r){return r.json();}).then(function(){'+PROFILE+'});'
+  script:RENDERER+';function show(){fetch("/api/profile").then(function(r){return r.json();}).then(function(){'+PROFILE+'});'
    +'fetch("/api/posts");'
-   +'setTimeout(function(){fetch("/api/posts").then(function(r){return r.json();}).then(function(d){document.getElementById("post-container").innerHTML=d.html;});},150);}',
+   +'setTimeout(function(){fetch("/api/posts").then(function(r){return r.json();}).then(function(d){ffPaint(d);});},150);}',
   api:(route,u)=>{
    if(u.pathname!=='/api/posts')return route.fulfill({status:200,contentType:'application/json',body:'{}'});
    if(!held){held=route;return;}
-   return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({html:card('SECOND')})});
+   return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(posts(rec({code:'SECOND',media:'SECOND'})))});
   }});
  // Release the FIRST-issued listing response only after the second one has already settled, so
  // the newest-issued response is not the newest-settled: a real out-of-order arrival.
  const releasing=(async()=>{
   const end=Date.now()+9000;while(!held&&Date.now()<end)await pause(20);
   await pause(500);
-  if(held)await held.fulfill({status:200,contentType:'application/json',body:JSON.stringify({html:card('FIRST')})}).catch(()=>{});
+  if(held)await held.fulfill({status:200,contentType:'application/json',body:JSON.stringify(posts(rec({code:'FIRST',media:'FIRST'})))}).catch(()=>{});
  })();
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+14000,10,5000));
  await releasing;
@@ -167,7 +177,7 @@ test('contract FR1: an oversized listing response is unknown evidence, not a lic
  const f=await windowFixture(t,{
   script:responsePage('document.getElementById("post-container").innerHTML='+JSON.stringify(card('BIG'))+';window.trace.push("rendered");'),
   api:(route,u)=>route.fulfill({status:200,contentType:'application/json',
-   body:u.pathname==='/api/posts'?JSON.stringify({pad:'x'.repeat(1200000),html:card('BIG')}):'{}'})});
+   body:u.pathname==='/api/posts'?JSON.stringify({p:[rec({code:'BIG',media:'BIG',date:'x'.repeat(1200000)})],pc:'x'}):'{}'})});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+12000,10,4000));
  assert.equal(result.accepted,false,'an unreadably large response body must be inconclusive, never accepted');
  assert.equal(result.readiness.binding.reason,'unknown-response-evidence');
@@ -185,7 +195,7 @@ test('contract FR1: the accepting snapshot reads exactly the cards readRawCardsF
  assert.ok(snapshot.probe&&Number.isInteger(snapshot.probe.commitGen)&&Number.isInteger(snapshot.probe.identityGen));
 });
 test('contract FR1: a local-only replacement inside the accepting seam cannot be returned as a matched snapshot',async t=>{
- const f=await windowFixture(t,{script:responsePage(commit),api:json({html:card('NEW')})});
+ const f=await windowFixture(t,{script:responsePage(commit),api:json(posts(rec({code:'NEW',media:'NEW'})))});
  const monitor=F.attachContinuationRequestMonitor(f.page,{pathname:null});t.after(()=>monitor.detach());
  let fired=false,lastRawAt=0,lastOp=null,firstSettled=0,settledReads=0;
  const wrapped=new Proxy(f.page,{get(target,prop){
@@ -248,11 +258,13 @@ test('contract FR1: benign rotation inside the container is not the page paintin
  else assert.equal(result.code,'WINDOW_NOT_READY');
 });
 test('contract FR1: an unrecognisable provider media locator is unknown evidence, never inert',async t=>{
- const cdn='<div class="post-card"><img class="post-image" data-type="image">'
-  +'<a class="content-download-btn" href="https://cdn.instacognito.com/media?id=CDN"></a><span data-id="CDN"></span>'
-  +'<div class="post-footer"><span class="icon-group"><span>1 January 2026</span></span></div></div>';
+ // A locator that cannot be reduced to a provider media identity - here one carrying a second
+ // id - makes the record unsupported rather than "no items".
+ // An opaque locator that reverses into an id providerMediaIdentity refuses - here one carrying
+ // whitespace - is a locator this codebase cannot reduce, so the record is unsupported.
+ const broken=rec({code:'CDN',media:'CDN'});broken.hu=[...'CDN ID'].reverse().join('');
  const f=await windowFixture(t,{script:responsePage(commit),api:(route,u)=>route.fulfill({status:200,contentType:'application/json',
-  body:u.pathname==='/api/posts'?JSON.stringify({html:cdn}):'{}'})});
+  body:u.pathname==='/api/posts'?JSON.stringify(posts(broken)):'{}'})});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+12000,10,4000));
  assert.equal(result.accepted,false,'a media locator this codebase cannot reduce to an identity must not be read as "no items"');
  assert.equal(result.readiness.binding.reason,'unknown-response-evidence');
@@ -260,27 +272,27 @@ test('contract FR1: an unrecognisable provider media locator is unknown evidence
 });
 test('contract FR1: a rendered card the current response does not identify cannot be certified',async t=>{
  const f=await windowFixture(t,{initial:card('KEEP'),
-  script:responsePage('document.getElementById("post-container").insertAdjacentHTML("beforeend",d.html);window.trace.push("rendered");'),
-  api:json({html:card('NEW')})});
+  script:responsePage('document.getElementById("post-container").insertAdjacentHTML("beforeend",'+JSON.stringify(card('NEW'))+');window.trace.push("rendered");'),
+  api:json(posts(rec({code:'NEW',media:'NEW'})))});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+12000,10,4000));
  assert.deepEqual(await live(f.page),['KEEP','NEW'],'the fixture must really leave a card the response never identified');
  assert.equal(result.accepted,false,'a listing wider than the response that identifies it is not a bound observation');
- assert.equal(result.readiness.binding.reason,'listing-exceeds-response-identity');
+ assert.equal(result.readiness.binding.reason,'listing-exceeds-response-tuples');
 });
 test('contract FR1: unrelated API traffic cannot exhaust the bounded listing evidence',async t=>{
  const browser=await launch(t),context=await browser.newContext({serviceWorkers:'block'});
  await context.route('**/*',route=>{
   const u=new URL(route.request().url());
-  if(u.pathname.startsWith('/api/'))return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/posts'?JSON.stringify({html:card('NEW')}):'{}'});
+  if(u.pathname.startsWith('/api/'))return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/posts'?JSON.stringify(posts(rec({code:'NEW',media:'NEW'}))):'{}'});
   return route.fulfill({contentType:'text/html',body:'<div id="post-container"></div>'});
  });
  const page=await context.newPage();
- const monitor=F.attachContinuationRequestMonitor(page,{pathname:null,responseEvidence:{maxReceipts:4,maxBytes:1048576,maxMatches:4096,timeoutMs:2000}});
+ const monitor=F.attachContinuationRequestMonitor(page,{pathname:null,responseEvidence:{maxReceipts:4,maxBytes:1048576,timeoutMs:2000,maxActiveReads:4,maxBodies:64}});
  t.after(()=>monitor.detach());
  await page.goto(F.PROVIDER_PHOTO_URL,{waitUntil:'domcontentloaded'});
  await page.evaluate(async()=>{for(let i=0;i<8;i++)await fetch('/api/track?i='+i);await fetch('/api/posts');});
  const end=Date.now()+8000;
- while(!monitor.receipts().list.some(r=>r.path==='/api/posts'&&r.state==='read')&&Date.now()<end)await pause(20);
+ while(!monitor.receipts().list.some(r=>r.path==='/api/posts')&&Date.now()<end)await pause(20);
  const receipts=monitor.receipts();
  assert.ok(monitor.snapshot().started>=9,'the fixture must really issue the unrelated traffic');
  assert.equal(receipts.overflow,null,'unrelated API traffic exhausted the listing evidence bound');

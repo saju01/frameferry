@@ -33,6 +33,10 @@ test('all redirect hops count and 429 never retries',async t=>{
 // observation can satisfy - which is exactly how a window with zero API transport
 // used to read as a settled observation. `status` still governs the document
 // response, so the denial fixtures keep refusing at the same request.
+// The listing response carries the REAL observed representation whose single tuple is exactly
+// the card this fixture paints; see test/fixtures/listing-page.js.
+const {rec,posts}=require('./fixtures/listing-page.js');
+const FIXTURE_LISTING=posts(rec({code:'POST',media:'POST',date:'8 hours ago'}));
 const FIXTURE_CARD='<div class="post-card"><img class="post-image" data-type="image" src="/media?id=POST"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>8 hours ago</span></span></div></div>';
 async function browserFixture(t,status=200,profileDelay=0){
  const chromium=require('playwright').chromium;
@@ -44,11 +48,11 @@ async function browserFixture(t,status=200,profileDelay=0){
   +'fetch("/api/profile",{method:"POST"}).then(function(r){return r.json();}).then(function(p){'
   +'var render=function(){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@\'+h+\'</span> \'+p.posts+\' posts\';};'
   +'if(PROFILE_DELAY>0)setTimeout(render,PROFILE_DELAY);else render();});'
-  +'fetch("/api/posts",{method:"POST"}).then(function(r){return r.json();}).then(function(d){document.getElementById("post-container").innerHTML=d.html;});}';
+  +'fetch("/api/posts",{method:"POST"}).then(function(r){return r.json();}).then(function(){document.getElementById("post-container").innerHTML='+JSON.stringify(FIXTURE_CARD)+';});}';
  const html='<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><script>'+script+'</script>';
  const wrap={newContext:async opts=>{assert.equal(opts.serviceWorkers,'block');const c=await browser.newContext(opts);contexts.push(c);await c.route('**/*',async route=>{
   const u=new URL(route.request().url());if(u.pathname==='/media'){preview++;return route.abort();}
-  if(u.pathname.startsWith('/api/')){apiRequests++;return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/profile'?'{"posts":1}':JSON.stringify({html:FIXTURE_CARD})});}
+  if(u.pathname.startsWith('/api/')){apiRequests++;return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/profile'?'{"posts":1}':JSON.stringify(FIXTURE_LISTING)});}
   requests++;
   await route.fulfill({status:Array.isArray(status)?status[requests-1]||200:status,contentType:'text/html',body:html});
  });return c;},close:async()=>{browserCloses++;}};

@@ -4,6 +4,9 @@
 // no provider traffic, no private paths, no signed locators and no import-data hacks.
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs/promises'),fsSync=require('node:fs'),os=require('node:os'),path=require('node:path');
 const F=require('../src/index.js'),W=require('../src/sync-window.js'),{openBudget}=require('../src/request-budget.js');
+// Listing responses use the REAL observed representation; see test/fixtures/listing-page.js.
+const {rec,posts}=require('./fixtures/listing-page.js');
+const NEW_LISTING=posts(rec({code:'NEW',media:'NEW'}));
 
 async function tmp(t){const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-rereview-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
 async function launch(t){
@@ -39,7 +42,7 @@ async function windowFixture(t,mode){
  // browser-issued /api/profile and /api/posts, so every fixture below does too.
  const apiDriven=prelude=>'function show(){'+prelude
   +'fetch("/api/profile").then(function(r){return r.json();}).then(function(){'+PROFILE+'});'
-  +'fetch("/api/posts").then(function(r){return r.json();}).then(function(d){document.getElementById("post-container").innerHTML=d.html;});}';
+  +'fetch("/api/posts").then(function(r){return r.json();}).then(function(){document.getElementById("post-container").innerHTML='+JSON.stringify(card('NEW'))+';});}';
  const script=mode==='subframe'?'function show(){'+PROFILE+'document.getElementById("post-container").innerHTML='+JSON.stringify(card('OLD'))+';}'
   :mode==='notfound'?afterApis(section('error-not-found'))
   :mode==='private'?afterApis(section('error-private'))
@@ -57,7 +60,7 @@ async function windowFixture(t,mode){
    api.push({path:u.pathname,main});
    if(mode==='http-denied'&&u.pathname==='/api/profile')return route.fulfill({status:403,contentType:'application/json',body:'{}'});
    if(mode==='settlement-race'&&u.pathname==='/api/posts'&&!heldPosts){heldPosts=route;return;}
-   return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({posts:1,html:card('NEW')})});
+   return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/posts'?JSON.stringify(NEW_LISTING):'{"posts":1}'});
   }
   if(u.pathname==='/child')return route.fulfill({status:200,contentType:'text/html',body:'<script>fetch("/api/profile");fetch("/api/posts");</script>'});
   return route.fulfill({status:200,contentType:'text/html',body:html});
@@ -67,7 +70,7 @@ async function windowFixture(t,mode){
   releasePosts:async()=>{
    assert.ok(heldPosts,'the fixture must really be holding the posts response');
    const held=heldPosts;heldPosts=null;
-   await held.fulfill({status:200,contentType:'application/json',body:JSON.stringify({html:card('NEW')})});
+   await held.fulfill({status:200,contentType:'application/json',body:JSON.stringify(NEW_LISTING)});
    await page.waitForFunction(()=>document.querySelector('#post-container [data-id]')?.getAttribute('data-id')==='NEW');
   }};
 }

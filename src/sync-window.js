@@ -260,80 +260,91 @@ const CATEGORY_LISTING_PATH={POSTS:'/api/posts',REELS:'/api/reels',STORIES:'/api
 // Reasons that describe a DOM which is simply not the current response's listing YET. They are
 // honest non-success, and unlike an ambiguous or unknown evidence state they do not invalidate
 // the settled stability run: the page is quiet, so the next sample re-evaluates cheaply.
-const BINDING_NOT_YET=new Set(['unrendered-response-identity','listing-predates-request','response-evidence-pending','listing-exceeds-response-identity']);
-const BINDING_UNRENDERED=new Set(['unrendered-response-identity','listing-predates-request']);
+const BINDING_NOT_YET=new Set(['unrendered-response-tuples','listing-exceeds-response-tuples','listing-tuple-mismatch','response-evidence-pending']);
+const BINDING_UNRENDERED=new Set(['unrendered-response-tuples','listing-tuple-mismatch']);
 // Positive evidence that the listing about to be returned belongs to the CURRENT response/render
 // generation - the question a transport epoch cannot answer, because a browser can have decoded
-// the new bytes while still showing the old cards. Exactly two bases may accept:
+// the new bytes while still showing the old cards. Exactly ONE basis may accept:
 //
-//   response-identity  the current generation's listing response carries recognizable provider
-//                      identities, and every one of them is a member of the rendered listing.
-//                      Direction matters: response -> DOM, so an item that has arrived but has
-//                      not rendered is a miss. A response that legitimately repeats the visible
-//                      listing binds it without requiring any change.
-//   request-generation-provenance
-//                      the listing response carries NO recognizable identity (an inert body, or
-//                      a payload shape this scan cannot read). Identity membership is then
-//                      unavailable, so acceptance instead demands positive causal evidence that
-//                      the rendered listing is not the pre-request one: a commit into the listing
-//                      container AFTER the current listing request was issued.
+//   response-tuples  the current generation's listing response decoded, under a STRICT versioned
+//                    grammar, into a complete ordered list of card tuples - shortcode, media
+//                    locator identity, media type and dateRaw, with carousel associations and
+//                    multiplicity preserved - and the rendered listing is exactly that list, in
+//                    that order, compared exhaustively in BOTH directions.
 //
-// Everything else - evidence still decoding, unreadable/oversized/overflowed evidence, an
-// out-of-order settlement, a missing or retired render observation - is inconclusive and returns
-// unbound. Inconclusive never becomes an empty or nothing-new acceptance.
-function bindWindowRender({receipts,probe,cards,category,attributedPaths}){
+// There is deliberately no second basis. Request-generation provenance used to accept a response
+// that carried no readable identity at all, on the strength of a listing commit that happened
+// after the request was issued; a response handler can re-render the OLD cards after decoding and
+// satisfy any such temporal test, so the absence of positive binding is now inconclusive rather
+// than a licence to publish a nothing-new COMPLETE.
+//
+// Everything else - evidence still being read, unreadable/oversized/cancelled/unknown evidence,
+// an out-of-order settlement, a missing or retired render observation - is inconclusive and
+// returns unbound. Inconclusive never becomes an empty or nothing-new acceptance.
+function bindWindowRender({receipts,probe,bodies,cards,category}){
  const fail=(reason,extra={})=>({bound:false,basis:null,reason,...extra});
  const path=CATEGORY_LISTING_PATH[category];
  if(!path)return fail('unknown-category');
  if(!probe||probe.overflow)return fail('render-observation-unavailable');
  if(!receipts||typeof receipts!=='object'||!Array.isArray(receipts.list))return fail('render-observation-unavailable');
  if(receipts.overflow)return fail('unknown-response-evidence');
+ // The bounded bodies must come from the SAME document and the SAME render generation as the
+ // cards they are about to be compared against - they arrived in the same round trip.
+ if(!bodies||typeof bodies!=='object'||!Array.isArray(bodies.bodies))return fail('render-observation-unavailable');
+ if(bodies.overflow)return fail('unknown-response-evidence');
+ if(bodies.token!==probe.token||bodies.generation!==probe.generation)return fail('render-observation-unavailable');
  const listing=receipts.list.filter(r=>r.path===path);
  if(!listing.length)return fail('no-listing-response');
- if(listing.some(r=>r.state==='reading'))return fail('response-evidence-pending');
- // 'read' carries identity; 'inert' positively carries none. Anything else - oversized,
- // unreadable, or carrying media locators this codebase cannot reduce to a provider identity -
- // is unknown evidence, and unknown evidence never accepts.
- if(listing.some(r=>!['read','inert'].includes(r.state)))return fail('unknown-response-evidence');
  // Issue order decides which response is the current one; a newest-issued response that is not
  // also the newest-settled leaves which listing the page rendered genuinely ambiguous.
  const latest=listing.reduce((a,b)=>b.seq>a.seq?b:a);
  if(listing.some(r=>r.seq<latest.seq&&r.finishSeq>latest.finishSeq))return fail('out-of-order-response');
- const identities={media:latest.media.length,shortcodes:latest.shortcodes.length};
- if(latest.state==='read'){
-  // Full membership in BOTH directions for every token class the response actually carries: a
-  // received-but-unrendered item is a miss, and a rendered card the current response does not
-  // identify is not something this window may certify either.
-  const domMedia=new Set(cards.map(c=>F.providerMediaFingerprint(c.href)).filter(Boolean));
-  const domShortcodes=new Set(cards.map(c=>c.shortcode).filter(Boolean));
-  const responseMedia=new Set(latest.media),responseShortcodes=new Set(latest.shortcodes);
-  const missing={media:[...responseMedia].filter(x=>!domMedia.has(x)).length,shortcodes:[...responseShortcodes].filter(x=>!domShortcodes.has(x)).length};
-  const extra={media:identities.media?[...domMedia].filter(x=>!responseMedia.has(x)).length+cards.filter(c=>!F.providerMediaFingerprint(c.href)).length:0,
-   shortcodes:identities.shortcodes?[...domShortcodes].filter(x=>!responseShortcodes.has(x)).length:0};
-  if(missing.media||missing.shortcodes)return fail('unrendered-response-identity',{identities,missing});
-  if(extra.media||extra.shortcodes)return fail('listing-exceeds-response-identity',{identities,missing:{media:0,shortcodes:0},extra});
-  return {bound:true,basis:'response-identity',reason:null,identities,missing:{media:0,shortcodes:0}};
- }
- // Inert body: identity membership is unavailable, so acceptance falls back to causal
- // provenance. Every listing request the transport monitor attributed to this document must
- // also have been seen at issue time, or the issue point being compared is the wrong one.
- const issuedHere=(probe.counts||{})[path]||0;
- if(issuedHere!==((attributedPaths||{})[path]||0))return fail('render-observation-unavailable',{identities});
- const issued=(probe.requests||[]).filter(r=>r.path===path&&r.generation===probe.generation).at(-1);
- if(!issued)return fail('render-observation-unavailable',{identities});
- // A LISTING commit, not merely a mutation: an engagement/caption/signed-URL rotation inside
- // the container paints no listing and can never satisfy this.
- if(!(probe.listingCommitGen>issued.listingCommitGen))return fail('listing-predates-request',{identities,listingIssueGen:issued.listingCommitGen});
- return {bound:true,basis:'request-generation-provenance',reason:null,identities,listingIssueGen:issued.listingCommitGen};
+ // Every listing response the TRUSTED transport saw must have a bounded body observation, and
+ // vice versa. A listing delivered on a transport the page-side observer cannot see, or a body
+ // with no matching transport receipt, means the evidence is incomplete - refuse it rather than
+ // reason from the part that happened to be observable.
+ const observed=bodies.bodies.filter(b=>b.path===path&&b.generation===bodies.generation);
+ if(observed.length!==listing.length)return fail('unknown-response-evidence',{observed:observed.length,expected:listing.length});
+ const body=observed.find(b=>b.ordinal===latest.arrivalSeq);
+ if(!body)return fail('unknown-response-evidence');
+ if(body.state==='reading')return fail('response-evidence-pending');
+ // Oversized, cancelled, timed out, unobserved: all genuinely unknown, none an acceptance.
+ if(body.state!=='read')return fail('unknown-response-evidence');
+ const decoded=F.decodeListingResponse(body.text);
+ if(!decoded.supported)return fail('unknown-response-evidence');
+ const schema={version:decoded.version,records:decoded.records,children:decoded.children,cards:decoded.tuples.length};
+ // FULL tuples on both sides. Independent media and shortcode sets, token occurrence counts, a
+ // matching subset or shortcode-only evidence cannot show that a card belongs to its own post,
+ // that a carousel has the right number of children, or that the date and type on a repeated id
+ // are the current ones. Sequence equality answers all of that at once.
+ const key=t=>JSON.stringify([t.shortcode||null,t.mediaIdentity||null,t.mediaType||null,t.dateRaw??null]);
+ const responseKeys=decoded.tuples.map(key);
+ const domKeys=cards.map(c=>key({shortcode:c.shortcode,mediaIdentity:F.providerMediaIdentity(c.href),mediaType:c.mediaType,dateRaw:c.dateRaw}));
+ if(responseKeys.length===domKeys.length&&responseKeys.every((k,i)=>k===domKeys[i]))
+  return {bound:true,basis:'response-tuples',reason:null,schema,unmatched:{missing:0,extra:0,mismatched:0}};
+ // Counter-only diagnosis of HOW it failed to match, so the typed reason is honest without any
+ // locator, caption or payload string reaching a record.
+ const tally=list=>list.reduce((m,k)=>m.set(k,(m.get(k)||0)+1),new Map());
+ const responseCount=tally(responseKeys),domCount=tally(domKeys);
+ let missing=0,extra=0;
+ for(const [k,n] of responseCount)missing+=Math.max(0,n-(domCount.get(k)||0));
+ for(const [k,n] of domCount)extra+=Math.max(0,n-(responseCount.get(k)||0));
+ let mismatched=0;
+ for(let i=0;i<Math.max(responseKeys.length,domKeys.length);i++)if(responseKeys[i]!==domKeys[i])mismatched++;
+ const unmatched={missing,extra,mismatched};
+ // A response item that has arrived but not rendered, a listing larger than the response, or the
+ // same multiset in a different order are all quiet-page states that the very next sample may
+ // resolve, so they stay "not yet" rather than discarding a settled run.
+ const reason=missing&&!extra?'unrendered-response-tuples'
+  :(!missing&&extra?'listing-exceeds-response-tuples':'listing-tuple-mismatch');
+ return fail(reason,{schema,unmatched});
 }
 // Counters only: no locator, caption, payload text or shortcode ever reaches a persisted record.
 function bindingRecord(binding,probe){
  return {basis:binding.basis??null,reason:binding.reason??null,
-  responseIdentities:binding.identities?{media:binding.identities.media,shortcodes:binding.identities.shortcodes}:null,
-  missingIdentities:binding.missing?{media:binding.missing.media,shortcodes:binding.missing.shortcodes}:null,
-  unidentifiedCards:binding.extra?{media:binding.extra.media,shortcodes:binding.extra.shortcodes}:null,
-  commitGen:probe?probe.commitGen:null,identityGen:probe?probe.identityGen:null,
-  listingIssueGen:Number.isInteger(binding.listingIssueGen)?binding.listingIssueGen:null};
+  schema:binding.schema?{version:binding.schema.version,records:binding.schema.records,children:binding.schema.children,cards:binding.schema.cards}:null,
+  unmatched:binding.unmatched?{missing:binding.unmatched.missing,extra:binding.unmatched.extra,mismatched:binding.unmatched.mismatched}:null,
+  commitGen:probe?probe.commitGen:null,identityGen:probe?probe.identityGen:null};
 }
 // The transport epoch of one instant: which generation is current, plus the attributed
 // and the global counters, read as a single value. Two equal epochs around an awaited
@@ -346,13 +357,16 @@ function observationEpoch(monitor){
  const g=monitor.snapshot();
  return a.generation+'|'+a.started+'/'+a.settled+'/'+a.failed+'/'+a.inFlight+'|'+g.started+'/'+g.settled+'/'+g.failed+'/'+g.inFlight;
 }
-async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
+async function discover(page,handle,budget,deadline,maxCards,waitMs=45000,options={}){
  // Shorter waits are an injected offline-test seam, never an expanded job budget.
  waitMs=number(waitMs,45000,1,45000,'readiness wait');
  page.setDefaultTimeout(Math.max(1,Math.min(45000,deadline-Date.now())));
  // Bodies the page has already received are inspected for identity evidence; nothing extra is
  // requested, and the decoded text never outlives the scan.
- const monitor=F.attachContinuationRequestMonitor(page,{pathname:null,responseEvidence:{maxBytes:1048576,maxMatches:4096,maxReceipts:64,timeoutMs:2000}}),started=Date.now();
+ // Admitted observer bounds. The page-side clone reader is installed under exactly these, so
+ // what may be looked at and what may be held are one configuration, not two.
+ const evidenceBounds=options.responseEvidence||{maxBytes:1048576,maxReceipts:64,timeoutMs:2000,maxActiveReads:4,maxBodies:64,maxRetainedBytes:4194304};
+ const monitor=F.attachContinuationRequestMonitor(page,{pathname:null,responseEvidence:evidenceBounds}),started=Date.now();
  let statuses=()=>({}),windowStarted=null,last=null;
  const d={schemaVersion:1,handle,phase:'profile',cause:null,profileMatched:false,profileHasTotal:false,category:null,challenge:false,sectionError:null,browserOpen:false,rawCount:0,maxRawCount:0,samples:0,signatureChanges:0,stableSamples:0,binding:null,waitMs,elapsedMs:0,deadlineRemainingMs:0,transport:null};
  const capture=()=>{d.browserOpen=!page.isClosed()&&page.context().browser().isConnected();d.elapsedMs=Date.now()-(windowStarted??started);d.deadlineRemainingMs=Math.max(0,deadline-Date.now());d.transport={...monitor.snapshot(),statuses:statuses()};return JSON.parse(JSON.stringify(d));};
@@ -386,7 +400,7 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
   statuses=await installGuards(page,budget,deadline);assertTime();
   // Installed BEFORE the first navigation: a commit or a request that predates the render
   // observation could never be placed in the order that acceptance depends on.
-  await F.installRenderObservationProbe(page);assertTime();
+  await F.installRenderObservationProbe(page,monitor.evidenceLimits?.()||evidenceBounds);assertTime();
   await page.goto(F.PROVIDER_PHOTO_URL,{waitUntil:'domcontentloaded'});assertTime();
   await page.fill('input#search-input',handle);
   // Everything the previous document/search observed stops being evidence about the
@@ -439,9 +453,9 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000){
     // ONE round trip for the cards AND the metadata AND the render generations: a local-only
     // replacement cannot slip between two halves of the accepting observation, because there
     // are no two halves.
-    const snapshot=await F.observeWindowSnapshot(page,{handle,selector:WINDOW_CHALLENGE_SELECTOR});
+    const snapshot=await F.observeWindowSnapshot(page,{handle,selector:WINDOW_CHALLENGE_SELECTOR,bodies:true});
     apply(snapshot);
-    const binding=bindWindowRender({receipts:monitor.receipts?.(),probe:snapshot.probe,cards:snapshot.cards,category:d.category,attributedPaths:monitor.attributed?.().paths});
+    const binding=bindWindowRender({receipts:monitor.receipts?.(),probe:snapshot.probe,bodies:snapshot.bodies,cards:snapshot.cards,category:d.category});
     d.binding=bindingRecord(binding,snapshot.probe);
     // A separate awaited read on the far side of the snapshot. The transport epoch cannot see
     // a purely local DOM change; the render observation can, and a benign engagement/caption/
@@ -490,17 +504,22 @@ const WINDOW_CHALLENGE_SELECTOR='iframe[src*="captcha" i], iframe[src*="challeng
 // The binding record is counters and typed reasons only - never a locator, caption or payload
 // string. `empty` cannot have attempted a binding at all, and a window whose binding failed is
 // reported under its own cause, so an unbound record can never arrive labelled `unstable`.
-const BINDING_BASES=['response-identity','request-generation-provenance'];
+const BINDING_BASES=['response-tuples'];
 function validBindingRecord(binding,cause){
  if(binding===null)return cause!=='unbound'&&cause!=='unrendered';
  if(cause==='empty')return false;
  if(!binding||typeof binding!=='object'||Array.isArray(binding))return false;
- if(Object.keys(binding).sort().join(',')!=='basis,commitGen,identityGen,listingIssueGen,missingIdentities,reason,responseIdentities,unidentifiedCards')return false;
+ if(Object.keys(binding).sort().join(',')!=='basis,commitGen,identityGen,reason,schema,unmatched')return false;
  if(!BINDING_BASES.includes(binding.basis))return false;
  if(binding.reason!==null)return false;
- const pair=v=>v===null||(!!v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(',')==='media,shortcodes'&&Number.isSafeInteger(v.media)&&v.media>=0&&Number.isSafeInteger(v.shortcodes)&&v.shortcodes>=0);
  const counter=v=>v===null||(Number.isSafeInteger(v)&&v>=0);
- return pair(binding.responseIdentities)&&pair(binding.missingIdentities)&&pair(binding.unidentifiedCards)&&counter(binding.commitGen)&&counter(binding.identityGen)&&counter(binding.listingIssueGen);
+ const schema=v=>v===null||(!!v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(',')==='cards,children,records,version'
+  &&Number.isSafeInteger(v.version)&&v.version>=1&&counter(v.records)&&counter(v.children)&&counter(v.cards));
+ const unmatched=v=>v===null||(!!v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(',')==='extra,mismatched,missing'
+  &&counter(v.missing)&&counter(v.extra)&&counter(v.mismatched));
+ // An ACCEPTED window matched exhaustively, so its counters are all zero by construction.
+ if(binding.unmatched&&(binding.unmatched.missing||binding.unmatched.extra||binding.unmatched.mismatched))return false;
+ return schema(binding.schema)&&unmatched(binding.unmatched)&&counter(binding.commitGen)&&counter(binding.identityGen);
 }
 function localWindowReadiness(d){
  const keys=['schemaVersion','handle','phase','cause','profileMatched','profileHasTotal','category','challenge','sectionError','browserOpen','rawCount','maxRawCount','samples','signatureChanges','stableSamples','binding','waitMs','elapsedMs','deadlineRemainingMs','transport'];

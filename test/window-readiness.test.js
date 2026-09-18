@@ -1,6 +1,17 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs/promises'),os=require('node:os'),path=require('node:path');
 const W=require('../src/sync-window.js');
+// The listing responses this fixture serves use the REAL observed representation, so a healthy
+// handle completes on the same evidence production requires rather than on an inert body.
+const {rec,posts}=require('./fixtures/listing-page.js');
+// What the page below actually paints for a handle in a given mode, expressed as the provider's
+// own p/pc listing: the base card, the unparseable-date variant, or nothing at all.
+const MIDDLE_PAINTS_NOTHING=['empty','no-api','403','429','503','challenge','closed','deadline',
+ 'in-flight','transport-failed','category','profile-drift','section-error'];
+function listingFor(handle,mode){
+ if(handle==='middle'&&MIDDLE_PAINTS_NOTHING.includes(mode))return {p:[],pc:''};
+ return posts(rec({code:'POST',media:'POST',date:handle==='middle'&&mode==='bad-date'?'gibberish date':'1 January 2026'}));
+}
 const jpg=Buffer.from([255,216,255,224,1,2,3,4,255,217]);
 async function fixture(t,mode){
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-ready-'));
@@ -45,7 +56,8 @@ function show(){
     const target=handle==='middle'&&u.pathname===(mode.startsWith('initial-profile-')?'/api/profile':'/api/posts');
     if(target&&['transport-failed','initial-failed-stable','initial-profile-failed-stable'].includes(mode))return route.abort('failed');
     if(target&&['in-flight','initial-pending-stable','initial-profile-pending-stable'].includes(mode))return new Promise(()=>{});
-    return route.fulfill({status:target&&mode==='403'?403:target&&mode==='429'?429:target&&mode==='503'?503:200,contentType:'application/json',body:'{}'});
+    return route.fulfill({status:target&&mode==='403'?403:target&&mode==='429'?429:target&&mode==='503'?503:200,contentType:'application/json',
+     body:u.pathname==='/api/posts'?JSON.stringify(listingFor(handle,mode)):'{}'});
    }
    await route.fulfill({status:200,contentType:'text/html',body:html});
   });return c;
@@ -104,12 +116,17 @@ test('pure local classifier rejects absent, malformed, transport and global dead
  // positive local evidence at all.
  const d={schemaVersion:1,handle:'middle',phase:'window',cause:'empty',profileMatched:true,profileHasTotal:true,category:'POSTS',challenge:false,sectionError:null,browserOpen:true,rawCount:0,maxRawCount:0,samples:45,signatureChanges:0,stableSamples:0,binding:null,waitMs:45000,elapsedMs:45000,deadlineRemainingMs:5000,transport:{started:2,settled:2,failed:0,inFlight:0,paths:{'/api/posts':1,'/api/profile':1},statuses:{200:3}}};
  assert.equal(W.localWindowReadiness(d),true);
- const bound={basis:'response-identity',reason:null,responseIdentities:{media:1,shortcodes:1},missingIdentities:{media:0,shortcodes:0},unidentifiedCards:null,commitGen:2,identityGen:1,listingIssueGen:null};
+ // The accepted record under the proven-contract binding: one basis, the decoded schema shape,
+ // and all-zero unmatched counters - an accepted window matched exhaustively by construction.
+ const bound={basis:'response-tuples',reason:null,schema:{version:1,records:1,children:0,cards:1},unmatched:{missing:0,extra:0,mismatched:0},commitGen:2,identityGen:1};
  assert.equal(W.localWindowReadiness({...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:bound}),true);
  for(const value of [null,{},[],{...d,binding:undefined},{...d,binding:{}},{...d,binding:bound},
   {...d,cause:'unbound',binding:null},{...d,cause:'unrendered',binding:null},
   {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,basis:null}},
-  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,reason:'unrendered-response-identity'}},
+  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,reason:'unrendered-response-tuples'}},
+  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,basis:'request-generation-provenance'}},
+  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,unmatched:{missing:1,extra:0,mismatched:1}}},
+  {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,schema:{version:1,records:1,children:0}}},
   {...d,cause:'unstable',rawCount:1,maxRawCount:1,stableSamples:1,binding:{...bound,commitGen:-1}},{...d,transport:{...d.transport,started:0,settled:0,paths:{}}},{...d,transport:{...d.transport,paths:{'/api/posts':2}}},{...d,transport:{...d.transport,paths:{'/api/profile':2}}},{...d,transport:{...d.transport,started:3,settled:3}},{...d,deadlineRemainingMs:0},{...d,elapsedMs:44999},{...d,waitMs:45001},{...d,challenge:true},{...d,browserOpen:false},{...d,samples:0},{...d,rawCount:1},{...d,stableSamples:2},{...d,profileMatched:false},{...d,transport:{...d.transport,failed:1}},{...d,transport:{...d.transport,statuses:{403:1}}},{...d,transport:{...d.transport,statuses:{429:1}}},{...d,transport:{...d.transport,statuses:{503:1}}}])assert.equal(W.localWindowReadiness(value),false,JSON.stringify(value));
 });
 

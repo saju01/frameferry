@@ -50,6 +50,10 @@ test('composition keeps a prototype-named handle as an own entry of the composed
 });
 
 // --- shared real-DOM fixture for R2/R3 ----------------------------------------
+// The listing response carries the REAL observed representation whose single tuple is exactly
+// the card this fixture paints; see test/fixtures/listing-page.js.
+const {rec,posts}=require('./fixtures/listing-page.js');
+const CARD_LISTING=posts(rec({code:'POST',media:'POST',date:'1 January 2026'}));
 const CARD='<div class="post-card"><img class="post-image" data-type="image"><a class="content-download-btn" href="/media?id=POST"></a><span data-id="POST"></span><div class="post-footer"><span class="icon-group"><span>1 January 2026</span></span></div></div>';
 async function windowFixture(t,{challenge=false,api=true}={}){
  const {chromium}=require('playwright');const executablePath=process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||chromium.executablePath();
@@ -61,7 +65,7 @@ async function windowFixture(t,{challenge=false,api=true}={}){
  const script=api
   ?'function show(){var h=document.getElementById("search-input").value;'
    +'fetch("/api/profile",{method:"POST"}).then(function(r){return r.json();}).then(function(p){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@\'+h+\'</span> \'+p.posts+\' posts\';});'
-   +'fetch("/api/posts",{method:"POST"}).then(function(r){return r.json();}).then(function(d){document.getElementById("post-container").innerHTML=d.html;});}'
+   +'fetch("/api/posts",{method:"POST"}).then(function(r){return r.json();}).then(function(){document.getElementById("post-container").innerHTML='+JSON.stringify(CARD)+';});}'
   :'function show(){var h=document.getElementById("search-input").value;'
    +'document.getElementById("profile-section").innerHTML=\'<span class="username-text">@\'+h+\'</span> 1 posts\';'
    +'document.getElementById("post-container").innerHTML='+JSON.stringify(CARD)+';}';
@@ -70,7 +74,7 @@ async function windowFixture(t,{challenge=false,api=true}={}){
   +(challenge?'<div id="challenge-form">verify</div>':'')+'<script>'+script+'</script>';
  await context.route('**/*',async route=>{
   const u=new URL(route.request().url());
-  if(u.pathname.startsWith('/api/')){apiRequests++;return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/profile'?'{"posts":1}':JSON.stringify({html:CARD})});}
+  if(u.pathname.startsWith('/api/')){apiRequests++;return route.fulfill({status:200,contentType:'application/json',body:u.pathname==='/api/profile'?'{"posts":1}':JSON.stringify(CARD_LISTING)});}
   return route.fulfill({status:200,contentType:'text/html',body:html});
  });
  return {root,ledger,page,budget,apiRequests:()=>apiRequests};
