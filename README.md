@@ -231,6 +231,33 @@ Example private configuration (keep real handles, paths and scheduling outside t
   replace the real run outcome. A genuine cleanup failure is published as
   `requests.ledgerCleanupError` instead of being thrown or silently dropped.
 
+### Window acceptance and listing-response observation
+
+A visible window is accepted as `COMPLETE` only when the rendered cards are bound, tuple for
+tuple and in order, to the provider listing response the page itself received — shortcode, media
+identity, media type and raw date, with carousel children and multiplicity preserved. FrameFerry
+gets those bytes by **passively observing the page's own consumption** of that response.
+
+- **What is observed.** The page-side probe records which listing responses arrived, and hooks
+  `Response.prototype.json` and `Response.prototype.text`. When the page consumes a listing
+  response through either method, FrameFerry looks at the value the page itself asked for, under
+  an admission ceiling, and decodes it outside the page with a closed, strict grammar.
+- **What is *not* observed, and what that means.** Every other path — `arrayBuffer()`, `blob()`,
+  `formData()`, consuming the raw `response.body` stream, consuming a `clone()`, or not consuming
+  the response at all — is **not observed**. Such a window is reported truthfully as
+  **inconclusive** (`WINDOW_NOT_READY`, with a `binding.reason` of `unknown-response-evidence`),
+  never as a completion. Inconclusive is not a failure of the page; it is the absence of the
+  evidence this contract requires.
+- **What FrameFerry never does to get evidence.** It never reads, clones, tees, cancels, locks or
+  disturbs a response body, never creates a `Response`, `ReadableStream`, reader or queue of its
+  own, and never forces the page to consume a body so that observation can succeed. The page
+  receives the native promise and the native `Response` — identity, immutable headers, `clone()`
+  metadata, byte (BYOB) readers, `bodyUsed` and cancellation semantics are the platform's own.
+- **What it may allocate.** The `text()` path allocates nothing to measure a body; the `json()`
+  path performs one bounded, faithful re-serialization whose every limit is checked *before* the
+  allocation it guards, so an oversized value is refused rather than copied. Retention has its
+  own separate ceiling. No heap high-water mark is claimed or reported.
+
 ### Honest limitations
 
 - `COMPLETE` remains **only** the existing current-visible-posts contract. This

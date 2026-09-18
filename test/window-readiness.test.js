@@ -8,6 +8,8 @@ const {rec,posts}=require('./fixtures/listing-page.js');
 // own p/pc listing: the base card, the unparseable-date variant, or nothing at all.
 const MIDDLE_PAINTS_NOTHING=['empty','no-api','403','429','503','challenge','closed','deadline',
  'in-flight','transport-failed','category','profile-drift','section-error'];
+// Modes whose listing body must still be the real representation even though the page will not
+// paint from it: the point of those controls is that correct bytes arrived and were not read.
 function listingFor(handle,mode){
  if(handle==='middle'&&MIDDLE_PAINTS_NOTHING.includes(mode))return {p:[],pc:''};
  return posts(rec({code:'POST',media:'POST',date:handle==='middle'&&mode==='bad-date'?'gibberish date':'1 January 2026'}));
@@ -24,26 +26,51 @@ async function fixture(t,mode){
  '<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><div class="g-recaptcha" style="display:none"></div><script>'+
  'const mode='+JSON.stringify(mode)+';'+
  functionBody()+ '</script>';
- function functionBody(){return `function card(id='POST',date='1 January 2026'){return '<div class="post-card"><img class="post-image" data-type="image"><a class="content-download-btn" href="/media?id='+id+'&signature=PRIVATE"></a><span data-id="POST"></span><div class="post-content"><p>PRIVATE-CAPTION</p></div><span class="likes-trigger" data-id="POST"><span>1</span></span><span class="comments-trigger" data-id="POST"><span>1</span></span><div class="post-footer"><span class="icon-group"><span>'+date+'</span></span></div></div>';}
+ function functionBody(){return `
+// The page's own renderer for the observed p/pc representation: flatten each primary plus its
+// om children in order and paint reverse(vhu|hu) as the /media?id= locator. Affirmative modes
+// paint what they DECODED from the response they actually consumed, so a completing window here
+// rests on the same evidence production requires - not on markup the fixture knew in advance.
+function ffRev(s){return s.split("").reverse().join("");}
+function ffFlat(d){var out=[];(d.p||[]).forEach(function(r){out.push(r);(r.om||[]).forEach(function(k){out.push(k);});});return out;}
+function ffCard(r){var vid=Object.prototype.hasOwnProperty.call(r,"vu");
+ return '<div class="post-card"><img class="post-image" data-type="'+(vid?"video":"image")+'"><a class="content-download-btn" href="/media?id='+encodeURIComponent(ffRev(vid?r.vhu:r.hu))+'&signature=PRIVATE"></a><span data-id="'+r.co+'"></span><div class="post-content"><p>PRIVATE-CAPTION</p></div><span class="likes-trigger" data-id="'+r.co+'"><span>'+r.lc+'</span></span><span class="comments-trigger" data-id="'+r.co+'"><span>'+r.cc+'</span></span><div class="post-footer"><span class="icon-group"><span>'+r.pd+'</span></span></div></div>';}
+// Markup the page paints WITHOUT having read the response: the negative/inconclusive controls.
+function stale(id,date){return '<div class="post-card"><img class="post-image" data-type="image"><a class="content-download-btn" href="/media?id='+id+'&signature=PRIVATE"></a><span data-id="POST"></span><div class="post-content"><p>PRIVATE-CAPTION</p></div><span class="likes-trigger" data-id="POST"><span>1</span></span><span class="comments-trigger" data-id="POST"><span>1</span></span><div class="post-footer"><span class="icon-group"><span>'+(date||'1 January 2026')+'</span></span></div></div>';}
+var STALE=['unstable','date-churn','unread','unsupported','initial-pending-stable','initial-failed-stable','initial-profile-pending-stable','initial-profile-failed-stable'];
 function show(){
- const handle=document.querySelector('#search-input').value,middle=handle==='middle';
+ var handle=document.querySelector('#search-input').value,middle=handle==='middle';
  document.querySelector('#profile-section').innerHTML='<span class="username-text">@'+handle+'</span> 1 posts';
- const posts=document.querySelector('#post-container');
- if(!(middle&&mode==='no-api')){fetch('/api/profile').catch(()=>{});fetch('/api/posts').catch(()=>{});}
- if(!middle){posts.innerHTML=card();return;}
- if(['empty','no-api','delayed','403','429','503','challenge','closed','deadline','in-flight','transport-failed','category','profile-drift','section-error'].includes(mode))posts.innerHTML='';else posts.innerHTML=card();
- if(mode==='bad-date')posts.innerHTML=card('POST','gibberish date');
- if(mode==='delayed')setTimeout(()=>posts.innerHTML=card(),500);
- if(mode==='unstable')setInterval(()=>posts.innerHTML=card('ID'+Date.now()),100);
- if(mode==='date-churn')setInterval(()=>posts.innerHTML=card('POST',Date.now()+' hours ago'),100);
- if(mode==='chatter')setInterval(()=>{posts.querySelector('.likes-trigger span').textContent=Date.now();posts.querySelector('.comments-trigger span').textContent=Date.now();posts.querySelector('.post-content p').textContent='PRIVATE-CAPTION-'+Date.now();posts.querySelector('a').href='/media?signature=PRIVATE-'+Date.now()+'&id=POST';},100);
+ var posts=document.querySelector('#post-container');
+ var paint=function(d){posts.innerHTML=ffFlat(d).map(ffCard).join('');};
+ if(!(middle&&mode==='no-api')){
+  fetch('/api/profile').then(function(r){return r.json();}).catch(function(){});
+  var settled=fetch('/api/posts');
+  // NEGATIVE control: the listing response arrives and is deliberately never consumed.
+  if(middle&&mode==='unread')settled.catch(function(){});
+  // NEGATIVE control: consumed through a path this codebase does not observe.
+  else if(middle&&mode==='unsupported')settled.then(function(r){return r.arrayBuffer();}).catch(function(){});
+  else settled.then(function(r){return r.json();}).then(function(d){
+   if(middle&&mode==='delayed'){setTimeout(function(){paint(d);},500);return;}
+   if(middle&&STALE.indexOf(mode)>=0)return;
+   paint(d);
+  }).catch(function(){});
+ }
+ if(!middle)return;
+ if(STALE.indexOf(mode)>=0)posts.innerHTML=stale('POST');
+ if(mode==='unstable')setInterval(function(){posts.innerHTML=stale('ID'+Date.now());},100);
+ if(mode==='date-churn')setInterval(function(){posts.innerHTML=stale('POST',Date.now()+' hours ago');},100);
+ if(mode==='chatter')setInterval(function(){var likes=posts.querySelector('.likes-trigger span');if(!likes)return;
+  likes.textContent=Date.now();posts.querySelector('.comments-trigger span').textContent=Date.now();
+  posts.querySelector('.post-content p').textContent='PRIVATE-CAPTION-'+Date.now();
+  posts.querySelector('a').href='/media?signature=PRIVATE-'+Date.now()+'&id=POST';},100);
 
- if(['challenge','stable-challenge'].includes(mode))setTimeout(()=>{const el=document.createElement('div');el.id='challenge-form';el.textContent='verify';document.body.append(el);},250);
- if(mode==='closed')setTimeout(()=>window.closeFixtureBrowser(),250);
+ if(['challenge','stable-challenge'].includes(mode))setTimeout(function(){var el=document.createElement('div');el.id='challenge-form';el.textContent='verify';document.body.append(el);},250);
+ if(mode==='closed')setTimeout(function(){window.closeFixtureBrowser();},250);
  if(mode==='category')document.querySelector('.menu-item').setAttribute('data-id','REELS');
- if(mode==='profile-drift')setTimeout(()=>document.querySelector('.username-text').textContent='@wrong',250);
- if(mode==='section-error'){const el=document.createElement('div');el.id='error-no-content';el.textContent='private detail';document.body.append(el);}
- if(['403','429','503','challenge','stable-challenge','closed','deadline'].includes(mode))setTimeout(()=>fetch('/api/must-not-run').catch(()=>{}),1800);
+ if(mode==='profile-drift')setTimeout(function(){document.querySelector('.username-text').textContent='@wrong';},250);
+ if(mode==='section-error'){var el=document.createElement('div');el.id='error-no-content';el.textContent='private detail';document.body.append(el);}
+ if(['403','429','503','challenge','stable-challenge','closed','deadline'].includes(mode))setTimeout(function(){fetch('/api/must-not-run').catch(function(){});},1800);
 }`;}
 
  const wrap={newContext:async opts=>{
@@ -98,6 +125,28 @@ for(const mode of ['in-flight','transport-failed','initial-pending-stable','init
  if(mode.includes('pending')||mode==='in-flight')assert.equal(r.transport.inFlight,1);
  if(mode.includes('failed'))assert.equal(r.transport.failed,1);
  if(mode.includes('stable'))assert.ok(r.stableSamples>=2,'stable raw DOM alone must not complete while initial posts transport is unresolved');
+});
+// NEGATIVE/inconclusive controls for the passive observer (.review-evidence/passive-design.md).
+// In both modes the provider returns the REAL p/pc listing and the page paints a card that
+// matches it tuple for tuple - but the page never consumes that response, or consumes it through
+// a path this codebase does not observe. A correct-looking DOM with no readable response
+// evidence is INCONCLUSIVE, never a completion: these are the fixtures whose synthetic
+// unread-response "success" the passive design deliberately withdraws.
+for(const mode of ['unread','unsupported'])test('real DOM '+mode+' listing evidence is inconclusive even though the cards match',async t=>{
+ const f=await fixture(t,mode),d=await W.syncWindow(f.config,f.deps),h=d.handles.middle;
+ assert.equal(d.stoppedGlobally,true,JSON.stringify(d));
+ assert.equal(h.error.code,'WINDOW_NOT_READY');assert.equal(h.error.scope,'global');
+ assert.equal(h.readiness.cause,'unbound');
+ assert.equal(h.readiness.binding.basis,null);
+ assert.equal(h.readiness.binding.reason,'unknown-response-evidence');
+ assert.equal(h.readiness.rawCount,1,'the counterexample must really have painted a matching card');
+ assert.equal(W.localWindowReadiness(h.readiness),false);
+ // Not an always-refuse implementation: the handle ahead of it consumed its own response and
+ // completed on exactly this mechanism.
+ assert.equal(d.handles.alpha.status,'COMPLETE');
+ assert.equal(d.handles.zulu.status,'NOT_COMPLETED');
+ assert.equal(f.downloads(),1);
+ assert.equal(JSON.stringify(d).includes('PRIVATE'),false);
 });
 test('signature ignores engagement and signed query only; media id, date, type, membership remain binding',()=>{
  const raw={shortcode:'POST',href:'https://instacognito.com/media?id=ID&signature=one',mediaType:'image',dateRaw:'1 January 2026',likes:'1',comments:'2',captionTruncated:'a'};

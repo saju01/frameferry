@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Observe the provider listing response **passively**, at the page's own consumption boundary,
+  and delete the response-stream interposition that preceded it. FrameFerry no longer creates a
+  `Response`, `ReadableStream`, reader, clone, tee or forwarding queue of its own, and no longer
+  reads a body the page has not read: the page keeps the native promise and the native `Response`,
+  with native `clone()` metadata, immutable headers, byte (BYOB) readers, `bodyUsed` and
+  cancellation semantics intact. Listing evidence now comes from the page's own `json()`/`text()`
+  completion. Consumption through any other path — `arrayBuffer()`, `blob()`, `formData()`, the
+  raw body stream, a `clone()`, or no consumption at all — is reported truthfully as inconclusive
+  (`WINDOW_NOT_READY` with `unknown-response-evidence`) rather than certified. The withdrawn
+  design's `peakObserverAllocationBytes` "measured high-water mark" is removed rather than
+  restated: the reported counters are admitted UTF-8 bytes, their UTF-16 upper bound, armed
+  observations and refusals, against the configured ceilings.
+
 - Complete the bounded incremental-job contract for `sync-window`: per-handle
   entries are restricted to exactly five fields (`handle`, `dateAfter`,
   `expectedPosts`, `accessRequired`, `eligibility`) with job-wide policy and

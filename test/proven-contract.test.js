@@ -206,9 +206,9 @@ test('proven contract: an out-of-order listing settlement is inconclusive',async
 });
 
 // === DR-S1: bounded observation at the application's own consumption boundary =============
-// The observer duplicates nothing: it never clones or tees a body. It takes the ONE reader of
-// the original, copies a BOUNDED prefix out of each chunk and forwards that chunk unchanged to
-// the application. See .review-evidence/closure-design.md for the measured bound argument.
+// The observer duplicates nothing and interposes on nothing: it creates no Response, stream,
+// reader, clone, tee or queue, and it observes only the values the application's own json()/
+// text() produced. See .review-evidence/passive-design.md, which supersedes closure-design.md.
 test('DR-S1: the transport monitor reads no response bytes of its own',async()=>{
  // The observer must never transfer or decode a body through the Playwright response API:
  // that call is neither bounded nor cancellable. Touching it here fails the test outright.
@@ -244,11 +244,11 @@ test('DR-S1: a body beyond the observer ceiling is cancelled and never accepts',
  assert.ok(post,'the listing body must have been observed');
  assert.equal(post.state,'oversized');
  assert.equal(post.retainedBytes,0,'a cancelled read retains nothing');
- assert.ok(observed.cancelledReads>=1,'the observation must actually be abandoned at the ceiling');
+ assert.ok(observed.refusedObservations>=1,'the observation must actually be refused at the ceiling');
  assert.equal(observed.retainedBackingBytes,0,'no observer allocation may survive the ceiling');
 });
 // This one drops evidence that has ALREADY been read; a genuinely still-pending observation,
-// released without touching the application's own reader, is covered by
+// released without touching the application's own read, is covered by
 // test/closure-regressions.test.js 'a still-pending observation is released ...'.
 test('DR-S1: a new generation retires already-read bodies and drops retained evidence',async t=>{
  const f=await windowFixture(t,{script:responsePage(paintNow),initial:card('OLD'),

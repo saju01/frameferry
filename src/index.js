@@ -1123,18 +1123,22 @@ async function installPaginationSentinelProbe(page) {
 // through; no request is created, delayed or modified. Bounded: 4096 cards, 256 request
 // records; either ceiling sets `overflow`, which the caller treats as inconclusive.
 const RENDER_OBSERVATION_KEY = '__ffWindowObservation';
-// Admission bounds for the page-side evidence observer. These are what the observer agrees to
-// LOOK at; they are deliberately reported separately from what it can hold, and neither is the
-// test runner's cgroup, which bounds a test process and says nothing about an application read.
-// They bound the OBSERVER's OWN additional allocation, never the browser's request memory:
-//   maxBytes          one observation's admission ceiling AND its single copy buffer, so that
-//                     observation's working allocation is at most 3*maxBytes (copy buffer plus
-//                     a transient decoded string of at most 2 bytes per UTF-8 byte);
-//   maxActiveReads    how many observations may be ARMED at once, so peak observer working
-//                     allocation is at most maxActiveReads * 3 * maxBytes;
+// Admission bounds for the page-side evidence observer. These bound the OBSERVER's OWN
+// ADDITIONAL work, never the browser's request memory - the request, the body and the parsed
+// object are the application's pre-existing normal allocation, which a passive observer neither
+// creates nor prolongs. The test runner's cgroup is not one of these bounds and is not evidence
+// of a per-response ceiling.
+//   maxBytes          one observation's admission ceiling, and the byte budget the bounded
+//                     re-serialization of a parsed value is built under - every limit checked
+//                     BEFORE the allocation it guards, so an oversized value is refused rather
+//                     than copied. The text() path allocates nothing at all: its length is
+//                     counted by an early-exiting scan.
+//   maxActiveReads    how many observations may be ARMED at once, so the observer's additional
+//                     work cannot scale with however many responses happen to land.
 //   maxRetainedBytes  what may still be HELD afterwards - a different question with its own
 //                     ceiling, reported as retainedBytes (UTF-8) and retainedBackingBytes.
-// peakObserverAllocationBytes reports the MEASURED high-water mark rather than the formula.
+// There is deliberately no peakObserverAllocationBytes: the withdrawn interposition's "measured
+// high-water mark" was disproved, and nothing here claims to measure a heap.
 const BODY_OBSERVATION_LIMITS = { maxBytes: 1048576, timeoutMs: 2000, maxActiveReads: 4, maxBodies: 64, maxRetainedBytes: 4194304 };
 const renderObservationSource = (limits = {}) => {
   const b = { ...BODY_OBSERVATION_LIMITS, ...limits };
@@ -1146,8 +1150,8 @@ const renderObservationSource = (limits = {}) => {
   const LISTING = ['/api/posts', '/api/reels', '/api/stories', '/api/highlights'];
   const state = { version: 2, token: String(Date.now()) + '-' + Math.random().toString(36).slice(2),
     generation: 0, commitGen: 0, listingCommitGen: 0, identityGen: 0, requests: [], counts: {}, overflow: null, signature: null,
-    bodies: [], arrivals: {}, retainedBytes: 0, cancelledReads: 0, activeReads: 0,
-    retainedBackingBytes: 0, observerWorkingBytes: 0, peakObserverAllocationBytes: 0 };
+    bodies: [], arrivals: {}, retainedBytes: 0, retainedBackingBytes: 0,
+    activeTaps: 0, refusedObservations: 0 };
   const cards = () => [...document.querySelectorAll('#post-container .post-card')];
   const identity = card => {
     const anchor = card.querySelector('.content-download-btn[href]');
@@ -1208,37 +1212,31 @@ const renderObservationSource = (limits = {}) => {
       state.requests.push({ path: u.pathname, commitGen: state.commitGen, listingCommitGen: state.listingCommitGen, generation: state.generation });
     } catch (e) { state.overflow = 'unreadable-request-observation'; }
   };
-  // Bounded observation by INTERPOSING on the body, never by duplicating it. The observer takes
-  // the ONE reader of the response body and hands the application an equivalent Response whose
-  // body is a pass-through it forwards every chunk into, unchanged and in order. There is
-  // exactly one pull chain and one consumer of the underlying source: no clone(), no tee(), no
-  // second branch. Measured natively, the rejected alternative was clone(): its branch queue
-  // still held an ENTIRE 65536-byte body after the source closed, while the application merely
-  // drained its own branch, and no BYOB view ceiling can bound that. The mechanism argument and
-  // the measurements are in .review-evidence/closure-design.md.
+  // PASSIVE observation of the APPLICATION's OWN consumption. See
+  // .review-evidence/passive-design.md. The observer creates no Response, no ReadableStream, no
+  // reader, no clone, no tee, no queue and no promise in the application's path. It never
+  // consumes, cancels, locks or disturbs a body, so it can never force a page to read one.
   //
-  // What this bounds is the OBSERVER's ADDITIONAL allocation, per armed observation:
-  //   - one evidence copy buffer, right-sized by doubling and never past maxBytes (during a
-  //     grow the old buffer is briefly live too, so under 2*maxBytes at that instant);
-  //   - one transient decoded string of at most 2 bytes per retained UTF-8 byte;
-  //   - the forwarded-but-not-yet-consumed queue, held under a ByteLengthQueuingStrategy with
-  //     highWaterMark = maxBytes, so it is at most maxBytes plus the one chunk that crossed it.
-  // These peak at under 4*maxBytes plus one delivered chunk, and peakObserverAllocationBytes
-  // reports what was MEASURED rather than this bound.
-  // At most maxActiveReads observations are armed at once. Everything else is the browser's
-  // pre-existing normal request/body memory: the chunks forwarded to the application are the
-  // page's own bytes, delivered exactly as they would have been with no observer present, and
-  // the observer neither creates nor prolongs them. This is not a claim over the browser heap.
+  // The mechanism is two hooks, both in the same spirit as the window.fetch wrapper above:
+  //   - window.fetch reads the URL, returns the NATIVE promise it was given, and separately
+  //     subscribes to it only to put the arriving NATIVE Response into a WeakMap;
+  //   - Response.prototype.json / .text call through to the native method, return the NATIVE
+  //     promise it returned, and - only for a registered listing response - subscribe to that
+  //     same promise to look at the value the APPLICATION itself asked for.
+  // Because that subscription is attached before the application attaches its own continuation,
+  // the observation is frozen BEFORE any application code can mutate the parsed value.
   //
-  // Only raw bounded bytes are ever retained - never a manifest, verdict or witness - and every
-  // acceptance decision is made outside this page against the strict decoder. Anything the
-  // observer cannot bound leaves a non-'read' state, which the acceptance seam already treats as
-  // unknown evidence: a chunk that is not an ArrayBufferView (a non-byte source), an arrival
-  // over maxActiveReads, a body it could not interpose on, a read error, an application cancel
-  // (a cancelled stream reports done exactly as an exhausted one does, so without this the
-  // observer could hold a TRUNCATED prefix as a complete body), or a body over the ceiling.
-  // There is no unbounded default read to fall back to.
+  // The interposition this replaces was withdrawn, not repaired: an independent review disproved
+  // its acquisition/backing bound, its "measured peak" claim and its Response-equivalence claim.
+  // There is therefore deliberately no peakObserverAllocationBytes here - the reported numbers
+  // are admitted UTF-8 bytes, their UTF-16 upper bound, armed observations and refusals, and
+  // nothing pretends to be a heap measurement.
   //
+  // SUPPORTED paths are json() and text(). Everything else - arrayBuffer/blob/formData, raw
+  // body-stream consumption, a clone's consumption, or no consumption at all - is typed
+  // inconclusive and can never certify a window. An unsupported path is never a reason to start
+  // a read of our own.
+  const watched = new WeakMap();
   // UTF-8 length WITHOUT allocating: a string's byte length is the admission question, and
   // TextEncoder().encode() would itself be the unbounded copy being guarded against. Early-exits
   // at the ceiling, so the scan is bounded too.
@@ -1254,169 +1252,164 @@ const renderObservationSource = (limits = {}) => {
     }
     return n;
   };
+  // Bounded, faithful re-serialization of the value the application's own json() produced, so
+  // that the SAME strict decoder validates it outside the page. It is deliberately NOT a summary
+  // and NOT a verdict: it emits EVERY own key it finds, so unknown remainder still reaches the
+  // decoder and is still refused there.
+  //
+  // Every limit is checked BEFORE the allocation it guards: a string value or key is refused on
+  // its raw .length - JSON escaping only ever grows a string - so a huge parsed field aborts the
+  // observation instead of being copied. Each node emits at least one byte before recursing, so
+  // the node count is bounded by the byte budget; depth is capped separately because a deeply
+  // nested value would otherwise exhaust the stack before the budget.
+  const MAX_SERIALIZE_DEPTH = 16;
+  // Returns { text } or a typed { reason }: 'oversized' when a BOUND refused it, 'unreadable'
+  // when the value is not something this codebase can represent faithfully. The two are
+  // different facts about the evidence and are never collapsed into one.
+  const serializeWithin = (root, limit) => {
+    const pieces = [];
+    let used = 0, overflowed = false;
+    const emit = piece => {
+      const n = utf8LengthWithin(piece, limit - used);
+      if (n < 0) { overflowed = true; return false; }
+      used += n; pieces.push(piece); return true;
+    };
+    const walk = (value, depth) => {
+      if (depth > MAX_SERIALIZE_DEPTH) return false;
+      if (value === null) return emit('null');
+      const type = typeof value;
+      if (type === 'string') {
+        // The RAW length decides, BEFORE any escaping: JSON escaping only ever grows a string,
+        // so a value that cannot fit unescaped is refused without allocating its escaped copy.
+        if (value.length > limit - used) { overflowed = true; return false; }
+        return emit(JSON.stringify(value));
+      }
+      if (type === 'number') return Number.isFinite(value) ? emit(String(value)) : false;
+      if (type === 'boolean') return emit(value ? 'true' : 'false');
+      if (Array.isArray(value)) {
+        if (!emit('[')) return false;
+        for (let i = 0; i < value.length; i++) {
+          if (i && !emit(',')) return false;
+          if (!walk(value[i], depth + 1)) return false;
+        }
+        return emit(']');
+      }
+      // Anything that is not what JSON.parse produces - a Date, a Map, a boxed primitive, an
+      // exotic object, a function, a symbol, a bigint, undefined - cannot be represented
+      // faithfully here, so it leaves the observation unreadable rather than guessed at.
+      if (type !== 'object' || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) return false;
+      const keys = Object.keys(value);
+      if (!emit('{')) return false;
+      for (let i = 0; i < keys.length; i++) {
+        if (i && !emit(',')) return false;
+        if (keys[i].length > limit - used) { overflowed = true; return false; }
+        if (!emit(JSON.stringify(keys[i]))) return false;
+        if (!emit(':')) return false;
+        if (!walk(value[keys[i]], depth + 1)) return false;
+      }
+      return emit('}');
+    };
+    if (!walk(root, 0)) return { reason: overflowed ? 'oversized' : 'unreadable' };
+    return { text: pieces.join('') };
+  };
   const releaseRetained = target => {
     state.retainedBytes -= target.retainedBytes;
     state.retainedBackingBytes -= target.retainedBackingBytes;
     target.retainedBytes = 0; target.retainedBackingBytes = 0; target.text = null;
   };
-  // Peak is a high-water mark over the observer's OWN working copies plus what it still holds,
-  // so the reported number is measured rather than asserted by a formula.
-  const noteAllocation = () => {
-    const now = state.observerWorkingBytes + state.retainedBackingBytes;
-    if (now > state.peakObserverAllocationBytes) state.peakObserverAllocationBytes = now;
+  // Closing is the ONLY place an armed slot is given back, and it refuses an entry that is no
+  // longer 'reading'. A timed-out or retired observation whose consumption completes LATER
+  // therefore cannot resurrect either its evidence or its accounting.
+  const close = (entry, next) => {
+    if (entry.state !== 'reading') return;
+    if (entry.timer) { clearTimeout(entry.timer); entry.timer = null; }
+    state.activeTaps--;
+    entry.state = next;
+    if (next !== 'read') { state.refusedObservations++; releaseRetained(entry); }
   };
-  // Returns the Response the APPLICATION receives: the original when nothing was interposed, or
-  // an equivalent one carrying the forwarded body. Status, statusText, headers, url, redirected
-  // and type are all carried across, so normal Response semantics are preserved.
-  const observeBody = (pathname, response) => {
-    if (state.bodies.length >= BODY.maxBodies) { state.overflow = 'body-observation-overflow'; return response; }
+  const admit = (entry, text) => {
+    const bytes = utf8LengthWithin(text, BODY.maxBytes);
+    // Over the ADMISSION ceiling: retain nothing at all rather than hold a prefix that could
+    // never decode into complete evidence anyway.
+    if (bytes < 0) { close(entry, 'oversized'); return; }
+    // Make room within the RETENTION ceiling before holding anything new. The oldest retained
+    // bodies are released first and become non-accepting evidence, which is truthful: their
+    // bytes are gone, so they can no longer certify anything.
+    for (const older of state.bodies) {
+      if (state.retainedBytes + bytes <= BODY.maxRetainedBytes) break;
+      if (older === entry || older.state !== 'read' || !older.retainedBytes) continue;
+      releaseRetained(older); older.state = 'released';
+    }
+    if (state.retainedBytes + bytes > BODY.maxRetainedBytes) { close(entry, 'oversized'); return; }
+    entry.text = text; entry.retainedBytes = bytes; entry.retainedBackingBytes = 2 * text.length;
+    state.retainedBytes += entry.retainedBytes; state.retainedBackingBytes += entry.retainedBackingBytes;
+    close(entry, 'read');
+  };
+  // Registers the NATIVE Response the application received. Nothing is read, wrapped or returned:
+  // the application already has the object, and it keeps it.
+  const registerBody = (pathname, response) => {
+    if (!response || (typeof response !== 'object' && typeof response !== 'function')) return;
+    if (state.bodies.length >= BODY.maxBodies) { state.overflow = 'body-observation-overflow'; return; }
     state.arrivals[pathname] = (state.arrivals[pathname] || 0) + 1;
     const entry = { path: pathname, ordinal: state.arrivals[pathname], generation: state.generation,
-      status: response && typeof response.status === 'number' ? response.status : null,
-      state: 'reading', text: null, retainedBytes: 0, retainedBackingBytes: 0, cancel: null };
+      status: typeof response.status === 'number' ? response.status : null,
+      state: 'unconsumed', via: null, text: null, retainedBytes: 0, retainedBackingBytes: 0, timer: null };
     state.bodies.push(entry);
-    // A ceiling on CONCURRENTLY ARMED observations: peak observer working allocation is bounded
-    // by maxActiveReads * 4 * maxBytes rather than by however many responses happen to land.
-    if (state.activeReads >= BODY.maxActiveReads) { entry.state = 'unobserved'; return response; }
-    let source = null;
-    try { source = response && response.body; } catch (e) { source = null; }
-    // A null body (204/205/304, or an opaque response) is nothing to interpose on and nothing to
-    // read: it stays exactly as the application received it.
-    if (!source || typeof source.getReader !== 'function') { entry.state = 'unreadable'; return response; }
-    let reader = null;
-    try { reader = source.getReader(); } catch (e) { entry.state = 'unreadable'; return response; }
-    let done = false, timer = null, buffer = null, filled = 0, working = 0;
-    const finish = next => {
-      if (done) return;
-      done = true;
-      if (timer) { clearTimeout(timer); timer = null; }
-      state.activeReads--;
-      state.observerWorkingBytes -= working; working = 0; buffer = null; filled = 0;
-      // A FINISHED observation holds nothing. Dropping entry.cancel drops the observer's only
-      // long-lived reference into this scope, and with it the reader, the pass-through and
-      // anything still queued in it: from here their lifetime belongs entirely to the page that
-      // holds the Response, so the queue stops being charged to the observer as well. Without
-      // this, state.bodies would pin a forwarded queue for every body the page never consumed.
-      releaseQueue();
-      entry.cancel = null;
-      if (entry.state === 'reading') entry.state = next;
-      if (entry.state !== 'read') releaseRetained(entry);
-    };
-    // Releasing the observer's OWN working memory and evidence. Forwarding to the application
-    // deliberately continues afterwards: refusing to RETAIN a body is not a licence to withhold
-    // it from the page that asked for it.
-    const abandon = next => {
-      if (done) return;
-      state.cancelledReads++;
-      finish(next);
-    };
-    entry.cancel = abandon;
-    const retain = text => {
-      if (done) return;
-      // The decoded string EXISTS before admission can reject it, so it is charged as transient
-      // working allocation on EVERY path - the refusal path allocates it too, and reporting only
-      // the accepting path's peak would understate the observer by up to 2 * maxBytes.
-      const backing = 2 * text.length;
-      state.observerWorkingBytes += backing; noteAllocation();
-      try { admit(text, backing); } finally { state.observerWorkingBytes -= backing; }
-    };
-    const admit = (text, backing) => {
-      const bytes = utf8LengthWithin(text, BODY.maxBytes);
-      // Over the ADMISSION ceiling: retain nothing at all rather than hold a prefix that could
-      // never decode into complete evidence anyway.
-      if (bytes < 0) { abandon('oversized'); return; }
-      // Make room within the RETENTION ceiling before holding anything new. The oldest retained
-      // bodies are released first and become non-accepting evidence, which is truthful: their
-      // bytes are gone, so they can no longer certify anything.
-      for (const older of state.bodies) {
-        if (state.retainedBytes + bytes <= BODY.maxRetainedBytes) break;
-        if (older === entry || older.state !== 'read' || !older.retainedBytes) continue;
-        releaseRetained(older); older.state = 'released';
-      }
-      if (state.retainedBytes + bytes > BODY.maxRetainedBytes) { abandon('oversized'); return; }
-      entry.text = text; entry.retainedBytes = bytes; entry.retainedBackingBytes = backing;
-      state.retainedBytes += bytes; state.retainedBackingBytes += backing;
-      noteAllocation();
-      entry.state = 'read';
-      finish('read');
-    };
-    // COPY out of the chunk into the observer's own fixed buffer, BEFORE it is forwarded. The
-    // chunk and the ArrayBuffer it pins belong to the page; retaining the view would retain that
-    // whole backing allocation, which byteLength accounting cannot see.
-    // RIGHT-SIZED, not ceiling-sized: allocating maxBytes up front would charge a megabyte of
-    // real memory to every few-hundred-byte listing body. The buffer starts small and doubles,
-    // never past the ceiling, so what is actually allocated tracks what was actually delivered.
-    const ensureCapacity = need => {
-      if (buffer && buffer.byteLength >= need) return;
-      const grown = new Uint8Array(Math.min(BODY.maxBytes, Math.max(need, buffer ? buffer.byteLength * 2 : 1024)));
-      if (buffer) grown.set(buffer.subarray(0, filled));
-      buffer = grown;
-      state.observerWorkingBytes += buffer.byteLength - working; working = buffer.byteLength;
-      noteAllocation();
-    };
-    const acceptBytes = view => {
-      if (done) return;
-      if (!ArrayBuffer.isView(view)) { abandon('unreadable'); return; }
-      if (filled + view.byteLength > BODY.maxBytes) { abandon('oversized'); return; }
-      ensureCapacity(filled + view.byteLength);
-      buffer.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength), filled);
-      filled += view.byteLength;
-    };
-    const finishBytes = () => {
-      if (done) return;
-      try { retain(new TextDecoder().decode(buffer ? buffer.subarray(0, filled) : new Uint8Array(0))); }
-      catch (e) { abandon('unreadable'); }
-    };
-    state.activeReads++;
-    timer = setTimeout(() => abandon('unreadable'), BODY.timeoutMs);
-    // The forwarded-but-unconsumed queue is the observer's doing too, so it is MEASURED rather
-    // than assumed: the controller's own desiredSize gives the exact queued byte total under the
-    // ByteLengthQueuingStrategy, resynced on every pull - which is precisely the moment just
-    // after a chunk was added, i.e. when that queue is at its largest.
-    let queued = 0;
-    const noteQueue = controller => {
-      const size = typeof controller.desiredSize === 'number' ? Math.max(0, BODY.maxBytes - controller.desiredSize) : 0;
-      state.observerWorkingBytes += size - queued; queued = size; noteAllocation();
-    };
-    const releaseQueue = () => { state.observerWorkingBytes -= queued; queued = 0; };
-    // The pass-through. Its ByteLengthQueuingStrategy is what lets the observation complete for a
-    // body the page has not started reading yet - a page can render a listing without ever
-    // consuming that Response - while still bounding what may sit forwarded and unconsumed.
-    let forwarded = null;
-    try {
-      forwarded = new ReadableStream({
-        pull(controller) {
-          let read;
-          // A reader released by a failed interposition below rejects here rather than silently
-          // draining an orphaned stream.
-          try { read = reader.read(); } catch (error) { abandon('unreadable'); controller.error(error); return; }
-          return read.then(step => {
-            if (step.done) { finishBytes(); controller.close(); releaseQueue(); return; }
-            acceptBytes(step.value);
-            // The application's bytes go on regardless of what the observation decided.
-            controller.enqueue(step.value);
-            noteQueue(controller);
-          }, error => { abandon('unreadable'); controller.error(error); releaseQueue(); });
-        },
-        cancel(reason) { abandon('unreadable'); releaseQueue(); return reader.cancel(reason); }
-      }, new ByteLengthQueuingStrategy({ highWaterMark: BODY.maxBytes }));
-    } catch (e) { forwarded = null; }
-    if (!forwarded) { abandon('unreadable'); try { reader.releaseLock(); } catch (e) { /* already released */ } return response; }
-    let wrapped = null;
-    try {
-      wrapped = new Response(forwarded, { status: response.status, statusText: response.statusText, headers: response.headers });
-      for (const name of ['url', 'redirected', 'type']) {
-        try { Object.defineProperty(wrapped, name, { configurable: true, enumerable: false, value: response[name] }); }
-        catch (e) { /* a property that cannot be carried is reported by the seam, not guessed at */ }
-      }
-    } catch (e) { wrapped = null; }
-    // Interposing failed: the observation is unknown evidence and the application keeps the
-    // response it already had. The reader taken above MUST be released, or the body it locked
-    // would reject every consumption the page attempts. This is decided synchronously, before
-    // the pass-through's first pull can run on a microtask, so no chunk has been taken yet.
-    if (!wrapped) { abandon('unreadable'); try { reader.releaseLock(); } catch (e) { /* already released */ } return response; }
-    return wrapped;
+    try { watched.set(response, entry); } catch (e) { entry.state = 'unobserved'; }
   };
+  // A supported consumption has STARTED. Arming costs a concurrency slot and a deadline, never a
+  // read: at most maxActiveReads observations may be armed at once, so the observer's additional
+  // bounded work cannot scale with however many responses happen to land.
+  const arm = (entry, via) => {
+    if (state.activeTaps >= BODY.maxActiveReads) { entry.state = 'unobserved'; return false; }
+    state.activeTaps++;
+    entry.state = 'reading'; entry.via = via;
+    // Nothing of the application's is held, so this deadline releases only the observer's own
+    // slot and types the observation inconclusive. The application's promise is untouched.
+    entry.timer = setTimeout(() => close(entry, 'unreadable'), BODY.timeoutMs);
+    return true;
+  };
+  // Runs in the FIRST continuation of the application's own promise, before application code can
+  // see - or mutate - the value.
+  const settle = (entry, extract, value) => {
+    if (entry.state !== 'reading') return;
+    let seen = null;
+    try { seen = extract(value); } catch (e) { seen = null; }
+    if (!seen || typeof seen.text !== 'string') { close(entry, (seen && seen.reason) || 'unreadable'); return; }
+    admit(entry, seen.text);
+  };
+  const EXTRACT = {
+    text: value => (typeof value === 'string' ? { text: value } : { reason: 'unreadable' }),
+    json: value => serializeWithin(value, BODY.maxBytes)
+  };
+  const patch = (name, apply) => {
+    const native = Response.prototype[name];
+    if (typeof native !== 'function') return;
+    const patched = function () {
+      // The APPLICATION's own read, performed by the platform, returning the platform's own
+      // promise - which is exactly what is handed back below.
+      const result = native.apply(this, arguments);
+      let entry = null;
+      try { entry = watched.get(this) || null; } catch (e) { entry = null; }
+      if (entry && entry.state === 'unconsumed') { try { apply(entry, result); } catch (e) { entry.state = 'unobserved'; } }
+      return result;
+    };
+    try { Object.defineProperty(patched, 'name', { value: name, configurable: true }); } catch (e) { /* frozen function */ }
+    try { Object.defineProperty(Response.prototype, name, { value: patched, writable: true, enumerable: false, configurable: true }); }
+    catch (e) { /* a locked-down prototype leaves that path simply unobserved */ }
+  };
+  if (typeof Response === 'function' && Response.prototype) {
+    for (const name of ['json', 'text']) patch(name, (entry, result) => {
+      if (!result || typeof result.then !== 'function') { entry.state = 'unobserved'; return; }
+      if (!arm(entry, name)) return;
+      // A SIDE subscription: the application still receives the native promise returned above.
+      result.then(value => settle(entry, EXTRACT[name], value), () => close(entry, 'unreadable'));
+    });
+    // Consumption paths this codebase does not observe are LABELLED, never read. Saying
+    // "unsupported" out loud is the honest answer; inventing a second read to cover them is the
+    // failure being removed.
+    for (const name of ['arrayBuffer', 'blob', 'formData', 'bytes']) patch(name, entry => { entry.state = 'unsupported'; });
+  }
   const fetchImpl = window.fetch;
   if (typeof fetchImpl === 'function') window.fetch = function (input) {
     try { record(input && typeof input === 'object' ? input.url : input); } catch (e) { state.overflow = 'unreadable-request-observation'; }
@@ -1425,15 +1418,14 @@ const renderObservationSource = (limits = {}) => {
       const u = new URL(String(input && typeof input === 'object' ? input.url : input), location.href);
       if (u.origin === location.origin && LISTING.indexOf(u.pathname) >= 0) {
         const generation = state.generation;
-        // The caller receives the SAME outcome - the same status, headers, url, type and bytes,
-        // in the same order, and the same rejection if the request failed. What it receives is
-        // a Response carrying the forwarded body, because observing without duplicating means
-        // being the single reader of the original. A retired generation observes nothing and
-        // interposes on nothing.
-        return settled.then(response => {
-          try { return generation === state.generation ? observeBody(u.pathname, response) : response; }
-          catch (e) { state.overflow = 'unreadable-body-observation'; return response; }
-        });
+        // A SIDE subscription, purely to learn which native Response arrived. The caller gets the
+        // NATIVE promise back untouched, so it sees the same fulfilment, the same Response object
+        // and the same rejection it would have seen with no observer present. A retired
+        // generation registers nothing.
+        settled.then(response => {
+          try { if (generation === state.generation) registerBody(u.pathname, response); }
+          catch (e) { state.overflow = 'unreadable-body-observation'; }
+        }, () => { /* a failed request is transport evidence, never body evidence */ });
       }
     } catch (e) { /* an unparseable URL is simply not observed, and then not evidence either */ }
     return settled;
@@ -1446,22 +1438,30 @@ const renderObservationSource = (limits = {}) => {
   }
   state.reset = () => {
     state.generation++; state.requests = []; state.counts = {}; state.overflow = null;
-    // A new search retires every body this generation observed: every armed observation is
-    // released - its copy buffer dropped and its evidence discarded - and nothing it retained
-    // survives into the next generation. The application's own reads are left alone.
-    for (const entry of state.bodies) { if (typeof entry.cancel === 'function') entry.cancel('cancelled'); }
+    // A new search retires every body this generation registered: armed observations give back
+    // their slot and their deadline, retained evidence is discarded, and nothing survives into
+    // the next generation. A late completion finds a non-'reading' entry and does nothing, so it
+    // can resurrect neither the evidence nor the accounting. The application's own reads, which
+    // the observer never held, are untouched.
+    for (const entry of state.bodies) {
+      if (entry.state === 'reading') { state.activeTaps--; if (entry.timer) { clearTimeout(entry.timer); entry.timer = null; } }
+      entry.state = 'retired'; entry.text = null; entry.retainedBytes = 0; entry.retainedBackingBytes = 0;
+    }
     state.bodies = []; state.arrivals = {}; state.retainedBytes = 0; state.retainedBackingBytes = 0;
   };
   // Bounded bytes with their trusted-channel coordinates. The decoded text is served only to
   // the single accepting read that decodes it; every other caller sees metadata only.
+  // Exactly what these numbers say and nothing more: admitted UTF-8 bytes, their UTF-16 upper
+  // bound, how many observations are armed and how many were refused at a bound - alongside the
+  // configured ceilings those are measured against. There is no heap high-water claim here, and
+  // the runner cgroup is not one either.
   state.bodyReport = includeText => ({ token: state.token, generation: state.generation, overflow: state.overflow,
-    retainedBytes: state.retainedBytes, cancelledReads: state.cancelledReads, activeReads: state.activeReads,
-    // The observer's own allocation, kept separate from the page's request memory and from what
-    // it merely LOOKED at, so a caller can never read one as the other.
-    retainedBackingBytes: state.retainedBackingBytes, observerWorkingBytes: state.observerWorkingBytes,
-    peakObserverAllocationBytes: state.peakObserverAllocationBytes,
+    retainedBytes: state.retainedBytes, retainedBackingBytes: state.retainedBackingBytes,
+    activeTaps: state.activeTaps, refusedObservations: state.refusedObservations,
+    limits: { maxBytes: BODY.maxBytes, maxRetainedBytes: BODY.maxRetainedBytes,
+      maxActiveReads: BODY.maxActiveReads, maxBodies: BODY.maxBodies, timeoutMs: BODY.timeoutMs },
     bodies: state.bodies.map(entry => ({ path: entry.path, ordinal: entry.ordinal, generation: entry.generation,
-      status: entry.status, state: entry.state, retainedBytes: entry.retainedBytes,
+      status: entry.status, state: entry.state, via: entry.via, retainedBytes: entry.retainedBytes,
       retainedBackingBytes: entry.retainedBackingBytes,
       text: includeText && entry.state === 'read' ? entry.text : null })) });
   // The per-path counts are COMPLETE for this generation even when the bounded request list is
