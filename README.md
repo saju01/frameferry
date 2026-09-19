@@ -166,14 +166,29 @@ Example private configuration (keep real handles, paths and scheduling outside t
   media verified. Output always has `fullHistoryComplete:false`. A stopped/empty/
   unreadable window or partial acquisition is nonzero, never a quiet success.
 - There is **no default signed-account-style hourly or per-run request quota**
-  for this public provider. Starts are paced at least 500 ms apart across browser
-  discovery and downloads. Counts remain auditable; an optional `maxRequests`
+  for this public provider. `public-provider-unpaced-v2` adds no artificial wait
+  between serialized request admissions. Standalone archives also default to zero
+  post-download delay; explicit caller `delayMs` remains supported. Counts remain auditable; an optional `maxRequests`
   bounds one job only and is not advertised as a provider quota. Default resource
   bounds remain 1 GiB total download, 50 MiB/file, 10 minutes and 1,000 visible
   cards/handle. All provider-origin browser requests and download/redirect hops
   are counted; cosmetic previews, styles and fonts are blocked before sending.
-  Real provider denials (including 429 and its Retry-After evidence) remain
-  sticky across run IDs. Existing accounting/denials are never reset to resume.
+  A real refusal stops the entire current operation and its run ID, including queued
+  acquisitions. A distinct later attempt enforces actual provider restrictions:
+  401/407 authentication, 451 legal restrictions, and evidenced login redirects
+  remain blocked. This version has no audited auth/legal-resolution API; manual
+  `cleared_denials` fields are ignored, and history must not be deleted to unblock it.
+  429 and 503 Retry-After deadlines are calculated from the original observation
+  (delta-seconds or HTTP-date), never restarted on reopen. Missing or
+  invalid retry time ends this attempt without an internal retry; only a separately
+  authorized/scheduled attempt may re-observe. Generic historical 403/content-wall/
+  DOM refusals alone do not establish an eternal provider ban. No challenge bypass,
+  credential fallback, provider switching or automatic retry loop is introduced.
+  Original refusal objects are retained in `denial_history`, with idempotent versioned
+  `denial_dispositions` and per-run refusal latches. Prior session counters are retained.
+  Malformed evidence is an accounting blocker, not permission to start fresh.
+  `requests.denial` describes the effective stop, while `requests.denialHistory`
+  exposes typed historical dispositions separately from `requests.activeRestriction`.
   Stale ledger locks require explicit operator inspection, never automatic reset.
 - Each completed file is a normal verified FrameFerry receipt. Restarts reuse
   positively bound, rehashed receipts. Old carousel positions and changing locators
@@ -211,6 +226,12 @@ Example private configuration (keep real handles, paths and scheduling outside t
   new". A `WINDOW_NOT_READY` handle carries a `readiness` diagnostics block (no
   DOM text, caption, API payload or signed URL) and is isolated to that handle
   only when that evidence is positively local; otherwise it is a global stop.
+  A current-generation, settled HTTP-success listing with the requested profile but
+  unsupported grammar is `UNSUPPORTED_LISTING_FORMAT`, a handle-local PARTIAL, never
+  COMPLETE. Positively attributed profile-not-found is `HANDLE_UNAVAILABLE` and local
+  too. Later handles proceed only after owned-page closure and refusal-observation
+  drain. Missing/oversized body evidence, observer faults, ambiguous transport and
+  cleanup failures remain global. Private/access walls still cancel the current operation.
 - The job deadline bounds request admission: no provider request is reserved or
   forwarded after the deadline, browser connect/launch timeouts and poll sleeps
   are clamped to the remaining budget, and a recorded provider denial keeps
@@ -248,6 +269,13 @@ gets those bytes by **passively observing the page's own consumption** of that r
   **inconclusive** (`WINDOW_NOT_READY`, with a `binding.reason` of `unknown-response-evidence`),
   never as a completion. Inconclusive is not a failure of the page; it is the absence of the
   evidence this contract requires.
+- **Supported variations and diagnostics.** Video children use the same equal
+  `vu`/`vhu` mapping as root videos; missing captions are allowed on roots and children.
+  Present captions remain bounded strings. Nested children, unequal variants, missing
+  identity/date/media fields and unknown fields remain unsupported. Every ordered tuple
+  and its cardinality must still match. Optional `binding.detail` uses a fixed vocabulary
+  to distinguish decoder reasons, receipt/body overflow, missing evidence and body-read
+  state; it never contains tokens, field names from a response, or source payloads.
 - **What FrameFerry never does to get evidence.** It never reads, clones, tees, cancels, locks or
   disturbs a response body, never creates a `Response`, `ReadableStream`, reader or queue of its
   own, and never forces the page to consume a body so that observation can succeed. The page
@@ -272,27 +300,57 @@ gets those bytes by **passively observing the page's own consumption** of that r
 
 ### Honest limitations
 
-- `COMPLETE` remains **only** the existing current-visible-posts contract. This
-  work makes **no** claim to fix live media transport, full-feed coverage, or
-  history coverage.
-- The scheduled runtime remains pinned to an older revision and its previous
-  Node denial still stands; nothing here changes the deployed scheduled runtime.
-- A robust public browser streaming transport is a **separate future design, not
-  delivered here**. Node's global `fetch` and a buffered `BrowserContext`
-  `APIRequestContext` are NOT proven equivalent; a buffered `context.request`
-  candidate was rejected because it allocates before enforcing byte limits and
-  lacks active abort. A future transport would require streaming with
-  backpressure, cancellation, redirect/request accounting, and privacy and
-  denial tests. None of that exists yet, and no release date is implied.
+- `COMPLETE` remains **only** the existing current-visible-posts contract, not
+  full-feed or history coverage. Offline session-conditioned tests do not prove
+  availability of any live provider; current-operation refusals and actual active
+  restrictions remain in force. Historical evidence is never relabelled successful.
+- `sync-window` keeps its discovery page open through acquisition and uses native
+  browser `fetch` in a CDP isolated world in that same context/session. It does not
+  export cookies or headers, change browser identity, attach to a page-controlled
+  bridge, or fall back to Node. Standalone `downloadOne` retains its Node default.
+- Media is a separate response owned by the transport, **not** the passive listing
+  observer's response. One outstanding BYOB pull transfers at most 16 KiB of media
+  bytes (a bounded numeric array over CDP), only when the file writer requests it.
+  There is no whole-media buffer, string or base64 conversion. Explicit per-pull
+  typed arrays, numeric serialization and Node buffers have constant-size bounds;
+  Chromium's native fetch/network buffers, protocol implementation, parser, GC and
+  page heap are **not** an enforceable whole-browser memory bound.
+- Initial media URL and public-DNS validation still precede browser acquisition.
+  Browser media redirects are rejected as `BROWSER_REDIRECT`: manual mode cannot
+  expose a redirect target safely for hop validation. No redirect is followed and
+  no alternate transport is tried. Chromium with native byte/BYOB readers is
+  required; unsupported browser behavior fails closed.
+- Browser media requests pass the same serialized accounting guard, counted once as downloads.
+  Refusals, byte/time limits and aborts cancel the source and remove partial files;
+  cleanup errors are non-success. A successful browser session does not authorize
+  deleting refusal history or retrying a refused request within the same operation.
+- Cancellation covers CDP attachment/setup as well as reads and EOF cleanup.
+  After asynchronous file preparation and a fresh visible-refusal check, the
+  writer checks its stop/deadline gate and publishes media plus receipt in a
+  synchronous, non-yielding commit section. Pre-commit stops remove only this
+  acquisition's temporary artifacts; earlier verified receipts remain intact.
+  The retained page is sampled for visible challenges/access walls with at most
+  one DOM read in flight, including while a media read is stalled. Actual page
+  closure stops new samples; an admitted sample is drained and classified before
+  accepting the handle or releasing the ledger. This drain is bounded by the job
+  deadline and a one-second cleanup grace. Failed/unresolved sampling is non-success;
+  a late result after that stop cannot mutate the released ledger. Files committed
+  before a later refusal remain valid prior work. Media temporary files are created
+  exclusively, and a failed creation never authorizes removing the foreign path.
+- `COMPLETE` on a handle proves its acquisition and owned-page cleanup, not the
+  later context/client cleanup for the whole job. A context cleanup failure makes
+  the job `PARTIAL / BROWSER_CLEANUP`; its already-complete handles remain eligible
+  for receipt-verified local composition. Composition does not certify that the
+  original job released every browser resource.
 - Window stability is keyed on the provider media locator fingerprint, falling
   back to the raw href when that locator is absent. If the provider ever stops
   emitting the media id, every render differs and no handle can stabilise; each
   would fail closed as `WINDOW_NOT_READY` for the full readiness wait. Fail-closed
   is intended, but the effect is fleet-wide rather than per-handle.
-- A non-denial provider HTTP failure during discovery (for example 503) latches
+- A non-denial provider HTTP failure during discovery (for example 503 without Retry-After) latches
   `DISCOVERY_TRANSPORT`, which is a **global** stop reported as `PARTIAL`, not
   `BLOCKED`. Only real denials (401/403/407/451/429, challenge redirects, content
-  walls) produce `BLOCKED`.
+  walls), plus a 503 Retry-After service restriction, produce `BLOCKED`.
 
 ## Optional Immich export
 

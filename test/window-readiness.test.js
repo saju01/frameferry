@@ -20,8 +20,7 @@ async function fixture(t,mode){
  const browser=await require('playwright').chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/chromium'});
  t.after(async()=>{await browser.close();await fs.rm(root,{recursive:true,force:true});});
  const calls=[];let downloads=0;
- const original=globalThis.fetch;t.after(()=>{globalThis.fetch=original;});
- globalThis.fetch=async()=>{downloads++;return new Response(jpg,{headers:{'content-type':'image/jpeg'}});};
+ // Acquisition is fulfilled on the same guarded browser session as discovery.
  const html=
  '<input id="search-input"><button id="download-btn" onclick="show()">Search</button><div id="profile-section"></div><div id="menu-wrapper"><button class="menu-item active" data-id="POSTS">Posts</button></div><div id="post-container"></div><div class="g-recaptcha" style="display:none"></div><script>'+
  'const mode='+JSON.stringify(mode)+';'+
@@ -78,6 +77,7 @@ function show(){
   await c.exposeFunction('closeFixtureBrowser',()=>browser.close());
   await c.route('**/*',async route=>{
    const u=new URL(route.request().url());calls.push(u.pathname);
+   if(u.pathname==='/media'){downloads++;return route.fulfill({status:200,contentType:'image/jpeg',body:jpg});}
    if(u.pathname.startsWith('/api/')){
     const handle=await route.request().frame().evaluate(()=>document.querySelector('#search-input').value);
     const target=handle==='middle'&&u.pathname===(mode.startsWith('initial-profile-')?'/api/profile':'/api/posts');

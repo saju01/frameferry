@@ -5,6 +5,7 @@
 const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('node:crypto');
 const F=require('./index.js');
 const {openBudget}=require('./request-budget.js');
+const {browserMediaFetch,boundedBrowserCleanup}=require('./browser-media-transport.js');
 const {estimateDate}=require('./date-estimate.js');
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function number(n,def,min,max,label){n=n===undefined?def:n;if(!Number.isInteger(n)||n<min||n>max)throw new F.ArchiveError('BAD_ARGS',label+' outside supported bounds');return n;}
@@ -216,8 +217,9 @@ async function installGuards(page,budget,deadline=Infinity){
   const req=route.request();const u=new URL(req.url());
   // Cosmetic previews never leave the browser. Media acquisition uses downloadOne.
   if(['image','media','stylesheet','font'].includes(req.resourceType()))return route.abort('blockedbyclient');
+  try{assertTime();}catch(e){return route.abort('blockedbyclient');}
   if(u.origin!==F.PROVIDER_ORIGIN)return route.fallback();
-  try{assertTime();await budget.admit('discovery',deadlineSignal(),deadline);assertTime();}
+  try{assertTime();await budget.admit(u.pathname==='/media'&&req.resourceType()==='fetch'?'download':'discovery',deadlineSignal(),deadline);assertTime();}
   catch(e){return route.abort('blockedbyclient');}
   return route.fallback();
  });
@@ -281,17 +283,24 @@ const BINDING_UNRENDERED=new Set(['unrendered-response-tuples','listing-tuple-mi
 // Everything else - evidence still being read, unreadable/oversized/cancelled/unknown evidence,
 // an out-of-order settlement, a missing or retired render observation - is inconclusive and
 // returns unbound. Inconclusive never becomes an empty or nothing-new acceptance.
+// Only these fixed strings may cross the persistence boundary as optional diagnostic detail.
+// Neither observer-supplied state/overflow strings nor response text are copied into records.
+const LISTING_DIAGNOSTIC_DETAILS=new Set(['unreadable-listing-body','unparseable-listing-body',
+ 'unknown-listing-representation','unknown-listing-field','unsupported-listing-variant','listing-exceeds-decoder-bound',
+ 'receipt-observation-overflow','body-observation-overflow','response-body-count-mismatch','missing-response-body',
+ 'body-reading','body-unconsumed','body-unobserved','body-unreadable','body-oversized','body-released','body-cancelled','body-state-unknown']);
 function bindWindowRender({receipts,probe,bodies,cards,category}){
  const fail=(reason,extra={})=>({bound:false,basis:null,reason,...extra});
  const path=CATEGORY_LISTING_PATH[category];
  if(!path)return fail('unknown-category');
- if(!probe||probe.overflow)return fail('render-observation-unavailable');
+ if(!probe||probe.overflow)return fail('render-observation-unavailable',
+  probe?.overflow==='body-observation-overflow'?{detail:'body-observation-overflow'}:{});
  if(!receipts||typeof receipts!=='object'||!Array.isArray(receipts.list))return fail('render-observation-unavailable');
- if(receipts.overflow)return fail('unknown-response-evidence');
+ if(receipts.overflow)return fail('unknown-response-evidence',{detail:'receipt-observation-overflow'});
  // The bounded bodies must come from the SAME document and the SAME render generation as the
  // cards they are about to be compared against - they arrived in the same round trip.
  if(!bodies||typeof bodies!=='object'||!Array.isArray(bodies.bodies))return fail('render-observation-unavailable');
- if(bodies.overflow)return fail('unknown-response-evidence');
+ if(bodies.overflow)return fail('unknown-response-evidence',{detail:'body-observation-overflow'});
  if(bodies.token!==probe.token||bodies.generation!==probe.generation)return fail('render-observation-unavailable');
  const listing=receipts.list.filter(r=>r.path===path);
  if(!listing.length)return fail('no-listing-response');
@@ -304,14 +313,15 @@ function bindWindowRender({receipts,probe,bodies,cards,category}){
  // with no matching transport receipt, means the evidence is incomplete - refuse it rather than
  // reason from the part that happened to be observable.
  const observed=bodies.bodies.filter(b=>b.path===path&&b.generation===bodies.generation);
- if(observed.length!==listing.length)return fail('unknown-response-evidence',{observed:observed.length,expected:listing.length});
+ if(observed.length!==listing.length)return fail('unknown-response-evidence',{detail:'response-body-count-mismatch',observed:observed.length,expected:listing.length});
  const body=observed.find(b=>b.ordinal===latest.arrivalSeq);
- if(!body)return fail('unknown-response-evidence');
- if(body.state==='reading')return fail('response-evidence-pending');
+ if(!body)return fail('unknown-response-evidence',{detail:'missing-response-body'});
+ if(body.state==='reading')return fail('response-evidence-pending',{detail:'body-reading'});
  // Oversized, cancelled, timed out, unobserved: all genuinely unknown, none an acceptance.
- if(body.state!=='read')return fail('unknown-response-evidence');
+ if(body.state!=='read')return fail('unknown-response-evidence',{detail:
+  ['unconsumed','unobserved','unreadable','oversized','released','cancelled'].includes(body.state)?'body-'+body.state:'body-state-unknown'});
  const decoded=F.decodeListingResponse(body.text);
- if(!decoded.supported)return fail('unknown-response-evidence');
+ if(!decoded.supported)return fail('unknown-response-evidence',{detail:decoded.reason});
  const schema={version:decoded.version,records:decoded.records,children:decoded.children,cards:decoded.tuples.length};
  // FULL tuples on both sides. Independent media and shortcode sets, token occurrence counts, a
  // matching subset or shortcode-only evidence cannot show that a card belongs to its own post,
@@ -342,6 +352,7 @@ function bindWindowRender({receipts,probe,bodies,cards,category}){
 // Counters only: no locator, caption, payload text or shortcode ever reaches a persisted record.
 function bindingRecord(binding,probe){
  return {basis:binding.basis??null,reason:binding.reason??null,
+  ...(LISTING_DIAGNOSTIC_DETAILS.has(binding.detail)?{detail:binding.detail}:{}),
   schema:binding.schema?{version:binding.schema.version,records:binding.schema.records,children:binding.schema.children,cards:binding.schema.cards}:null,
   unmatched:binding.unmatched?{missing:binding.unmatched.missing,extra:binding.unmatched.extra,mismatched:binding.unmatched.mismatched}:null,
   commitGen:probe?probe.commitGen:null,identityGen:probe?probe.identityGen:null};
@@ -384,19 +395,25 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000,option
   // section (#error-no-content) is NOT a refusal and never latches one.
   if(d.challenge)throw budget.deny('DENIED_CHALLENGE_DOM');
   if(d.sectionError==='error-private')throw budget.deny('DENIED_ACCESS_DOM');
-  // "This profile does not exist" is the absence of one handle, not the provider
-  // refusing this client: nothing here was authenticated, challenged or walled off. It
-  // still stops this run fail-closed with a truthful cause, but persisting it as a
-  // provider-wide denial would refuse every LATER run ID on the shared ledger on the
-  // strength of one missing handle. fail() still yields to a recorded PROVIDER_DENIED,
-  // so a genuine historical refusal is neither cleared nor downgraded by this.
-  if(d.sectionError==='error-not-found')throw budget.fail('HANDLE_UNAVAILABLE','requested public profile is not available');
+  // Source absence is classified in inspect only after current-generation attribution.
   assertTime();
   if(!d.browserOpen)throw new F.ArchiveError('BROWSER_CLOSED','browser closed during window readiness');
  };
+ const settledNow=()=>{const g=monitor.snapshot();return settledWindowTransport(typeof monitor.attributed==='function'?monitor.attributed():null)&&g.inFlight===0&&g.failed===0;};
+ const successfulListing=()=>{const r=monitor.receipts?.();const list=r?.list?.filter(x=>x.path==='/api/posts');return !!list?.length&&!r.overflow&&list.every(x=>x.status>=200&&x.status<300);};
  const inspect=async()=>{
-  assertTime();
-  apply(await F.observeWindowSnapshot(page,{handle,selector:WINDOW_CHALLENGE_SELECTOR}));
+  assertTime();const epoch=observationEpoch(monitor);
+  const seen=await F.observeWindowSnapshot(page,{handle,selector:WINDOW_CHALLENGE_SELECTOR});apply(seen);
+  if(seen.sectionError==='error-not-found'){
+   // A stale/subframe/unmatched absence is not a reason to skip a requested source.
+   const confirm=await F.observeWindowSnapshot(page,{handle,selector:WINDOW_CHALLENGE_SELECTOR});apply(confirm);
+   if(confirm.sectionError==='error-not-found'&&d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'
+     &&seen.probe&&confirm.probe&&!seen.probe.overflow&&!confirm.probe.overflow
+     &&seen.probe.token===confirm.probe.token&&seen.probe.generation===confirm.probe.generation
+     &&epoch===observationEpoch(monitor)&&settledNow()&&successfulListing())
+    throw new F.ArchiveError('HANDLE_UNAVAILABLE','requested public profile is not available');
+   throw new F.ArchiveError('PROFILE_NOT_READY','profile absence lacks current source attribution');
+  }
  };
  try{
   statuses=await installGuards(page,budget,deadline);assertTime();
@@ -426,7 +443,7 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000,option
   windowStarted=Date.now();d.phase='window';const end=Math.min(deadline,windowStarted+waitMs);
   // Positive evidence must be settled in the CURRENT generation AND globally quiet:
   // anything still moving anywhere could be about to redraw the listing being read.
-  const settledNow=()=>{const g=monitor.snapshot();return settledWindowTransport(typeof monitor.attributed==='function'?monitor.attributed():null)&&g.inFlight===0&&g.failed===0;};
+
   // `d.stableSamples` stays the plain DOM stability of the reported readiness record.
   // Acceptance uses a SEPARATE counter, because stability accrued while a response was
   // pending - or before it settled, or across a navigation or a new search - describes
@@ -467,6 +484,13 @@ async function discover(page,handle,budget,deadline,maxCards,waitMs=45000,option
     const coherent=!!snapshot.probe&&!!confirm&&!confirm.overflow&&confirm.token===snapshot.probe.token
      &&confirm.generation===snapshot.probe.generation&&confirm.identityGen===snapshot.probe.identityGen;
     const seam=observationEpoch(monitor)===afterEpoch&&settledNow()&&coherent;
+    // A positively attributed successful response in an unsupported grammar is a source
+    // failure, not a COMPLETE and not a broken shared observer. Bounds/read faults stay global.
+    if(seam&&successfulListing()&&d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError
+      &&binding.reason==='unknown-response-evidence'
+      &&['unknown-listing-field','unknown-listing-representation','unsupported-listing-variant'].includes(binding.detail)){
+     d.cause='unbound';throw new F.ArchiveError('UNSUPPORTED_LISTING_FORMAT','current source listing representation is unsupported');
+    }
     if(seam&&binding.bound&&windowSignature(snapshot.cards)===signature&&d.profileMatched&&d.profileHasTotal&&d.category==='POSTS'&&!d.sectionError){
      return {raw:snapshot.cards,observedAt:new Date().toISOString(),binding:d.binding};
     }
@@ -539,6 +563,61 @@ function localWindowReadiness(d){
  if(!(t.paths['/api/profile']>=1)||!(t.paths['/api/posts']>=1)||Object.values(t.paths).reduce((sum,n)=>sum+n,0)!==t.started)return false;
  return !!t.statuses&&Object.values(t.statuses).reduce((sum,n)=>sum+n,0)>=t.settled&&typeof t.statuses==='object'&&!Array.isArray(t.statuses)&&Object.keys(t.statuses).length>0&&Object.entries(t.statuses).every(([status,n])=>/^[23][0-9]{2}$/.test(status)&&count(n)&&n>0);
 }
+// Retained-page refusal surveillance: at most one small DOM sample in flight,
+// no response interception, listing payloads, mutation history or polling queue.
+function watchAcquisitionRefusal(page,budget,deadline){
+ let pending=null,timer,admitting=true,finalizing;
+ const expire=setTimeout(()=>budget.fail('TIME_LIMIT','incremental job deadline reached'),Math.max(1,deadline-Date.now()));
+ // Actual page closure ends admission, not classification of an admitted sample.
+ // Keep watching during a delayed close; there is still only one sample, no queue.
+ const stopAdmission=()=>{admitting=false;clearTimeout(timer);};
+ page.once('close',stopAdmission);
+ const observationFailure=e=>{
+  // Preserve an already authoritative stop (especially denial/file timeout).
+  budget.assert();
+  throw budget.fail(e.code||'BROWSER_TRANSPORT','refusal observation failed');
+ };
+ const sample=()=>pending||=(async()=>{
+  // Every admitted read owns the next poll time. A fresh explicit check must
+  // retire the old poll timer, not leave it ready to race normal page teardown.
+  clearTimeout(timer);
+  budget.assert();
+  if(Date.now()>=deadline)throw budget.fail('TIME_LIMIT','incremental job deadline reached');
+  if(!admitting)throw budget.fail('BROWSER_TRANSPORT','refusal observation page closed');
+  let abort;
+  try{
+   const seen=await Promise.race([F.observeWindowSnapshot(page,{selector:WINDOW_CHALLENGE_SELECTOR,refusalOnly:true}),new Promise((_,reject)=>{
+    abort=()=>reject(budget.signal.reason);budget.signal.addEventListener('abort',abort,{once:true});if(budget.signal.aborted)abort();
+   })]);
+   if(seen.challenge)throw budget.deny('DENIED_CHALLENGE_DOM');
+   if(seen.sectionError==='error-private')throw budget.deny('DENIED_ACCESS_DOM');
+   budget.assert();
+  }finally{budget.signal.removeEventListener('abort',abort);}
+ })().catch(observationFailure).finally(()=>{pending=null;if(admitting&&!budget.signal.aborted)timer=setTimeout(poll,50);});
+ const poll=()=>{if(!admitting||page.isClosed())return;sample().catch(()=>{});};
+ poll();
+ return {
+  async check(signal){
+   const abort=()=>budget.fail(signal.reason instanceof F.ArchiveError?signal.reason.code:'TIMEOUT','browser media acquisition aborted');
+   signal?.addEventListener('abort',abort,{once:true});
+   try{if(signal?.aborted)abort();budget.assert();if(pending)await pending;await sample();budget.assert();}
+   finally{signal?.removeEventListener('abort',abort);}
+  },
+  stop(){return finalizing||=(async()=>{
+   stopAdmission();
+   try{
+    budget.assert();
+    if(Date.now()>=deadline)throw budget.fail('TIME_LIMIT','incremental job deadline reached');
+    if(pending)await boundedBrowserCleanup(pending);
+    budget.assert();
+   }catch(e){
+    // Bounded drain failure is a stop, never a clean surveillance shutdown.
+    // Aborting the sample race also detaches late raw results from classification.
+    try{observationFailure(e);}finally{if(pending)await pending.catch(()=>{});}
+   }finally{clearTimeout(expire);page.off('close',stopAdmission);}
+  })();}
+ };
+}
 async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
  const out=[];
  for(const {item,date,selected} of rows){
@@ -553,11 +632,12 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
   if(receipt&&receipt.providerMediaFingerprint===item.providerMediaFingerprint&&receiptAgreesWithObservation(receipt,item)&&await verifyStrictReceipt(paths,receipt,item.stableId,handle))reused=true;
   else {
    const remaining=options.maxBytes-totals.bytes;if(remaining<1)throw new F.ArchiveError('BYTE_LIMIT','incremental byte allowance exhausted');
-   const result=await F.downloadOne(item,paths,{handle,runId,fetchImpl:budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{},acceptExistingReceipt:r=>canonicalReceiptMediaPath(paths,r)});
+   const result=await F.downloadOne(item,paths,{handle,runId,signal:budget.signal,beforeCommit:options.beforeCommit,fetchImpl:options.fetchImpl||budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{},acceptExistingReceipt:r=>canonicalReceiptMediaPath(paths,r)});
    if(result.conflict)throw new F.ArchiveError('IDENTITY_CONFLICT','conflicting media bytes held unchanged');
    receipt=result.receipt;totals.downloaded++;totals.bytes+=receipt.bytes;
   }
   if(!receiptAgreesWithObservation(receipt,item)||!await verifyStrictReceipt(paths,receipt,item.stableId,handle))throw new F.ArchiveError('BAD_RECEIPT','selected receipt failed identity/path/byte verification');
+  await options.beforeCommit?.();budget.assert();
   if(reused)totals.reused++;
   out.push({stableId:receipt.stableId,shortcode:receipt.shortcode,mediaType:receipt.mediaType,path:receipt.path,bytes:receipt.bytes,sha256:receipt.sha256,profileHandle:receipt.profileHandle,sourceHost:receipt.sourceHost,date,receiptRunId:receipt.runId,reused});
  }
@@ -565,7 +645,7 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
 }
 // Only positively classified handle-local failures may continue. Unknown errors,
 // browser loss, disk/byte/time limits and denial remain global fail-stops.
-const HANDLE_LOCAL_ERRORS=new Set(['ACCESS_REQUIRED','FEED_COVERAGE_GAP','EMPTY_WINDOW','AMBIGUOUS_WINDOW','BAD_ITEM','DATE_POLICY']);
+const HANDLE_LOCAL_ERRORS=new Set(['ACCESS_REQUIRED','FEED_COVERAGE_GAP','EMPTY_WINDOW','AMBIGUOUS_WINDOW','BAD_ITEM','DATE_POLICY','HANDLE_UNAVAILABLE','UNSUPPORTED_LISTING_FORMAT']);
 async function syncWindow(input,deps={}){
  const config=validate(input),root=await F.safeOutputRoot(config.output),resultFile=path.resolve(config.resultFile);
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));
@@ -592,10 +672,11 @@ async function syncWindow(input,deps={}){
     Object.assign(h,{accessRequired:spec.accessRequired,observedCards:0,selectedCards:0,observations:[],coverage:witnessCoverage(spec,[])});
     throw new F.ArchiveError('ACCESS_REQUIRED','authenticated view required; no provider request attempted for '+spec.handle);
    }
-   const page=await context.newPage();let observation;
+   const page=await context.newPage();let observation,complete,refusal;
    try{observation=await discover(page,spec.handle,budget,deadline,config.maxCards,deps.readinessWaitMs);
+    refusal=watchAcquisitionRefusal(page,budget,deadline);
     if(spec.expectedPosts?.length){const category=await page.locator('#menu-wrapper .menu-item.active').first().getAttribute('data-id').catch(e=>{if(e.name==='TimeoutError')return null;throw e;});if(category!=='POSTS')throw new F.ArchiveError('FEED_COVERAGE_GAP','cannot verify Posts category for known-post witnesses');}
-   }finally{await page.close().catch(()=>{});}
+
    // Only job-wide policy plus this handle's own cutoff; never a spec-level override.
    const rows=select(observation.raw,observation.observedAt,{dateAfter:spec.dateAfter,timeZone:config.timeZone,allowEstimatedDates:config.allowEstimatedDates});
    const observations=rows.map(({item,date,selected})=>({stableId:item.stableId,shortcode:item.shortcode,category:'posts',mediaType:item.mediaType,date,selected}));
@@ -605,12 +686,25 @@ async function syncWindow(input,deps={}){
     throw new F.ArchiveError('FEED_COVERAGE_GAP','known recent post absent or date-conflicting in provider listing for '+spec.handle+'; cutoff must not advance');
    }
    const paths=F.profilePaths(root,spec.handle);await F.ensureSafeDir(paths.stateDir,root);
-   const files=await F.withLock(paths,config.runId,()=>acquireSelection(rows,paths,spec.handle,config.runId,budget,{...config,deadline,dnsLookup:deps.dnsLookup},result.totals));
+   const files=await F.withLock(paths,config.runId,()=>acquireSelection(rows,paths,spec.handle,config.runId,budget,{...config,deadline,dnsLookup:deps.dnsLookup,beforeCommit:signal=>refusal.check(signal),fetchImpl:async(url,init)=>{await refusal.check(init?.signal);return browserMediaFetch(page,budget,url,init);}},result.totals));
+   await refusal.check();
+   budget.assert();
    // Which evidence class actually bound this observation travels WITH it. There is exactly one
    // accepting basis - 'response-tuples' - so a consumer can see that this COMPLETE rests on the
    // decoded current response matching the rendered listing tuple for tuple. Request-generation
    // provenance is NOT an acceptance basis and no longer appears here.
-   writeHandle(result.handles,spec.handle,{status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,renderBinding:observation.binding??null,files});
+   complete={status:'COMPLETE',scope:'current-visible-posts',observedAt:observation.observedAt,observedCards:rows.length,dateAfter:spec.dateAfter,eligibility:spec.eligibility||'caller-selected',selectedCards:files.length,observations,coverage,renderBinding:observation.binding??null,files};
+   }catch(e){
+    // Local discovery failures may continue only after real close-boundary refusals have
+    // been sampled and drained. Do not reset the shared cancellation controller.
+    if(['HANDLE_UNAVAILABLE','UNSUPPORTED_LISTING_FORMAT'].includes(e.code)){
+     refusal=watchAcquisitionRefusal(page,budget,deadline);await refusal.check();
+    }
+    throw e;
+   }finally{try{await boundedBrowserCleanup(page.close());}finally{await refusal?.stop();}}
+   budget.assert();
+   if(Date.now()>=deadline)throw new F.ArchiveError('TIME_LIMIT','job deadline reached');
+   writeHandle(result.handles,spec.handle,complete);
    }catch(e){
     // A sticky budget stop takes precedence over a coincident local parse gap.
     try{budget.assert();}catch(stop){e=stop;}
@@ -631,8 +725,15 @@ async function syncWindow(input,deps={}){
  finally{
   // Close only our context. For connectOverCDP, browser.close() disconnects
   // Playwright's client transport; it does not terminate the external browser.
-  if(context)await context.close().catch(()=>{});if(browser)await browser.close().catch(()=>{});
-  result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,quotaPolicy:budget.data.quota_policy,minRequestIntervalMs:budget.data.min_request_interval_ms,denial:budget.data.denial};
+  const cleanupFailure=()=>{
+   result.stoppedGlobally=true;
+   if(result.status==='COMPLETE')result.status='PARTIAL';
+   result.error ||= {code:'BROWSER_CLEANUP',message:'owned browser resource cleanup failed',scope:'global'};
+  };
+  if(context)await boundedBrowserCleanup(context.close()).catch(cleanupFailure);
+  if(browser)await boundedBrowserCleanup(browser.close()).catch(cleanupFailure);
+  result.finishedAt=new Date().toISOString();result.requests={session:budget.data.requests,hour:budget.data.recent_request_ms.length,blocked:budget.data.blocked,limit:budget.data.session_ceiling,quotaPolicy:budget.data.quota_policy,minRequestIntervalMs:budget.data.min_request_interval_ms,denial:budget.data.denial,
+   activeRestriction:budget.data.active_restriction,denialHistory:budget.data.denial_dispositions};
   // Release the ledger lock first: cleanup is best-effort and cannot throw, so a
   // genuine cleanup failure is published as evidence instead of replacing the
   // real run outcome from this finally block.
