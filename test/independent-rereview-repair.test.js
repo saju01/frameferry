@@ -99,8 +99,8 @@ test('rereview RR1: a visible private access wall still latches a durable provid
  assert.equal(JSON.stringify(f.budget.data.denial).includes('<'),false,'no raw DOM may be stored as denial evidence');
  await f.page.close();f.budget.close();
  const next=openBudget(f.ledger,'next-run');t.after(()=>next.close());
- assert.ok(next.data.denial,'a positively observed access wall must survive a new run ID');
- assert.throws(()=>next.reserve('discovery'),e=>e.code==='PROVIDER_DENIED');
+ assert.equal(next.data.denial,null,'a generic historical DOM access wall does not prove an eternal provider ban');
+ assert.equal(next.data.denial_history[0].kind,'DENIED_ACCESS_DOM');next.reserve('discovery');
 });
 test('rereview RR1: an inconclusive no-content window is neither success nor a refusal',async t=>{
  const f=await windowFixture(t,'nocontent');
@@ -122,7 +122,7 @@ test('rereview RR1: a genuine HTTP refusal during discovery still latches a dura
  assert.equal(f.budget.data.denial.status,403);
  await f.page.close();f.budget.close();
  const next=openBudget(f.ledger,'next-run');t.after(()=>next.close());
- assert.throws(()=>next.reserve('discovery'),e=>e.code==='PROVIDER_DENIED');
+ assert.equal(next.data.denial,null);assert.equal(next.data.denial_history[0].status,403);next.reserve('discovery');
 });
 
 // --- RR2: positive readiness is attributed to the intended main frame/generation ---

@@ -99,7 +99,7 @@ test('DR1: a response-driven structural re-render of OLD is not provenance',asyn
  assert.deepEqual(await live(f.page),['NEW']);
  assert.ok(atReturn.includes('old-rerendered-after-response'),'the counterexample must have re-rendered OLD after decoding');
  assert.equal(r.accepted,false,'an inert body carries no listing identity and can never certify one');
- assert.equal(r.code,'WINDOW_NOT_READY');
+ assert.equal(r.code,'UNSUPPORTED_LISTING_FORMAT');
  assert.equal(r.readiness.binding.reason,'unknown-response-evidence');
  assert.equal(W.localWindowReadiness(r.readiness),false);
 });
@@ -173,7 +173,9 @@ test('DR3: a wholly unknown payload stays inconclusive',async t=>{
 const unsupported=[
  {name:'a video whose vu and vhu differ',payload:(()=>{const r=rec({code:'A',media:'M',type:'video'});r.vu=opaque('other');return posts(r);})()},
  {name:'a carousel child carrying its own children',payload:(()=>{const r=rec({code:'A',media:'M',children:[{media:'M2'}]});r.om[0].om=[];return posts(r);})()},
- {name:'a video carousel child',payload:(()=>{const r=rec({code:'A',media:'M',children:[{media:'M2'}]});r.om[0].vu=opaque('M2');r.om[0].vhu=opaque('M2');return posts(r);})()},
+ // Video children with equal vu/vhu are now proven (video-carousel-child.test.js).
+ // Preserve the negative control for unproved unequal variants on a child.
+ {name:'a video carousel child whose vu and vhu differ',payload:(()=>{const r=rec({code:'A',media:'M',children:[{media:'M2'}]});r.om[0].vu=opaque('OTHER');r.om[0].vhu=opaque('M2');return posts(r);})()},
  {name:'an unknown extra item field',payload:(()=>{const r=rec({code:'A',media:'M'});r.extra='x';return posts(r);})()},
  {name:'a non-string listing field',payload:(()=>{const r=rec({code:'A',media:'M'});r.pd=20260101;return posts(r);})()},
  {name:'a missing required item field',payload:(()=>{const r=rec({code:'A',media:'M'});delete r.pd;return posts(r);})()}

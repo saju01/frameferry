@@ -27,7 +27,7 @@ function validateOptions(opts = {}) {
     maxAcquireItems: integer('maxAcquireItems', 100000, 0, 100000),
     maxAcquireBytes: integer('maxAcquireBytes', 512 * 1024 * 1024, 0, 2 * 1024 * 1024 * 1024),
     maxBytes: integer('maxBytes', 50 * 1024 * 1024, 1, 512 * 1024 * 1024),
-    networkTimeoutMs: integer('networkTimeoutMs', 60000, 1, 600000), delayMs: integer('delayMs', 500, 0, 60000),
+    networkTimeoutMs: integer('networkTimeoutMs', 60000, 1, 600000), delayMs: integer('delayMs', 0, 0, 60000),
     maxLocatorAgeMs: integer('maxLocatorAgeMs', 300000, 1, 7200000),
     maxObservedMedia: integer('maxObservedMedia', 100000, 1, 100000),
     discoveryOnly: !!opts.discoveryOnly, targetIds: list('targetIds'), targetPosts: list('targetPosts'), stopOnItemFailure: !!opts.stopOnItemFailure };

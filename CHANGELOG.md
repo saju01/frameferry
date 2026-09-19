@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed
+
+- Accept observed video carousel children with equal `vu`/`vhu`, and absent root/child captions. Keep present-field types and bounds, nested/unequal-variant rejection, and exhaustive ordered identity/type/date/cardinality checks.
+- Persist optional closed-vocabulary listing diagnostic details without source strings. Isolate positively attributed unsupported formats and profile-not-found as handle-local PARTIAL; observer/transport/cleanup faults and current refusals remain global.
+- Replace invented 500 ms public-provider pacing and standalone post-download delay with zero defaults (`public-provider-unpaced-v2`), preserving serialization, explicit caller delay/resource bounds and all cancellation/deadline checks. DOM settling/sampling grace is unchanged.
+- Separate immutable refusal history, current-operation latches and active cross-run restrictions. Honor 429/503 Retry-After from original observation time; retain unresolved authentication/legal requirements. Generic historical technical refusals do not permanently ban later distinct attempts. Migration preserves original refusal evidence and prior counters; old denied result parts remain invalid. No live-ledger migration, provider switch, credential fallback or in-operation retry is performed by this code change.
+
+## 0.3.2 - 2026-09-18
+
+### Fixed
+
+- Keep the `sync-window` discovery page open and acquire media through native fetch in the same browser context/session, rather than switching to Node fetch. No browser identity changes, cookie export, challenge bypass, denial clearance or fallback transport.
+- Stream media via an isolated CDP world using one outstanding BYOB pull of at most 16 KiB. Apply shared request pacing/accounting once, retain refusal stops and cancel/release the media reader on byte/time/abort/file errors. Cleanup failures cannot report job success.
+- Reject browser media redirects (`BROWSER_REDIRECT`) without following any hop: manual browser redirects do not expose the target required for validation. Standalone Node downloads retain validated redirect behavior.
+- Add real offline cookie-conditioned Chromium and attached-CLI tests, including byte-verified receipts, bounded pulls, denial/redirect stops and cleanup. Passive discovery response observation and receipt schema are unchanged.
+- Drain pending retained-page refusal observations before handle acceptance and ledger release, with bounded fail-closed finalization. Preserve valid files committed before a later refusal.
+- Create media temporary files exclusively and track creation ownership, so a forced existing-path collision neither overwrites nor deletes the other owner's file.
+
+
 ## 0.3.1 - 2026-09-18
 
 ### Fixed

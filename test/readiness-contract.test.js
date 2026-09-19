@@ -122,7 +122,7 @@ test('contract FR1: an inert listing response cannot certify a listing that pred
   api:json({})});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+10000,10,3000));
  assert.equal(result.accepted,false,'an empty response beside a listing rendered before the request is not evidence');
- assert.equal(result.code,'WINDOW_NOT_READY');
+ assert.equal(result.code,'UNSUPPORTED_LISTING_FORMAT');
  assert.equal(result.readiness.binding.reason,'unknown-response-evidence');
  assert.equal(result.readiness.cause,'unbound');
  assert.equal(W.localWindowReadiness(result.readiness),false,'an unbound window is not positive handle-local evidence');
@@ -134,7 +134,7 @@ test('contract FR1: an inert listing response is never accepted on request-gener
  const f=await windowFixture(t,{script:responsePage('document.getElementById("post-container").innerHTML='+JSON.stringify(card('FRESH'))+';window.trace.push("rendered");'),api:json({})});
  const result=await outcome(W.discover(f.page,'example',f.budget,Date.now()+15000,10,5000));
  assert.equal(result.accepted,false,'a body carrying no listing identity must never certify a listing');
- assert.equal(result.code,'WINDOW_NOT_READY');
+ assert.equal(result.code,'UNSUPPORTED_LISTING_FORMAT');
  assert.equal(result.readiness.binding.reason,'unknown-response-evidence');
  assert.equal(result.readiness.binding.basis,null,'there is exactly one acceptance basis and this is not it');
  assert.equal(W.localWindowReadiness(result.readiness),false);
@@ -255,7 +255,7 @@ test('contract FR1: benign rotation inside the container is not the page paintin
  assert.ok(rotations>=5,'the fixture must really rotate engagement, caption and signed locator');
  assert.deepEqual([...new Set(await live(f.page))],['NEW'],'this card carries several data-id anchors; only the identity matters');
  if(result.accepted)assert.deepEqual(result.cards,['NEW'],'a benign rotation was accepted as evidence that the listing is current');
- else assert.equal(result.code,'WINDOW_NOT_READY');
+ else assert.equal(result.code,'UNSUPPORTED_LISTING_FORMAT');
 });
 test('contract FR1: an unrecognisable provider media locator is unknown evidence, never inert',async t=>{
  // A locator that cannot be reduced to a provider media identity - here one carrying a second

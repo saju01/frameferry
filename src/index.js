@@ -10,12 +10,12 @@ const { performance } = require('node:perf_hooks');
 const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 const discovery = require('./discovery.js');
 
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MAX_TIME_MS = 600000;
-const DEFAULT_DELAY_MS = 500;
+const DEFAULT_DELAY_MS = 0;
 const DEFAULT_NETWORK_TIMEOUT_MS = 60000;
 const VALID_CATEGORIES = ['posts', 'reels', 'stories', 'highlights'];
 const VALID_MEDIA_TYPES = ['image', 'video'];
@@ -483,13 +483,15 @@ function responseBodyStream(res) {
   if (res.body && Symbol.asyncIterator in res.body) return res.body;
   throw new ArchiveError('BAD_CONTENT', 'response has no readable body');
 }
-async function streamResponseToPart(res, part, { maxBytes, signal }) {
+async function streamResponseToPart(res, part, { maxBytes, signal, onPartCreated }) {
   const body = responseBodyStream(res);
-  const fh = await fsp.open(part, 'w', 0o600);
+  const fh = await fsp.open(part, 'wx', 0o600);
   const hash = crypto.createHash('sha256');
   let bytes = 0;
   const head = [];
   try {
+    // Ownership begins only after exclusive creation; EEXIST is never ours to clean.
+    onPartCreated?.();
     if (body.getReader) {
       const reader = body.getReader();
       for (;;) {
@@ -720,14 +722,24 @@ function discoveryCoverageSatisfied({ reportedTotal, uniquePostCount, resumeTarg
 }
 // `acceptExistingReceipt(receipt, stableId, handle, paths)` lets callers impose
 // stricter reuse rules; it must tolerate nullish receipts and return false to reject reuse.
-async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = DEFAULT_NETWORK_TIMEOUT_MS, dnsLookup, timeoutMs, completedMap = {}, handle, stopOnDenial = false, acceptExistingReceipt = () => true } = {}) {
+async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes = DEFAULT_MAX_BYTES, runId, remainingMs = DEFAULT_NETWORK_TIMEOUT_MS, dnsLookup, timeoutMs, signal, completedMap = {}, handle, stopOnDenial = false, acceptExistingReceipt = () => true, beforeCommit } = {}) {
   const observedFingerprint = providerMediaFingerprint(item.href);
   if (item.providerMediaFingerprint && item.providerMediaFingerprint !== observedFingerprint) throw new ArchiveError('IDENTITY_CONFLICT', 'provided fingerprint contradicts supported media locator');
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), Math.max(1, timeoutMs || remainingMs));
+  const onAbort = () => ac.abort(signal.reason);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+  const deadline = Date.now() + Math.max(1, timeoutMs || remainingMs);
+  const timer = setTimeout(() => ac.abort(), Math.max(1, deadline - Date.now()));
   const tempBase = path.join(paths.mediaDir, (item.stableId || fallbackFailureKey(item, 0)) + '.' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '.part');
+  let res, receiptStage, partOwned = false;
+  const assertActive = () => {
+    res?.assertActive?.();
+    ac.signal.throwIfAborted();
+    if (Date.now() >= deadline) throw new ArchiveError('TIMEOUT', 'download timeout');
+  };
   try {
-    const res = await fetchWithValidatedRedirects(item.href, { fetchImpl, remainingMs, dnsLookup, signal: ac.signal, stopOnDenial });
+    res = await fetchWithValidatedRedirects(item.href, { fetchImpl, remainingMs, dnsLookup, signal: ac.signal, stopOnDenial });
     if ([401,403].includes(res.status)) throw new ArchiveError('DENIED', 'provider denied acquisition with HTTP ' + res.status);
     if (!res.ok) throw new ArchiveError('DOWNLOAD_FAILED', 'download failed with HTTP ' + res.status);
     const ct = (headerGet(res, 'content-type') || '').toLowerCase();
@@ -736,7 +748,9 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
     if (declared > maxBytes) throw new ArchiveError('TOO_LARGE', 'content-length exceeds max bytes');
     await ensureSafeDir(paths.mediaDir, paths.root);
     await ensureSafeDir(paths.receiptDir, paths.root);
-    const got = await streamResponseToPart(res, tempBase, { maxBytes, signal: ac.signal });
+    const got = await streamResponseToPart(res, tempBase, { maxBytes, signal: ac.signal, onPartCreated: () => { partOwned = true; } });
+    await res.close?.();
+    assertActive();
     if (declared && declared !== got.bytes) throw new ArchiveError('BAD_LENGTH', 'content-length mismatch');
     const actualMediaType = normalizeMediaType(got.kind);
     const expectedMediaType = normalizeMediaType(item.mediaType);
@@ -767,23 +781,24 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
     // could be adopted wholesale just because the content happened to hash the same.
     const existingIsOurs = receiptMatchesIdentity(existing, stableId, handle) && acceptExistingReceipt(existing, stableId, handle, paths);
     if (existingIsOurs && existing.sha256 === got.sha256 && existing.bytes === got.bytes && await verifyReceipt(paths, existing)) {
-      await fsp.rm(tempBase, { force: true }).catch(() => {});
+      await fsp.rm(tempBase, { force: true }).then(() => { partOwned = false; }).catch(() => {});
       // Same bytes, so the media is the same, but it was just observed under the current provider
       // id. Refreshing the fingerprint keeps the slide mapping provable on the next run instead of
       // leaving a stale one that would force a re-acquire.
+      await beforeCommit?.(ac.signal);assertActive();
       return { receipt: existing, fetchedButReused: true };
     }
     // Different bytes for an id whose stored receipt still verifies is a conflict, not an update.
     // Overwriting would destroy verified content on nothing better than slide position, so the
     // observation is reported and held instead.
     if (existingIsOurs && existing.sha256 !== got.sha256 && await verifyReceipt(paths, existing)) {
-      await fsp.rm(tempBase, { force: true }).catch(() => {});
+      await fsp.rm(tempBase, { force: true }).then(() => { partOwned = false; }).catch(() => {});
+      await beforeCommit?.(ac.signal);assertActive();
       return { receipt: existing, fetchedButReused: true, conflict: { expectedSha256: existing.sha256, observedSha256: got.sha256, observedBytes: got.bytes, observedAt: new Date().toISOString(), observedProviderMediaFingerprint: item.providerMediaFingerprint || null, category: item.category, rawPostId: item.rawPostId || item.shortcode || null, metadataProvenance: item.metadataProvenance || null } };
     }
     const destinationExists = await fsp.lstat(dest).catch(err => { if (err.code === 'ENOENT') return null; throw err; });
     if (destinationExists && !existingIsOurs) throw new ArchiveError('IDENTITY_CONFLICT', 'existing canonical destination lacks a positively bound receipt; held unchanged');
     if (destinationExists?.isSymbolicLink()) throw new ArchiveError('BAD_OUTPUT', 'canonical destination is a symlink');
-    await fsp.rename(tempBase, dest);
     const receipt = {
       stableId,
       id: stableId,
@@ -812,14 +827,44 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
       runId,
       completedAt: new Date().toISOString()
     };
-    await atomicWriteJson(path.join(paths.receiptDir, stableId + '.json'), receipt);
+    const receiptDest = path.join(paths.receiptDir, stableId + '.json');
+    await ensureNoSymlinkAncestors(receiptDest);
+    receiptStage = path.join(paths.receiptDir, path.basename(tempBase));
+    try { await fsp.writeFile(receiptStage, redactSignedUrls(jsonText(receipt)), { mode: 0o600, flag: 'wx' }); }
+    catch (err) {
+      // Exclusive-create refusal proves we never owned this pathname.
+      if (err.code === 'EEXIST') receiptStage = null;
+      throw err;
+    }
+    await beforeCommit?.(ac.signal);
+    // All awaited preparation is over. The stop gate and these two small renames
+    // are one event-loop commit boundary: no abort/denial callback can interleave.
+    // Save only the destination we own, for rollback if receipt publication fails.
+    assertActive();
+    const backup = tempBase + '.previous';
+    let backedUp = false, published = false;
+    try {
+      if (destinationExists) { fs.renameSync(dest, backup); backedUp = true; }
+      fs.renameSync(tempBase, dest); partOwned = false; published = true;
+      fs.renameSync(receiptStage, receiptDest); receiptStage = null;
+    } catch (err) {
+      if (published) fs.unlinkSync(dest);
+      if (backedUp) fs.renameSync(backup, dest);
+      throw err;
+    }
+    if (backedUp) fs.unlinkSync(backup);
     return { receipt, fetchedButReused: false };
   } catch (err) {
-    await fsp.rm(tempBase, { force: true }).catch(() => {});
+    try { await res?.close?.(err); }
+    finally {
+      if (partOwned) await fsp.rm(tempBase, { force: true });
+      if (receiptStage) await fsp.rm(receiptStage, { force: true });
+    }
     if (err.name === 'AbortError') throw new ArchiveError('TIMEOUT', 'download timeout');
     throw err;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 }
 function decideOutcome({ reportedTotal, uniquePostCount, failed, pending = 0, noGrowth, hitLimit, mode, reusedOnlyComplete = false }) {
@@ -1596,14 +1641,19 @@ async function readRenderObservation(page) {
 // serializes each evaluated function separately, so they cannot share a closure. The
 // "accepting snapshot reads exactly the cards readRawCardsFromPage reads" regression pins
 // them together permanently.
-async function observeWindowSnapshot(page, { handle, selector = CHALLENGE_SELECTOR, bodies = false } = {}) {
-  return page.evaluate(({ handle, selector, key, bodies }) => {
+async function observeWindowSnapshot(page, { handle, selector = CHALLENGE_SELECTOR, bodies = false, refusalOnly = false } = {}) {
+  return page.evaluate(({ handle, selector, key, bodies, refusalOnly }) => {
     const visible = el => {
       const style = el.ownerDocument.defaultView.getComputedStyle(el);
       if (style.visibility === 'hidden' || style.display === 'none') return false;
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     };
+    const refusal = {
+      challenge: [...document.querySelectorAll(selector)].some(visible),
+      sectionError: ['error-private', 'error-not-found', 'error-no-content'].find(id => { const el = document.getElementById(id); return el && visible(el); }) || null
+    };
+    if (refusalOnly) return refusal;
     const section = document.querySelector('#profile-section');
     const name = (section && section.querySelector('.username-text') ? section.querySelector('.username-text').textContent : '') || '';
     const active = document.querySelector('#menu-wrapper .menu-item.active');
@@ -1633,8 +1683,7 @@ async function observeWindowSnapshot(page, { handle, selector = CHALLENGE_SELECT
       matched: name.replace(/^@/, '').trim().toLowerCase() === String(handle).toLowerCase(),
       text: section ? section.innerText : '',
       category: ['POSTS', 'REELS', 'STORIES', 'HIGHLIGHTS'].includes(category) ? category : null,
-      challenge: [...document.querySelectorAll(selector)].some(visible),
-      sectionError: ['error-private', 'error-not-found', 'error-no-content'].find(id => { const el = document.getElementById(id); return el && visible(el); }) || null,
+      ...refusal,
       cards,
       probe: state && typeof state.report === 'function' ? state.report() : null,
       // Requested ONLY by the accepting read, so a 250ms sampling loop never drags a bounded
@@ -1642,7 +1691,7 @@ async function observeWindowSnapshot(page, { handle, selector = CHALLENGE_SELECT
       // always come from one evaluation of one document state.
       bodies: bodies && state && typeof state.bodyReport === 'function' ? state.bodyReport(true) : null
     };
-  }, { handle, selector, key: RENDER_OBSERVATION_KEY, bodies });
+  }, { handle, selector, key: RENDER_OBSERVATION_KEY, bodies, refusalOnly });
 }
 // The provider listing representation this codebase can actually READ, version 1.
 //
@@ -1687,6 +1736,9 @@ function decodeListingResponse(text, limits = {}) {
       return 'unknown-listing-field';
     }
     for (const key of LISTING_ITEM_REQUIRED) {
+      // Captured roots and children can omit captions. A present caption is still a bounded
+      // string; absence of any identity/date/media field remains unsupported.
+      if (key === 'c' && !Object.prototype.hasOwnProperty.call(item, key)) continue;
       const value = item[key];
       if (typeof value !== 'string') return 'unknown-listing-field';
       if (value.length > bound.maxStringLength) return 'listing-exceeds-decoder-bound';
@@ -1694,9 +1746,9 @@ function decodeListingResponse(text, limits = {}) {
     const hasVu = Object.prototype.hasOwnProperty.call(item, 'vu');
     const hasVhu = Object.prototype.hasOwnProperty.call(item, 'vhu');
     if (hasVu !== hasVhu) return 'unknown-listing-field';
-    // No captured child carried its own media variants or its own children, so both shapes are
-    // unobserved. Guessing one would be inventing schema, which is the whole failure being fixed.
-    if (isChild && (hasVu || Object.prototype.hasOwnProperty.call(item, 'om'))) return 'unsupported-listing-variant';
+    // Observed video children use the same vu === vhu locator mapping as root videos.
+    // Nested children remain unproven; accepting video children does not relax that boundary.
+    if (isChild && Object.prototype.hasOwnProperty.call(item, 'om')) return 'unsupported-listing-variant';
     if (hasVu) {
       if (typeof item.vu !== 'string' || typeof item.vhu !== 'string') return 'unknown-listing-field';
       if (item.vu.length > bound.maxStringLength || item.vhu.length > bound.maxStringLength) return 'listing-exceeds-decoder-bound';
