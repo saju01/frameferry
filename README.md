@@ -194,19 +194,32 @@ Example private configuration (keep real handles, paths and scheduling outside t
   Stale ledger locks require explicit operator inspection, never automatic reset.
 - Optional `minRequestIntervalMs` is a **caller-chosen courtesy gap** between
   serialized request admissions: a whole number of milliseconds from `0` to
-  `60000`, `BAD_BUDGET` otherwise. It is enforced inside the shared admission
+  `5000`, `BAD_BUDGET` otherwise. It is enforced inside the shared admission
   path, so discovery and media acquisition observe one combined gap and
   concurrent callers cannot interleave around it, and it is measured from the
   last request the run actually debited, so a queued caller waits only the
   remainder and an admission that fails after waiting never compounds the next
-  gap. The effective value is published as `requests.minRequestIntervalMs` and
-  stored as the ledger's `min_request_interval_ms`; it is stated per run and is
-  never inherited from an earlier one.
+  gap. A single wait is never longer than the interval itself, so a backward
+  wall-clock step cannot stretch one. The effective value is published as
+  `requests.minRequestIntervalMs` and stored as the ledger's
+  `min_request_interval_ms`; it is stated per run, is never inherited from an
+  earlier one, and the interval a completed session ran under is kept with that
+  session's record in `prior_sessions`.
+  **A paced wait is spent from the deadlines the run already has, never added to
+  them.** It elapses inside the job's `maxTimeMs`, inside the 45 s profile
+  readiness wait a discovery request is issued under, and inside the 30 s
+  per-file acquisition window — so a gap approaching one of those spends the
+  whole budget waiting and the request then fails on the deadline instead of
+  being forwarded. That is why the accepted maximum is `5000` rather than
+  something closer to those limits, and why **staying under the maximum is not a
+  promise that your interval fits**: size it against your own request count,
+  `maxTimeMs`, and per-file window.
   **250 ms is a reasonable choice for ordinary use.** At that spacing a
   168-request job spends about 42 s waiting — roughly 7% of the default
-  10-minute job deadline, and under 4% of the 20-minute maximum — so the gap fits
-  inside an ordinary run rather than competing with it. Budget for it explicitly
-  if you also lower `maxTimeMs`.
+  10-minute job deadline, and under 4% of the 20-minute maximum. That leaves room
+  in a default run, but it is an estimate for that request count, not a
+  guarantee: a larger window, a lowered `maxTimeMs`, or a run already close to
+  its per-file window needs the gap budgeted explicitly.
   The interval is a gap the caller chose, **not a quota, a retry or a backoff**.
   FrameFerry still never waits out a 429/503 `Retry-After`: a refusal ends the
   current operation and its run ID, and only a separately authorized attempt may
@@ -261,7 +274,9 @@ Example private configuration (keep real handles, paths and scheduling outside t
   any `minRequestIntervalMs` gap are clamped to the remaining budget, and a
   recorded provider denial keeps precedence over a lapsed deadline. A pacing gap
   also ends immediately on a caller abort, on a recorded refusal and on ledger
-  close, and the stop that is reported is then the one that actually applies.
+  close, and the stop that is reported is then the one that actually applies. An
+  already exhausted `maxRequests` allowance is refused at once rather than after
+  the gap, since no wait could have admitted it.
 - Composition (`resultParts`) binds to the immutable on-disk receipt, not to the
   result document being composed: each projected file must match the receipt at
   `receipts/<handle>/<stableId>.json` field-for-field, the part's `runId` must be

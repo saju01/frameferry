@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { ArchiveError, PROVIDER_ORIGIN } = require('./index.js');
-const HOUR_MS = 3600000, MIN_REQUEST_INTERVAL_MS = 0, MAX_REQUEST_INTERVAL_MS = 60000;
+const HOUR_MS = 3600000, MIN_REQUEST_INTERVAL_MS = 0, MAX_REQUEST_INTERVAL_MS = 5000;
 const POLICY='public-provider-unpaced-v2';
 const DENIAL_KINDS=new Set(['DENIED_AUTH','RATE_LIMITED','SERVICE_UNAVAILABLE','DENIED_CHALLENGE','DENIED_CONTENT_WALL','DENIED_CHALLENGE_DOM','DENIED_ACCESS_DOM']);
 function retryAt(raw,at,truncated=false){
@@ -41,8 +41,16 @@ function cap(value) {
 }
 // The caller's own spacing between serialized admissions. Absent means the documented
 // default - no wait at all - so an existing caller's timing is unchanged. An explicit
-// value is a job bound like maxRequests, typed here rather than deep inside a timer:
-// a gap wider than a minute would outlast most of the job deadlines this tool supports.
+// value is a job bound like maxRequests, typed here rather than deep inside a timer.
+//
+// A paced admission is SPENT FROM the deadlines the run already had, never added to
+// them: the wait happens inside the per-file acquisition window (30s) and inside the
+// readiness wait a discovery request is issued under (45s), as well as inside the job's
+// own maxTimeMs. The accepted ceiling is therefore kept well below the smallest of
+// those, so no legal interval can on its own guarantee that every download times out
+// before it is even forwarded. Staying under the ceiling is not a promise that the gap
+// fits: a caller choosing an interval still has to size it against its own request
+// count and deadlines.
 function pace(value) {
   if (value === undefined) return MIN_REQUEST_INTERVAL_MS;
   if (!Number.isSafeInteger(value) || value < 0 || value > MAX_REQUEST_INTERVAL_MS) throw new ArchiveError('BAD_BUDGET', 'optional minRequestIntervalMs must be a safe integer from 0 to ' + MAX_REQUEST_INTERVAL_MS);
@@ -158,10 +166,14 @@ function openBudget(file, runId, limit, interval) {
     d.active_restriction=d.denial?disposition(d.denial):null;
     // Read the deprecated ceilings BEFORE the session rollover below overwrites
     // session_ceiling: history must be what the old ledger held, never this
-    // caller's cap.
+    // caller's cap. The same applies to the pacing the rolled-over session actually
+    // ran under: it is still on `d` at the push below and is preserved there, so a
+    // completed session's record says how it was paced instead of being relabelled
+    // with this caller's interval. A ledger written before pacing existed simply has
+    // no such value, and records null rather than an invented zero.
     const legacyCeilings=d.quota_policy?null:{session:d.session_ceiling??null,hour:d.hourly_ceiling??null};
     if (d.session_id!==runId) {
-      d.prior_sessions=[...(d.prior_sessions||[]),{session_id:d.session_id,requests:d.requests,blocked:d.blocked,by_phase:d.by_phase,session_ceiling:d.session_ceiling,ended_at:d.updated_at}];
+      d.prior_sessions=[...(d.prior_sessions||[]),{session_id:d.session_id,requests:d.requests,blocked:d.blocked,by_phase:d.by_phase,session_ceiling:d.session_ceiling,min_request_interval_ms:d.min_request_interval_ms??null,ended_at:d.updated_at}];
       d.session_id=runId; d.requests=0;d.blocked=0;d.by_phase={};d.session_ceiling=maximum;
     }
     // Deprecated local ceilings do not define a public-provider quota. Keep their history
@@ -183,6 +195,9 @@ function openBudget(file, runId, limit, interval) {
       }
       stopController.abort(stopped);return stopped;
     };
+    // The allowance reserve() will test, readable before a pacing wait is armed so an
+    // already exhausted job is refused now rather than one interval from now.
+    const exhausted=()=>d.session_ceiling!==null&&d.requests>=d.session_ceiling;
     const reserve=phase=>{
       assert();d.recent_request_ms=d.recent_request_ms.filter(t=>t>=Date.now()-HOUR_MS);
       if(d.session_ceiling!==null && d.requests>=d.session_ceiling){d.blocked++;save();throw fail('REQUEST_LIMIT','request allowance exhausted; incomplete scope retained');}
@@ -216,7 +231,11 @@ function openBudget(file, runId, limit, interval) {
     // it may no longer reserve, and the boundary check below then raises TIME_LIMIT.
     const paced=(at,signal)=>{
       if(minInterval<=0||lastRequestMs===null)return null;
-      let wait=lastRequestMs+minInterval-Date.now();
+      // The gap the caller asked for is the most this may ever sleep. lastRequestMs is a
+      // wall-clock reading, so a clock stepped BACKWARD after it was taken would other-
+      // wise inflate the remainder by the whole size of the jump - an interval of a few
+      // hundred milliseconds turning into minutes of a deadline nobody budgeted for.
+      let wait=Math.min(lastRequestMs+minInterval-Date.now(),minInterval);
       if(Number.isFinite(at))wait=Math.min(wait,at-Date.now());
       if(!(wait>0))return null;
       return new Promise(resolve=>{
@@ -231,7 +250,14 @@ function openBudget(file, runId, limit, interval) {
       const at=deadlineAt===undefined?jobDeadline:deadlineAt;
       const task=admissionTail.then(async()=>{
         assert();signal?.throwIfAborted();expire(at);
-        await paced(at,signal);
+        // An exhausted allowance is a refusal no courtesy gap can turn into an
+        // admission, so waiting first would only postpone REQUEST_LIMIT - and the
+        // blocked count reserve() records with it - by the full interval. The allowance
+        // is read INSIDE this serialized admission, the same place that will debit it,
+        // so a concurrent caller cannot admit between the check and the refusal.
+        // Precedence is untouched: assert() above still reports a recorded denial or a
+        // latched stop ahead of this, and the deadline check below still outranks it.
+        if(!exhausted())await paced(at,signal);
         assert();signal?.throwIfAborted();expire(at);
         reserve(phase);
       });
