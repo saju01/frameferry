@@ -212,14 +212,20 @@ async function installGuards(page,budget,deadline=Infinity){
   return deadlineAbort.signal;
  };
  // One guarded page per handle: do not leave its deadline timer armed once closed.
- page.on('close',()=>{if(deadlineTimer)clearTimeout(deadlineTimer);});
+ // Closing the page also releases any admission still waiting out a pacing gap for
+ // it: that request can no longer be forwarded, so it must not be debited after the
+ // page is gone. Like the deadline abort, this is a plain typed reason, never
+ // budget.fail(), so it cannot overwrite a recorded provider denial.
+ const pageClosed=new AbortController();
+ page.on('close',()=>{if(deadlineTimer)clearTimeout(deadlineTimer);if(!pageClosed.signal.aborted)pageClosed.abort(new F.ArchiveError('BROWSER_TRANSPORT','guarded page closed before request admission'));});
+ const admissionSignal=()=>{const d=deadlineSignal();return d?AbortSignal.any([d,pageClosed.signal]):pageClosed.signal;};
  await page.route('**/*',async route=>{
   const req=route.request();const u=new URL(req.url());
   // Cosmetic previews never leave the browser. Media acquisition uses downloadOne.
   if(['image','media','stylesheet','font'].includes(req.resourceType()))return route.abort('blockedbyclient');
   try{assertTime();}catch(e){return route.abort('blockedbyclient');}
   if(u.origin!==F.PROVIDER_ORIGIN)return route.fallback();
-  try{assertTime();await budget.admit(u.pathname==='/media'&&req.resourceType()==='fetch'?'download':'discovery',deadlineSignal(),deadline);assertTime();}
+  try{assertTime();await budget.admit(u.pathname==='/media'&&req.resourceType()==='fetch'?'download':'discovery',admissionSignal(),deadline);assertTime();}
   catch(e){return route.abort('blockedbyclient');}
   return route.fallback();
  });
@@ -650,7 +656,9 @@ async function syncWindow(input,deps={}){
  const config=validate(input),root=await F.safeOutputRoot(config.output),resultFile=path.resolve(config.resultFile);
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));
  if(await fs.lstat(resultFile).catch(e=>e.code==='ENOENT'?null:Promise.reject(e)))throw new F.ArchiveError('EXISTS','result already exists; use a new run result path');
- const budget=openBudget(config.requestLedger,config.runId,config.maxRequests),deadline=Date.now()+config.maxTimeMs;
+ // Optional caller pacing is a job bound like maxRequests: typed by openBudget, shared by
+ // discovery and acquisition, and absent by default so existing jobs keep their timing.
+ const budget=openBudget(config.requestLedger,config.runId,config.maxRequests,config.minRequestIntervalMs),deadline=Date.now()+config.maxTimeMs;
  // Media admission shares the job's absolute deadline with discovery admission.
  budget.setDeadline(deadline);
  const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,failureIsolation:'handle-local-v1',stoppedGlobally:false,output:root,handles:handleMap(),totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};

@@ -154,6 +154,7 @@ Example private configuration (keep real handles, paths and scheduling outside t
   "requestLedger": "/archives/provider-requests.json",
   "timeZone": "UTC",
   "allowEstimatedDates": true,
+  "minRequestIntervalMs": 250,
   "browserExecutable": "/usr/bin/chromium"
 }
 ```
@@ -166,8 +167,9 @@ Example private configuration (keep real handles, paths and scheduling outside t
   media verified. Output always has `fullHistoryComplete:false`. A stopped/empty/
   unreadable window or partial acquisition is nonzero, never a quiet success.
 - There is **no default signed-account-style hourly or per-run request quota**
-  for this public provider. `public-provider-unpaced-v2` adds no artificial wait
-  between serialized request admissions. Standalone archives also default to zero
+  for this public provider. `public-provider-unpaced-v2` adds no wait of
+  FrameFerry's own between serialized request admissions: `minRequestIntervalMs`
+  defaults to `0`, so an existing job's timing is unchanged. Standalone archives also default to zero
   post-download delay; explicit caller `delayMs` remains supported. Counts remain auditable; an optional `maxRequests`
   bounds one job only and is not advertised as a provider quota. Default resource
   bounds remain 1 GiB total download, 50 MiB/file, 10 minutes and 1,000 visible
@@ -190,6 +192,41 @@ Example private configuration (keep real handles, paths and scheduling outside t
   `requests.denial` describes the effective stop, while `requests.denialHistory`
   exposes typed historical dispositions separately from `requests.activeRestriction`.
   Stale ledger locks require explicit operator inspection, never automatic reset.
+- Optional `minRequestIntervalMs` is a **caller-chosen courtesy gap** between
+  serialized request admissions: a whole number of milliseconds from `0` to
+  `5000`, `BAD_BUDGET` otherwise. It is enforced inside the shared admission
+  path, so discovery and media acquisition observe one combined gap and
+  concurrent callers cannot interleave around it, and it is measured from the
+  last request the run actually debited, so a queued caller waits only the
+  remainder and an admission that fails after waiting never compounds the next
+  gap. A single wait is never longer than the interval itself, so a backward
+  wall-clock step cannot stretch one. The effective value is published as
+  `requests.minRequestIntervalMs` and stored as the ledger's
+  `min_request_interval_ms`; it is stated per run, is never inherited from an
+  earlier one, and the interval a completed session ran under is kept with that
+  session's record in `prior_sessions`.
+  **A paced wait is spent from the deadlines the run already has, never added to
+  them.** It elapses inside the job's `maxTimeMs`, inside the 45 s profile
+  readiness wait a discovery request is issued under, and inside the 30 s
+  per-file acquisition window — so a gap approaching one of those spends the
+  whole budget waiting and the request then fails on the deadline instead of
+  being forwarded. That is why the accepted maximum is `5000` rather than
+  something closer to those limits, and why **staying under the maximum is not a
+  promise that your interval fits**: size it against your own request count,
+  `maxTimeMs`, and per-file window.
+  **250 ms is a reasonable choice for ordinary use.** At that spacing a
+  168-request job spends about 42 s waiting — roughly 7% of the default
+  10-minute job deadline, and under 4% of the 20-minute maximum. That leaves room
+  in a default run, but it is an estimate for that request count, not a
+  guarantee: a larger window, a lowered `maxTimeMs`, or a run already close to
+  its per-file window needs the gap budgeted explicitly.
+  The interval is a gap the caller chose, **not a quota, a retry or a backoff**.
+  FrameFerry still never waits out a 429/503 `Retry-After`: a refusal ends the
+  current operation and its run ID, and only a separately authorized attempt may
+  re-observe. Because pacing changes nothing about how a refusal is classified,
+  the versioned policy name `public-provider-unpaced-v2` is unchanged and
+  existing `denial_dispositions` are not re-derived — the effective interval is
+  reported in its own field rather than encoded in a policy name.
 - Each completed file is a normal verified FrameFerry receipt. Restarts reuse
   positively bound, rehashed receipts. Old carousel positions and changing locators
   are not treated as identity aliases. A separate window cache keeps an unfinished
@@ -233,9 +270,14 @@ Example private configuration (keep real handles, paths and scheduling outside t
   drain. Missing/oversized body evidence, observer faults, ambiguous transport and
   cleanup failures remain global. Private/access walls still cancel the current operation.
 - The job deadline bounds request admission: no provider request is reserved or
-  forwarded after the deadline, browser connect/launch timeouts and poll sleeps
-  are clamped to the remaining budget, and a recorded provider denial keeps
-  precedence over a lapsed deadline.
+  forwarded after the deadline, browser connect/launch timeouts, poll sleeps and
+  any `minRequestIntervalMs` gap are clamped to the remaining budget, and a
+  recorded provider denial keeps precedence over a lapsed deadline. A pacing gap
+  also ends immediately on a caller abort, on a recorded refusal, on ledger
+  close and when the guarded browser page closes (that request is then neither
+  debited nor forwarded), and the stop that is reported is then the one that actually applies. An
+  already exhausted `maxRequests` allowance is refused at once rather than after
+  the gap, since no wait could have admitted it.
 - Composition (`resultParts`) binds to the immutable on-disk receipt, not to the
   result document being composed: each projected file must match the receipt at
   `receipts/<handle>/<stableId>.json` field-for-field, the part's `runId` must be

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.3 - 2026-09-27
+
+### Added
+
+- Optional `sync-window` `minRequestIntervalMs`: a caller-chosen courtesy gap, 0-5000 whole
+  milliseconds (`BAD_BUDGET` otherwise), between serialized request admissions. It is enforced
+  inside the shared admission path, so discovery and media acquisition observe one combined gap
+  and concurrent callers cannot interleave around it, and it is measured from the last request
+  the run actually debited, so a queued caller waits only the remainder and a failed admission
+  never compounds the next gap. A single wait is additionally capped at the interval itself, so
+  a backward wall-clock step cannot stretch one. The default stays `0`: an existing job's timing
+  is unchanged and no timer is armed. A paced wait is spent from the deadlines the run already
+  has rather than added to them - the job's `maxTimeMs`, the 45s profile readiness wait and the
+  30s per-file acquisition window - which is why the accepted maximum sits well below the
+  smallest of those; staying under it is not a promise that a given interval fits, and callers
+  must size the gap against their own request count and deadlines. The absolute job deadline
+  still bounds the wait - no admission sleeps past it - and a caller abort, a recorded refusal,
+  ledger close or the close of the guarded browser page ends the wait at once without debiting
+  the abandoned request, with the stop that actually applies reported under the
+  existing precedence. An already exhausted `maxRequests` allowance is refused immediately
+  instead of after the gap, with the same `REQUEST_LIMIT` refusal and blocked accounting. No
+  automatic 429/503 `Retry-After` wait is introduced: a refusal still ends the current operation
+  and its run ID, and only a separately authorized attempt may re-observe. The effective
+  interval is published as `requests.minRequestIntervalMs` and stored as the ledger's
+  `min_request_interval_ms`, and a completed session's own interval is preserved with its
+  `prior_sessions` record (`null` for ledgers written before pacing existed); because pacing
+  changes nothing about how a refusal is classified, the versioned policy name
+  `public-provider-unpaced-v2` is unchanged and existing `denial_dispositions` are not
+  re-derived.
+
 ## 0.3.2 - 2026-09-19
 
 ### Fixed
