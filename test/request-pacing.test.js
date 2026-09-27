@@ -396,3 +396,32 @@ test('a ledger written before pacing rolls over with an unknown interval, never 
  const saved=JSON.parse(await fs.readFile(file,'utf8'));
  assert.equal(saved.prior_sessions[0].min_request_interval_ms,null);
 });
+
+test('closing the guarded page releases a queued admission without debiting or forwarding it',async t=>{
+ const tick=clock(t),file=await ledger(t),b=openBudget(file,'guard-page-close',undefined,1000);
+ t.after(()=>b.close());
+ let handler;const closers=[];
+ const page={route:async(_,h)=>{handler=h;},on:(event,fn)=>{if(event==='close')closers.push(fn);}};
+ const c=counters();
+ const send=(type,pathname)=>handler({request:()=>({url:()=>ORIGIN+pathname,resourceType:()=>type}),fallback:async()=>{c.allowed++;},abort:async reason=>{c.aborted++;c.reasons.push(reason);}});
+ await W.installGuards(page,b,Date.now()+60000);
+ await send('document','/api/posts');
+ assert.equal(b.data.requests,1);
+ const queued=track(send('fetch','/api/posts?page=2'));
+ await flush();assert.equal(queued.settled,false);
+ // The page goes away while that request is still waiting out the gap.
+ for(const close of closers)close();
+ await flush();
+ assert.equal(queued.settled,true,'a closed page ends the wait at once');
+ assert.equal(Date.now(),epoch);
+ // Even once the interval would have elapsed, the abandoned request is never debited.
+ tick(1000);await flush();
+ assert.equal(c.allowed,1,'a request for a closed page is never forwarded');
+ assert.equal(c.aborted,1);assert.deepEqual(c.reasons,['blockedbyclient']);
+ assert.equal(b.data.requests,1,'a closed page cannot debit the ledger');
+ assert.equal(b.data.blocked,0);
+ // The close is not a run stop: the budget still admits for the next page.
+ await b.admit('discovery');
+ assert.equal(b.data.requests,2);
+ assert.equal(b.data.denial,null);
+});

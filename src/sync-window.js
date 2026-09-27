@@ -212,14 +212,20 @@ async function installGuards(page,budget,deadline=Infinity){
   return deadlineAbort.signal;
  };
  // One guarded page per handle: do not leave its deadline timer armed once closed.
- page.on('close',()=>{if(deadlineTimer)clearTimeout(deadlineTimer);});
+ // Closing the page also releases any admission still waiting out a pacing gap for
+ // it: that request can no longer be forwarded, so it must not be debited after the
+ // page is gone. Like the deadline abort, this is a plain typed reason, never
+ // budget.fail(), so it cannot overwrite a recorded provider denial.
+ const pageClosed=new AbortController();
+ page.on('close',()=>{if(deadlineTimer)clearTimeout(deadlineTimer);if(!pageClosed.signal.aborted)pageClosed.abort(new F.ArchiveError('BROWSER_TRANSPORT','guarded page closed before request admission'));});
+ const admissionSignal=()=>{const d=deadlineSignal();return d?AbortSignal.any([d,pageClosed.signal]):pageClosed.signal;};
  await page.route('**/*',async route=>{
   const req=route.request();const u=new URL(req.url());
   // Cosmetic previews never leave the browser. Media acquisition uses downloadOne.
   if(['image','media','stylesheet','font'].includes(req.resourceType()))return route.abort('blockedbyclient');
   try{assertTime();}catch(e){return route.abort('blockedbyclient');}
   if(u.origin!==F.PROVIDER_ORIGIN)return route.fallback();
-  try{assertTime();await budget.admit(u.pathname==='/media'&&req.resourceType()==='fetch'?'download':'discovery',deadlineSignal(),deadline);assertTime();}
+  try{assertTime();await budget.admit(u.pathname==='/media'&&req.resourceType()==='fetch'?'download':'discovery',admissionSignal(),deadline);assertTime();}
   catch(e){return route.abort('blockedbyclient');}
   return route.fallback();
  });
