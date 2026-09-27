@@ -650,7 +650,9 @@ async function syncWindow(input,deps={}){
  const config=validate(input),root=await F.safeOutputRoot(config.output),resultFile=path.resolve(config.resultFile);
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));
  if(await fs.lstat(resultFile).catch(e=>e.code==='ENOENT'?null:Promise.reject(e)))throw new F.ArchiveError('EXISTS','result already exists; use a new run result path');
- const budget=openBudget(config.requestLedger,config.runId,config.maxRequests),deadline=Date.now()+config.maxTimeMs;
+ // Optional caller pacing is a job bound like maxRequests: typed by openBudget, shared by
+ // discovery and acquisition, and absent by default so existing jobs keep their timing.
+ const budget=openBudget(config.requestLedger,config.runId,config.maxRequests,config.minRequestIntervalMs),deadline=Date.now()+config.maxTimeMs;
  // Media admission shares the job's absolute deadline with discovery admission.
  budget.setDeadline(deadline);
  const result={schemaVersion:1,kind:'frameferry-sync-window',runId:config.runId,scope:'current-visible-posts',fullHistoryComplete:false,failureIsolation:'handle-local-v1',stoppedGlobally:false,output:root,handles:handleMap(),totals:{downloaded:0,reused:0,bytes:0},status:'RUNNING'};

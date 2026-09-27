@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Optional `sync-window` `minRequestIntervalMs`: a caller-chosen courtesy gap, 0-60000 whole
+  milliseconds (`BAD_BUDGET` otherwise), between serialized request admissions. It is enforced
+  inside the shared admission path, so discovery and media acquisition observe one combined gap
+  and concurrent callers cannot interleave around it, and it is measured from the last request
+  the run actually debited, so a queued caller waits only the remainder and a failed admission
+  never compounds the next gap. The default stays `0`: an existing job's timing is unchanged and
+  no timer is armed. The absolute job deadline still bounds the wait - no admission sleeps past
+  it - and a caller abort, a recorded refusal or ledger close ends the wait at once, with the
+  stop that actually applies reported under the existing precedence. No automatic 429/503
+  `Retry-After` wait is introduced: a refusal still ends the current operation and its run ID,
+  and only a separately authorized attempt may re-observe. The effective interval is published
+  as `requests.minRequestIntervalMs` and stored as the ledger's `min_request_interval_ms`;
+  because pacing changes nothing about how a refusal is classified, the versioned policy name
+  `public-provider-unpaced-v2` is unchanged and existing `denial_dispositions` are not
+  re-derived.
+
 ## 0.3.2 - 2026-09-19
 
 ### Fixed

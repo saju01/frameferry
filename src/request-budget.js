@@ -1,11 +1,12 @@
 'use strict';
 // Public InstaCognito traffic: serialized accounting, not a signed-account quota or pacing rule.
-// Preserve real provider denials and history. Optional maxRequests is a caller job bound.
+// Preserve real provider denials and history. Optional maxRequests is a caller job bound,
+// and optional minRequestIntervalMs is a caller courtesy gap between serialized admissions.
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { ArchiveError, PROVIDER_ORIGIN } = require('./index.js');
-const HOUR_MS = 3600000, MIN_REQUEST_INTERVAL_MS = 0;
+const HOUR_MS = 3600000, MIN_REQUEST_INTERVAL_MS = 0, MAX_REQUEST_INTERVAL_MS = 60000;
 const POLICY='public-provider-unpaced-v2';
 const DENIAL_KINDS=new Set(['DENIED_AUTH','RATE_LIMITED','SERVICE_UNAVAILABLE','DENIED_CHALLENGE','DENIED_CONTENT_WALL','DENIED_CHALLENGE_DOM','DENIED_ACCESS_DOM']);
 function retryAt(raw,at,truncated=false){
@@ -38,15 +39,24 @@ function cap(value) {
   if (!Number.isSafeInteger(value) || value < 1) throw new ArchiveError('BAD_BUDGET', 'optional maxRequests must be a positive safe integer');
   return value;
 }
+// The caller's own spacing between serialized admissions. Absent means the documented
+// default - no wait at all - so an existing caller's timing is unchanged. An explicit
+// value is a job bound like maxRequests, typed here rather than deep inside a timer:
+// a gap wider than a minute would outlast most of the job deadlines this tool supports.
+function pace(value) {
+  if (value === undefined) return MIN_REQUEST_INTERVAL_MS;
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_REQUEST_INTERVAL_MS) throw new ArchiveError('BAD_BUDGET', 'optional minRequestIntervalMs must be a safe integer from 0 to ' + MAX_REQUEST_INTERVAL_MS);
+  return value;
+}
 
 function atomic(file, doc) {
   const tmp=file+'.tmp-'+process.pid;
   fs.writeFileSync(tmp, JSON.stringify(doc,null,2), {mode:0o600});
   fs.renameSync(tmp,file);
 }
-function openBudget(file, runId, limit) {
+function openBudget(file, runId, limit, interval) {
   if (!file || typeof runId !== 'string' || !/^[A-Za-z0-9._-]{1,150}$/.test(runId)) throw new ArchiveError('BAD_BUDGET','ledger path and safe run ID required');
-  const maximum=cap(limit); file=path.resolve(file);
+  const maximum=cap(limit),minInterval=pace(interval); file=path.resolve(file);
   fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
   if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) throw new ArchiveError('BAD_BUDGET','ledger cannot be a symlink');
   const lock=file+'.window-lock'; let fd,lockIdentity=null;
@@ -79,8 +89,13 @@ function openBudget(file, runId, limit) {
     fd=undefined;
     throw new ArchiveError('BAD_BUDGET','cannot record request ledger ownership ('+(e.code||e.message)+')',{cleanup});
   }
-  let d,stopped=null,closeError=null,jobDeadline=Infinity;
+  let d,stopped=null,closeError=null,jobDeadline=Infinity,lastRequestMs=null;
   const stopController=new AbortController();
+  // Closing is not a stop this run can be blamed for, so it does not abort
+  // stopController (that would latch a reason over a recorded denial). It only
+  // releases anyone waiting out the pacing interval, who then re-checks and gets
+  // the ordinary BUDGET_CLOSED refusal from assert().
+  const closeController=new AbortController();
   // Cleanup is the last thing a run does, from a `finally`: a throw here would
   // replace the real outcome. So it is idempotent and best-effort. A missing lock
   // is the desired end state, not a fault; any other failure is recorded on the
@@ -92,6 +107,7 @@ function openBudget(file, runId, limit) {
   // the inode this owner created is unlinked; anything else is reported as lost
   // ownership and left exactly where it is.
   const close=()=>{
+    closeController.abort();
     if(fd!==undefined){
       const handle=fd;fd=undefined;
       try{fs.closeSync(handle);}catch(e){if(e.code!=='EBADF')closeError=closeError||new ArchiveError('LEDGER_CLEANUP_FAILED','cannot close request ledger lock ('+(e.code||e.message)+')',{cause:e.code||null});}
@@ -151,7 +167,7 @@ function openBudget(file, runId, limit) {
     // Deprecated local ceilings do not define a public-provider quota. Keep their history
     // for audit, but only an explicit current caller limit can bound this invocation.
     if (legacyCeilings) d.previous_local_ceilings=legacyCeilings;
-    d.quota_policy=POLICY;d.session_ceiling=maximum;d.hourly_ceiling=null;d.min_request_interval_ms=MIN_REQUEST_INTERVAL_MS;
+    d.quota_policy=POLICY;d.session_ceiling=maximum;d.hourly_ceiling=null;d.min_request_interval_ms=minInterval;
     const save=()=>{d.recent_request_ms=d.recent_request_ms.filter(t=>t>=Date.now()-HOUR_MS);d.updated_at=new Date().toISOString();atomic(file,d);};
     const assert=()=>{if(fd===undefined)throw new ArchiveError('BUDGET_CLOSED','request ledger is closed');if(stopped)throw stopped;if(d.denial)throw new ArchiveError('PROVIDER_DENIED','recorded provider denial '+d.denial.id+' remains in force');};
     // A recorded provider denial is the strongest stop a run can hold, and assert()
@@ -170,7 +186,7 @@ function openBudget(file, runId, limit) {
     const reserve=phase=>{
       assert();d.recent_request_ms=d.recent_request_ms.filter(t=>t>=Date.now()-HOUR_MS);
       if(d.session_ceiling!==null && d.requests>=d.session_ceiling){d.blocked++;save();throw fail('REQUEST_LIMIT','request allowance exhausted; incomplete scope retained');}
-      d.requests++;d.by_phase[phase]=(d.by_phase[phase]||0)+1;d.recent_request_ms.push(Date.now());
+      d.requests++;d.by_phase[phase]=(d.by_phase[phase]||0)+1;lastRequestMs=Date.now();d.recent_request_ms.push(lastRequestMs);
       try{save();}catch(e){throw fail('LEDGER_WRITE_FAILED','cannot persist request reservation');}
     };
     let admissionTail=Promise.resolve();
@@ -181,10 +197,41 @@ function openBudget(file, runId, limit) {
     // keeps a lapsed job from debiting the ledger. It is thrown, never latched by
     // fail(): a deadline must not downgrade a recorded PROVIDER_DENIED.
     const expire=at=>{if(Number.isFinite(at)&&Date.now()>=at)throw new ArchiveError('TIME_LIMIT','job deadline reached before request reservation');};
+    // Optional caller pacing, applied INSIDE the serialized admission path so discovery
+    // and media acquisition share one gap and concurrent callers cannot interleave around
+    // it. The interval is measured from the last request this run actually debited, so a
+    // queued caller waits only the remainder, and an admission that fails after waiting
+    // does not compound the next one's gap.
+    //
+    // This is a courtesy gap the CALLER chose, not a provider quota and not a retry. A
+    // 429/503 Retry-After is deliberately never waited out here: a refusal ends the current
+    // operation and its run ID (see deny/fail), and only a separately authorized attempt may
+    // re-observe. Sleeping off a recorded cooldown inside admission would quietly convert a
+    // denial into an internal retry loop.
+    //
+    // The wait RESOLVES early and never rejects - on the caller's abort, on this budget's own
+    // stop, and on close - so the checks after it decide the outcome under their established
+    // precedence (a recorded denial outranks an abort, which outranks a lapsed deadline). It
+    // is clamped to the absolute deadline too: a run must not sleep past the moment at which
+    // it may no longer reserve, and the boundary check below then raises TIME_LIMIT.
+    const paced=(at,signal)=>{
+      if(minInterval<=0||lastRequestMs===null)return null;
+      let wait=lastRequestMs+minInterval-Date.now();
+      if(Number.isFinite(at))wait=Math.min(wait,at-Date.now());
+      if(!(wait>0))return null;
+      return new Promise(resolve=>{
+        const signals=[signal,stopController.signal,closeController.signal].filter(Boolean);
+        let timer=null;
+        const finish=()=>{clearTimeout(timer);for(const s of signals)s.removeEventListener('abort',finish);resolve();};
+        timer=setTimeout(finish,wait);
+        for(const s of signals){if(s.aborted)return finish();s.addEventListener('abort',finish,{once:true});}
+      });
+    };
     const admit=(phase,signal,deadlineAt)=>{
       const at=deadlineAt===undefined?jobDeadline:deadlineAt;
-      const task=admissionTail.then(()=>{
+      const task=admissionTail.then(async()=>{
         assert();signal?.throwIfAborted();expire(at);
+        await paced(at,signal);
         assert();signal?.throwIfAborted();expire(at);
         reserve(phase);
       });
@@ -231,4 +278,4 @@ function openBudget(file, runId, limit) {
     save();return {data:d,reserve,admit,inspect,deny,assert,fetch,close,fail,setDeadline,signal:stopController.signal,get cleanupError(){return closeError;}};
   } catch(e) {close();if(e instanceof ArchiveError)throw e;throw new ArchiveError('BAD_BUDGET','cannot read trustworthy request accounting');}
 }
-module.exports={openBudget,MIN_REQUEST_INTERVAL_MS};
+module.exports={openBudget,MIN_REQUEST_INTERVAL_MS,MAX_REQUEST_INTERVAL_MS};
