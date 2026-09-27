@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.3 - 2026-09-27
 
 ### Added
 
@@ -16,8 +16,9 @@
   30s per-file acquisition window - which is why the accepted maximum sits well below the
   smallest of those; staying under it is not a promise that a given interval fits, and callers
   must size the gap against their own request count and deadlines. The absolute job deadline
-  still bounds the wait - no admission sleeps past it - and a caller abort, a recorded refusal
-  or ledger close ends the wait at once, with the stop that actually applies reported under the
+  still bounds the wait - no admission sleeps past it - and a caller abort, a recorded refusal,
+  ledger close or the close of the guarded browser page ends the wait at once without debiting
+  the abandoned request, with the stop that actually applies reported under the
   existing precedence. An already exhausted `maxRequests` allowance is refused immediately
   instead of after the gap, with the same `REQUEST_LIMIT` refusal and blocked accounting. No
   automatic 429/503 `Retry-After` wait is introduced: a refusal still ends the current operation

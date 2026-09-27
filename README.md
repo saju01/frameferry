@@ -273,8 +273,9 @@ Example private configuration (keep real handles, paths and scheduling outside t
   forwarded after the deadline, browser connect/launch timeouts, poll sleeps and
   any `minRequestIntervalMs` gap are clamped to the remaining budget, and a
   recorded provider denial keeps precedence over a lapsed deadline. A pacing gap
-  also ends immediately on a caller abort, on a recorded refusal and on ledger
-  close, and the stop that is reported is then the one that actually applies. An
+  also ends immediately on a caller abort, on a recorded refusal, on ledger
+  close and when the guarded browser page closes (that request is then neither
+  debited nor forwarded), and the stop that is reported is then the one that actually applies. An
   already exhausted `maxRequests` allowance is refused at once rather than after
   the gap, since no wait could have admitted it.
 - Composition (`resultParts`) binds to the immutable on-disk receipt, not to the
