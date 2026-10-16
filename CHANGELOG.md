@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.4 - 2026-10-16
+
+### Added
+
+- Opt-in `--resume-by-slot` (`resumeBySlot: true`) on `archive`: when a provider rotates media URL
+  fingerprints between runs, reuse an existing byte-verified receipt that covers the same
+  `(shortcode, carouselIndex, slideCount, mediaType)` slot and resolve stale carried pending entries
+  for proved slots without re-downloading. Default behavior (`resumeBySlot: false`) is unchanged.
+
+### Fixed
+
+- Listing response contract: carousel children in `/api/posts` no longer require an `id` field when
+  the provider omits it, while root items and present child `id` values remain strictly validated.
+  Unknown listing fields now report bounded field-name and value-type diagnostics.
+- `sync-window` empty media responses: an `HTTP 200` media response with a 0-byte body is now
+  classified as an item-local `EMPTY_MEDIA` failure rather than halting the entire multi-handle
+  batch as a global `BAD_SIGNATURE` stop. Non-empty unrecognized headers remain a global
+  `BAD_SIGNATURE` stop with bounded 16-byte hex diagnostics preserved through `request-budget`.
+- Multi-generation carousel discovery & pagination retention: `retainVisibleBatch` now computes
+  batch-local `carouselIndex` and `slideCount` per DOM generation (folding multi-copy DOM snapshots
+  back to single-generation slide counts) so repeated pagination renders never inflate `slideCount`
+  or re-queue already-retained slides, while `rearmPaginationSentinel` nudges relative to the
+  sentinel rather than scrolling to the top of the document.
+
 ## 0.3.3 - 2026-09-27
 
 ### Added

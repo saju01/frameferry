@@ -327,7 +327,7 @@ function bindWindowRender({receipts,probe,bodies,cards,category}){
  if(body.state!=='read')return fail('unknown-response-evidence',{detail:
   ['unconsumed','unobserved','unreadable','oversized','released','cancelled'].includes(body.state)?'body-'+body.state:'body-state-unknown'});
  const decoded=F.decodeListingResponse(body.text);
- if(!decoded.supported)return fail('unknown-response-evidence',{detail:decoded.reason});
+ if(!decoded.supported)return fail('unknown-response-evidence',{detail:decoded.reason,...(decoded.fields?{fields:decoded.fields}:{})});
  const schema={version:decoded.version,records:decoded.records,children:decoded.children,cards:decoded.tuples.length};
  // FULL tuples on both sides. Independent media and shortcode sets, token occurrence counts, a
  // matching subset or shortcode-only evidence cannot show that a card belongs to its own post,
@@ -359,6 +359,9 @@ function bindWindowRender({receipts,probe,bodies,cards,category}){
 function bindingRecord(binding,probe){
  return {basis:binding.basis??null,reason:binding.reason??null,
   ...(LISTING_DIAGNOSTIC_DETAILS.has(binding.detail)?{detail:binding.detail}:{}),
+  ...(binding.fields&&typeof binding.fields==='object'?{fields:{where:['root','item','child'].includes(binding.fields.where)?binding.fields.where:'unknown',
+    keys:(Array.isArray(binding.fields.keys)?binding.fields.keys:[]).filter(k=>typeof k==='string'&&/^[A-Za-z0-9_]{1,16}:(string|number|boolean|object|array|null|undefined)$/.test(k)).slice(0,8),
+    ...(typeof binding.fields.bad==='string'&&/^[a-z]{1,4}$/.test(binding.fields.bad)?{bad:binding.fields.bad}:{})}}:{}),
   schema:binding.schema?{version:binding.schema.version,records:binding.schema.records,children:binding.schema.children,cards:binding.schema.cards}:null,
   unmatched:binding.unmatched?{missing:binding.unmatched.missing,extra:binding.unmatched.extra,mismatched:binding.unmatched.mismatched}:null,
   commitGen:probe?probe.commitGen:null,identityGen:probe?probe.identityGen:null};
@@ -638,7 +641,7 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
   if(receipt&&receipt.providerMediaFingerprint===item.providerMediaFingerprint&&receiptAgreesWithObservation(receipt,item)&&await verifyStrictReceipt(paths,receipt,item.stableId,handle))reused=true;
   else {
    const remaining=options.maxBytes-totals.bytes;if(remaining<1)throw new F.ArchiveError('BYTE_LIMIT','incremental byte allowance exhausted');
-   const result=await F.downloadOne(item,paths,{handle,runId,signal:budget.signal,beforeCommit:options.beforeCommit,fetchImpl:options.fetchImpl||budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{},acceptExistingReceipt:r=>canonicalReceiptMediaPath(paths,r)});
+   const result=await (async()=>{try{return await F.downloadOne(item,paths,{handle,runId,signal:budget.signal,beforeCommit:options.beforeCommit,fetchImpl:options.fetchImpl||budget.fetch,stopOnDenial:true,dnsLookup:options.dnsLookup,maxBytes:Math.min(options.maxFileBytes,remaining),remainingMs:Math.min(30000,options.deadline-Date.now()),completedMap:{},acceptExistingReceipt:r=>canonicalReceiptMediaPath(paths,r)});}catch(e){if(e&&e.code==='EMPTY_MEDIA')e.details={...e.details,stableId:item.stableId,shortcode:item.shortcode};throw e;}})();
    if(result.conflict)throw new F.ArchiveError('IDENTITY_CONFLICT','conflicting media bytes held unchanged');
    receipt=result.receipt;totals.downloaded++;totals.bytes+=receipt.bytes;
   }
@@ -651,7 +654,7 @@ async function acquireSelection(rows,paths,handle,runId,budget,options,totals){
 }
 // Only positively classified handle-local failures may continue. Unknown errors,
 // browser loss, disk/byte/time limits and denial remain global fail-stops.
-const HANDLE_LOCAL_ERRORS=new Set(['ACCESS_REQUIRED','FEED_COVERAGE_GAP','EMPTY_WINDOW','AMBIGUOUS_WINDOW','BAD_ITEM','DATE_POLICY','HANDLE_UNAVAILABLE','UNSUPPORTED_LISTING_FORMAT']);
+const HANDLE_LOCAL_ERRORS=new Set(['ACCESS_REQUIRED','FEED_COVERAGE_GAP','EMPTY_WINDOW','AMBIGUOUS_WINDOW','BAD_ITEM','DATE_POLICY','HANDLE_UNAVAILABLE','UNSUPPORTED_LISTING_FORMAT','EMPTY_MEDIA']);
 async function syncWindow(input,deps={}){
  const config=validate(input),root=await F.safeOutputRoot(config.output),resultFile=path.resolve(config.resultFile);
  await F.ensureSafeDir(path.dirname(resultFile),path.dirname(resultFile));
@@ -719,7 +722,7 @@ async function syncWindow(input,deps={}){
     const readiness=e.details?.readiness;
     const local=(HANDLE_LOCAL_ERRORS.has(e.code)||(e.code==='WINDOW_NOT_READY'&&localWindowReadiness(readiness)))&&Date.now()<deadline;
     if(readiness)h.readiness=readiness;
-    h.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:local?'handle':'global'};
+    h.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:local?'handle':'global',...(e.code==='EMPTY_MEDIA'&&e.details?{itemDiagnostics:{...F.sanitizeSignatureDiagnostics(e.details),...(typeof e.details.stableId==='string'&&/^[A-Za-z0-9_.-]{1,128}$/.test(e.details.stableId)?{stableId:e.details.stableId}:{})}}:{})};
     if(!local)throw e;
     result.error ||= h.error;
    }
@@ -729,7 +732,7 @@ async function syncWindow(input,deps={}){
   // the map's values instead would call a job complete whose requested handle never
   // made it into the map at all.
   result.status=config.handles.every(spec=>readHandle(result.handles,spec.handle)?.status==='COMPLETE')?'COMPLETE':'PARTIAL';return result;
- }catch(e){result.stoppedGlobally=true;result.status=budget.data.denial||['DENIED','PROVIDER_DENIED','RATE_LIMITED'].includes(e.code)?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:'global'};for(const h of config.handles)if(!hasHandle(result.handles,h.handle))writeHandle(result.handles,h.handle,{status:'NOT_COMPLETED',failed:true,scope:'current-visible-posts',dateAfter:h.dateAfter,files:[]});return result;}
+ }catch(e){result.stoppedGlobally=true;result.status=budget.data.denial||['DENIED','PROVIDER_DENIED','RATE_LIMITED'].includes(e.code)?'BLOCKED':'PARTIAL';result.error={code:e.code||'FAILED',message:F.redactSignedUrls(e.message),scope:'global',...(e.code==='BAD_SIGNATURE'&&e.details?{signatureDiagnostics:F.sanitizeSignatureDiagnostics(e.details)}:{})};for(const h of config.handles)if(!hasHandle(result.handles,h.handle))writeHandle(result.handles,h.handle,{status:'NOT_COMPLETED',failed:true,scope:'current-visible-posts',dateAfter:h.dateAfter,files:[]});return result;}
  finally{
   // Close only our context. For connectOverCDP, browser.close() disconnects
   // Playwright's client transport; it does not terminate the external browser.

@@ -37,7 +37,8 @@ async function browserMediaFetch(page,budget,url,{signal}={}){
  const close=reason=>{
   if(reason instanceof Error){
    let stopped=false;try{budget.assert();}catch(e){stopped=true;}
-   if(!stopped)budget.fail(reason.code||'BROWSER_TRANSPORT','browser media acquisition failed');
+   // EMPTY_MEDIA is item-local (positively classified in downloadOne): close this reader, but never latch the job-wide stop.
+   if(!stopped&&reason.code!=='EMPTY_MEDIA')budget.fail(reason.code||'BROWSER_TRANSPORT','browser media acquisition failed',reason.code==='BAD_SIGNATURE'?reason.details:undefined);
   }
   return closing||=(async()=>{
   try{

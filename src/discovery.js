@@ -30,7 +30,7 @@ function validateOptions(opts = {}) {
     networkTimeoutMs: integer('networkTimeoutMs', 60000, 1, 600000), delayMs: integer('delayMs', 0, 0, 60000),
     maxLocatorAgeMs: integer('maxLocatorAgeMs', 300000, 1, 7200000),
     maxObservedMedia: integer('maxObservedMedia', 100000, 1, 100000),
-    discoveryOnly: !!opts.discoveryOnly, targetIds: list('targetIds'), targetPosts: list('targetPosts'), stopOnItemFailure: !!opts.stopOnItemFailure };
+    discoveryOnly: !!opts.discoveryOnly, targetIds: list('targetIds'), targetPosts: list('targetPosts'), stopOnItemFailure: !!opts.stopOnItemFailure, resumeBySlot: !!opts.resumeBySlot };
 }
 function runtimeReceipt(effective) {
   const files = ['index.js', 'discovery.js', 'zip.js', '../bin/frameferry.js', '../package.json'].map(name => [name, hash(fs.readFileSync(path.join(__dirname, name)))]);
