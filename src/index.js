@@ -80,6 +80,17 @@ function normalizeMediaType(value) {
   if (v === 'video' || v === 'reel' || v === 'mp4') return 'video';
   return 'unknown';
 }
+function sanitizeSignatureDiagnostics(d) {
+  if (!d || typeof d !== 'object') return null;
+  const num = v => (Number.isFinite(v) && v >= 0 ? v : null);
+  return {
+    headHex: typeof d.headHex === 'string' && /^[0-9a-f]{0,32}$/.test(d.headHex) ? d.headHex : null,
+    streamedBytes: num(d.streamedBytes),
+    contentTypeToken: typeof d.contentTypeToken === 'string' && d.contentTypeToken.length <= 64 ? d.contentTypeToken : null,
+    httpStatus: num(d.httpStatus),
+    declaredLength: num(d.declaredLength),
+  };
+}
 function sanitizeContentTypeToken(raw) {
   if (!raw || typeof raw !== 'string') return null;
   const token = raw.split(';')[0].trim().toLowerCase();
@@ -380,6 +391,7 @@ function normalizeItems(rawItems, opts = {}) {
       permalink: raw.permalink ?? null,
       highlightGroup: raw.highlightGroup ?? options.highlightGroup ?? null,
       rawPostId: shortcode || null,
+      rawSlideCount: Number.isInteger(raw.slideCount) ? raw.slideCount : undefined,
       providerMediaFingerprint: providerMediaFingerprint(href),
       locatorObservedAt: raw.locatorObservedAt || raw.observedAt || new Date().toISOString(),
       metadataProvenance: raw.metadataProvenance || { observedAt: raw.observedAt || new Date().toISOString(), category, source: 'supported-ui', dateRaw, captionTruncated: raw.captionTruncated ?? raw.caption ?? null },
@@ -395,9 +407,19 @@ function normalizeItems(rawItems, opts = {}) {
   }
   // How many slides this post actually showed in this observation. A single-slide post has an
   // unambiguous index; a carousel does not, and needs its mapping proved before it can be reused.
+  if (options.dedupeSlotPositions) {
+    const bySlot = new Map();
+    for (const item of items) {
+      const sk = item.shortcode ? item.shortcode + '|' + item.carouselIndex : Symbol();
+      bySlot.set(sk, item);
+    }
+    items.length = 0;
+    items.push(...bySlot.values());
+  }
   const slideCounts = new Map();
-  for (const item of items) if (item.shortcode) slideCounts.set(item.shortcode, (slideCounts.get(item.shortcode) || 0) + 1);
-  for (const item of items) item.slideCount = item.shortcode ? slideCounts.get(item.shortcode) : 1;
+  for (const item of items) if (item.shortcode) slideCounts.set(item.shortcode, Math.max(slideCounts.get(item.shortcode) || 0, Number.isInteger(item.carouselIndex) ? item.carouselIndex + 1 : 1));
+  for (const item of items) item.slideCount = Number.isInteger(item.rawSlideCount) ? item.rawSlideCount : (item.shortcode ? slideCounts.get(item.shortcode) : 1);
+  for (const item of items) delete item.rawSlideCount;
   return { items, uniquePostCount: seenPosts.size };
 }
 function validateProviderMediaUrl(raw) {
@@ -521,7 +543,14 @@ async function streamResponseToPart(res, part, { maxBytes, signal, onPartCreated
   }
   const first = Buffer.concat(head).subarray(0, 16);
   const kind = mediaKindFromMagic(first);
-  if (!kind) throw new ArchiveError('BAD_SIGNATURE', 'download signature is not recognized media');
+  if (!kind) {
+    // Diagnostics only: the first 16 header bytes as hex (never more) and the streamed length. The
+    // rejected body is deleted by the caller; without this a global stop is unexplainable.
+    throw new ArchiveError('BAD_SIGNATURE', 'download signature is not recognized media', {
+      headHex: first.toString('hex'),
+      streamedBytes: bytes,
+    });
+  }
   return { bytes, sha256: hash.digest('hex'), kind };
 }
 async function verifyReceipt(paths, receipt) {
@@ -748,7 +777,28 @@ async function downloadOne(item, paths, { fetchImpl = globalThis.fetch, maxBytes
     if (declared > maxBytes) throw new ArchiveError('TOO_LARGE', 'content-length exceeds max bytes');
     await ensureSafeDir(paths.mediaDir, paths.root);
     await ensureSafeDir(paths.receiptDir, paths.root);
-    const got = await streamResponseToPart(res, tempBase, { maxBytes, signal: ac.signal, onPartCreated: () => { partOwned = true; } });
+    let got;
+    try {
+      got = await streamResponseToPart(res, tempBase, { maxBytes, signal: ac.signal, onPartCreated: () => { partOwned = true; } });
+    } catch (sigErr) {
+      if (sigErr && sigErr.code === 'BAD_SIGNATURE') {
+        sigErr.details = {
+          ...sigErr.details,
+          contentTypeToken: sanitizeContentTypeToken(ct),
+          httpStatus: typeof res.status === 'number' && Number.isFinite(res.status) && res.status >= 0 ? res.status : null,
+          declaredLength: Number.isFinite(declared) && declared >= 0 ? declared : null,
+        };
+        // Positive evidence only: HTTP 200, a media content type, a declared AND streamed length of
+        // exactly zero. That is the provider serving an empty body for this one item (observed
+        // 2026-10-16, same item twice, other items in the same session fine). It is NOT a recognised
+        // refusal, so it is item-local; any other unrecognised bytes stay a global BAD_SIGNATURE.
+        const d = sigErr.details;
+        if (d.streamedBytes === 0 && d.httpStatus === 200 && d.declaredLength === 0 && /^(image|video)\//.test(d.contentTypeToken || '')) {
+          throw new ArchiveError('EMPTY_MEDIA', 'provider served an empty media body for this item', d);
+        }
+      }
+      throw sigErr;
+    }
     await res.close?.();
     assertActive();
     if (declared && declared !== got.bytes) throw new ArchiveError('BAD_LENGTH', 'content-length mismatch');
@@ -1715,13 +1765,20 @@ const LISTING_DECODER_LIMITS = { maxRecords: 512, maxChildren: 64, maxTuples: 40
 function reverseLocator(value) { return [...value].reverse().join(''); }
 function decodeListingResponse(text, limits = {}) {
   const bound = { ...LISTING_DECODER_LIMITS, ...limits };
-  const fail = reason => ({ supported: false, reason, version: null, tuples: null, records: 0, children: 0 });
+  // Diagnostics for an unsupported grammar: at most 8 key NAMES (short, [A-Za-z0-9_]) with the JS type of
+  // their value. Never a value, never provider text.
+  const keyInfo = o => {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return [];
+    return Object.keys(o).filter(k => /^[A-Za-z0-9_]{1,16}$/.test(k)).slice(0, 8).map(k => k + ':' + (Array.isArray(o[k]) ? 'array' : o[k] === null ? 'null' : typeof o[k]));
+  };
+  let probeFields = null;
+  const fail = reason => ({ supported: false, reason, version: null, tuples: null, records: 0, children: 0, ...(probeFields ? { fields: probeFields } : {}) });
   if (typeof text !== 'string') return fail('unreadable-listing-body');
   if (text.length > bound.maxTextLength) return fail('listing-exceeds-decoder-bound');
   let root;
   try { root = JSON.parse(text); } catch { return fail('unparseable-listing-body'); }
   if (!root || typeof root !== 'object' || Array.isArray(root)) return fail('unknown-listing-representation');
-  for (const key of Object.keys(root)) if (!LISTING_ROOT_KEYS.has(key)) return fail('unknown-listing-field');
+  for (const key of Object.keys(root)) if (!LISTING_ROOT_KEYS.has(key)) { probeFields = { where: 'root', keys: keyInfo(root) }; return fail('unknown-listing-field'); }
   if (!Array.isArray(root.p)) return fail('unknown-listing-representation');
   // `pc` is the opaque continuation cursor. It is not listing data and never becomes a tuple.
   if (Object.prototype.hasOwnProperty.call(root, 'pc') && typeof root.pc !== 'string') return fail('unknown-listing-field');
@@ -1733,14 +1790,19 @@ function decodeListingResponse(text, limits = {}) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return 'unknown-listing-representation';
     for (const key of Object.keys(item)) {
       if (LISTING_ITEM_REQUIRED.includes(key) || LISTING_ITEM_OPTIONAL.has(key)) continue;
+      probeFields = { where: isChild ? 'child' : 'item', keys: keyInfo(item) };
       return 'unknown-listing-field';
     }
     for (const key of LISTING_ITEM_REQUIRED) {
       // Captured roots and children can omit captions. A present caption is still a bounded
       // string; absence of any identity/date/media field remains unsupported.
       if (key === 'c' && !Object.prototype.hasOwnProperty.call(item, key)) continue;
+      // 2026-10-16: the provider's live /api/posts carousel children no longer carry `id` (roots still
+      // do). `id` is never read into a tuple, so a child without it loses no identity/date/media
+      // evidence. A PRESENT child `id` must still be a bounded string; roots still require it.
+      if (key === 'id' && isChild && !Object.prototype.hasOwnProperty.call(item, key)) continue;
       const value = item[key];
-      if (typeof value !== 'string') return 'unknown-listing-field';
+      if (typeof value !== 'string') { probeFields = { where: isChild ? 'child' : 'item', keys: keyInfo(item), bad: key }; return 'unknown-listing-field'; }
       if (value.length > bound.maxStringLength) return 'listing-exceeds-decoder-bound';
     }
     const hasVu = Object.prototype.hasOwnProperty.call(item, 'vu');
@@ -2525,7 +2587,7 @@ function rawCardIdentity(card) {
   return fingerprint ? JSON.stringify([card.shortcode || null, fingerprint])
     : JSON.stringify([card.shortcode || null, null, card.mediaType || null]);
 }
-async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, started, maxTimeMs, maxPages, continuationMonitor = null, resumeTargets = null, onDiscoveryBatch = null, slicePages = 12, sliceTimeMs = 180000, maxObservedMedia = 100000, targetAliases = {}, requireTerminal = false, stopWhenTargetsObserved = false, targetPosts = [] }) {
+async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, started, maxTimeMs, maxPages, continuationMonitor = null, resumeTargets = null, onDiscoveryBatch = null, slicePages = 12, sliceTimeMs = 180000, maxObservedMedia = 100000, targetAliases = {}, requireTerminal = false, stopWhenTargetsObserved = false, targetPosts = [], resumeBySlot = false }) {
   const accumulated = new Map(), posts = new Set(), discoveredIds = new Set();
   let blocked = null, stopCause = 'page-limit', steps = 0, slice = 1, sliceStarted = Date.now(), sliceStep = 0, generation = 0;
   let finalState = null, activeStep = false;
@@ -2539,22 +2601,69 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
     generation = captured.generation;
     const batches = [...captured.batches.filter(b => !b.category || b.category === category), { cards: await readRawCardsFromPage(page), observedAt: new Date().toISOString() }];
     const changed = new Map();
-    for (const batch of batches) for (const card of batch.cards) {
-      const key = rawCardIdentity(card), prior = accumulated.get(key);
-      // Compare observable fields, not polling timestamps. Work is proportional to rendered
-      // batches, not the size of the accumulated profile. Preserve metadata provenance on
-      // locator-only refresh while replacing the in-memory locator on every actual change.
-      const signature = JSON.stringify([card.shortcode, card.href, card.mediaType, card.dateRaw, card.captionTruncated, card.likes, card.comments]);
-      if (prior && prior.observationSignature === signature) continue;
-      const meta = JSON.stringify([card.dateRaw, card.captionTruncated, card.likes, card.comments]);
-      const next = { ...card, observationSignature: signature, observedAt: batch.observedAt,
-        locatorObservedAt: prior?.href === card.href ? prior.locatorObservedAt : batch.observedAt,
-        metadataProvenance: prior?.metadataSignature === meta ? prior.metadataProvenance : { source: 'supported-ui', category, observedAt: batch.observedAt, dateRaw: card.dateRaw || null, captionTruncated: card.captionTruncated || null }, metadataSignature: meta };
-      accumulated.set(key, next); changed.set(key, next);
-      if (card.shortcode) posts.add(card.shortcode);
+    for (const batch of batches) {
+      const batchPostCounts = new Map();
+      const batchCards = [];
+      const batchSeenFingerprints = new Set();
+      for (const card of batch.cards) {
+        const fp = providerMediaFingerprint(card.href);
+        const fk = fp ? (card.shortcode || '') + '|' + fp : null;
+        if (fk && batchSeenFingerprints.has(fk)) continue;
+        if (fk) batchSeenFingerprints.add(fk);
+        batchCards.push(card);
+        if (card.shortcode) batchPostCounts.set(card.shortcode, (batchPostCounts.get(card.shortcode) || 0) + 1);
+      }
+      // Instagram carousels have at most 20 slides. When the provider appends a fresh generation of an
+      // already-rendered post into #post-container before removing the prior nodes, one DOM snapshot contains
+      // N copies of the same carousel (e.g. 2x18 = 36 or 3x11 = 33). If resumeBySlot is active and a post has
+      // already been observed with a smaller slideCount (<= 20) that divides the snapshot count, fold the
+      // snapshot back into that single-generation slideCount and keep the newest generation's cards.
+      if (resumeBySlot) {
+        for (const [sc, count] of batchPostCounts.entries()) {
+          let baseCount = null;
+          for (const prev of accumulated.values()) {
+            if (prev.shortcode === sc && Number.isInteger(prev.slideCount) && prev.slideCount > 0 && prev.slideCount <= 20) {
+              baseCount = baseCount == null ? prev.slideCount : Math.min(baseCount, prev.slideCount);
+            }
+          }
+          if (baseCount && count > baseCount && count % baseCount === 0) {
+            batchPostCounts.set(sc, baseCount);
+          } else if (!baseCount && count > 20) {
+            for (let d = 2; d <= 5; d++) {
+              if (count % d === 0 && (count / d) <= 20) { batchPostCounts.set(sc, count / d); break; }
+            }
+          }
+        }
+      }
+      const batchNextIdx = new Map();
+      for (const card of batchCards) {
+        const sc = card.shortcode || null;
+        let batchCarouselIndex = Number.isInteger(card.carouselIndex) ? card.carouselIndex : undefined;
+        let batchSlideCount = Number.isInteger(card.slideCount) ? card.slideCount : undefined;
+        if (sc && batchCarouselIndex === undefined) {
+          const effCount = batchPostCounts.get(sc) || 1;
+          const rawIdx = batchNextIdx.get(sc) || 0;
+          batchNextIdx.set(sc, rawIdx + 1);
+          batchCarouselIndex = resumeBySlot ? (rawIdx % effCount) : rawIdx;
+          batchSlideCount = effCount;
+        }
+        const key = rawCardIdentity(card), prior = accumulated.get(key);
+        // Compare observable fields, not polling timestamps. Work is proportional to rendered
+        // batches, not the size of the accumulated profile. Preserve metadata provenance on
+        // locator-only refresh while replacing the in-memory locator on every actual change.
+        const signature = JSON.stringify([card.shortcode, card.href, card.mediaType, card.dateRaw, card.captionTruncated, card.likes, card.comments]);
+        if (prior && prior.observationSignature === signature) continue;
+        const meta = JSON.stringify([card.dateRaw, card.captionTruncated, card.likes, card.comments]);
+        const next = { ...card, ...(batchCarouselIndex !== undefined ? { carouselIndex: batchCarouselIndex } : {}), ...(batchSlideCount !== undefined ? { slideCount: batchSlideCount } : {}),
+          observationSignature: signature, observedAt: batch.observedAt,
+          locatorObservedAt: prior?.href === card.href ? prior.locatorObservedAt : batch.observedAt,
+          metadataProvenance: prior?.metadataSignature === meta ? prior.metadataProvenance : { source: 'supported-ui', category, observedAt: batch.observedAt, dateRaw: card.dateRaw || null, captionTruncated: card.captionTruncated || null }, metadataSignature: meta };
+        accumulated.set(key, next); changed.set(key, next);
+        if (card.shortcode) posts.add(card.shortcode);
+      }
     }
     if (accumulated.size > maxObservedMedia) throw new ArchiveError('RESOURCE_BUDGET', 'discovery identity ceiling reached');
-    const items = normalizeItems([...changed.values()], { category, mediaTypes: DEFAULT_MEDIA_TYPES }).items;
+    const items = normalizeItems([...changed.values()], { category, mediaTypes: DEFAULT_MEDIA_TYPES, dedupeSlotPositions: !!resumeBySlot }).items;
     for (const item of items) if (item.stableId) { discoveredIds.add(item.stableId); for (const alias of targetAliases[item.stableId] || []) discoveredIds.add(alias); }
     // RETENTION above, EMISSION below, and they are not the same operation. Everything above is
     // in-memory observation that the final record reports honestly: a batch that really did
@@ -2638,7 +2747,7 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
     err.code ||= 'OBSERVATION_ERROR'; err.details = { ...(err.details || {}), stopCause, retainedMediaCount: accumulated.size, category };
     throw err;
   }
-  const norm = normalizeItems([...accumulated.values()], { category, mediaTypes });
+  const norm = normalizeItems([...accumulated.values()], { category, mediaTypes, dedupeSlotPositions: !!resumeBySlot });
   const hitLimit = !['terminal-ui', 'coverage-satisfied'].includes(stopCause);
   const status = category === 'posts' && reportedTotal == null ? 'ACTION_REQUIRED' : hitLimit ? 'PARTIAL' : norm.items.length ? 'COMPLETE' : 'UNAVAILABLE';
   return makeSectionRecord({ category, status, reason: blocked ? 'provider denied continuation: ' + blocked.reason : stopCause, tabPresent: true, itemCount: norm.items.length, mediaTypeFilterApplied: mediaTypes,
@@ -2687,7 +2796,7 @@ async function scrapeHighlightsSection(page, { mediaTypes, started, maxTimeMs, o
   if (finalDenial) return denied(finalDenial, 'denied');
   return makeSectionRecord({ category: 'highlights', status: 'PARTIAL', hitLimit: true, reason: 'visible highlight groups do not prove deep-history traversal', tabPresent: true, itemCount: allItems.length, mediaTypeFilterApplied: mediaTypes, evidence: { source: '#highlights-container .highlight + #post-container .post-card' }, items: allItems });
 }
-async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp, categories = DEFAULT_CATEGORIES, mediaTypes = DEFAULT_MEDIA_TYPES, resumeTargets = null, onDiscoveryBatch = null, slicePages = 12, sliceTimeMs = 180000, maxObservedMedia = 100000, targetAliases = {}, requireTerminal = true, consumeScan = null, stopWhenTargetsObserved = false, targetPosts = [] }) {
+async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecutable, browserChannel, attachCdp, categories = DEFAULT_CATEGORIES, mediaTypes = DEFAULT_MEDIA_TYPES, resumeTargets = null, onDiscoveryBatch = null, slicePages = 12, sliceTimeMs = 180000, maxObservedMedia = 100000, targetAliases = {}, requireTerminal = true, consumeScan = null, stopWhenTargetsObserved = false, targetPosts = [], resumeBySlot = false }) {
   if (attachCdp) {
     const u = new URL(attachCdp);
     if (u.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(u.hostname)) throw new ArchiveError('BAD_CDP', 'CDP attach must be explicit loopback http://127.0.0.1:<port>');
@@ -2717,7 +2826,7 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
     await discovery.installCapture(page);
     await page.fill('input#search-input', handle, { timeout: remainingTimeout(started, maxTimeMs) });
     await page.click('button#download-btn', { timeout: remainingTimeout(started, maxTimeMs) });
-    const scan = await scanReadyProfilePage(page, { handle, maxPages, maxTimeMs, categories, mediaTypes, started, continuationMonitor, resumeTargets, onDiscoveryBatch, slicePages, sliceTimeMs, maxObservedMedia, targetAliases, requireTerminal, stopWhenTargetsObserved, targetPosts });
+    const scan = await scanReadyProfilePage(page, { handle, maxPages, maxTimeMs, categories, mediaTypes, started, continuationMonitor, resumeTargets, onDiscoveryBatch, slicePages, sliceTimeMs, maxObservedMedia, targetAliases, requireTerminal, stopWhenTargetsObserved, targetPosts, resumeBySlot });
     if (!consumeScan) return scan;
     let remainingPages = Math.max(0, maxPages - scan.sections.reduce((n,s) => n + (s.evidence?.pages || 0), 0));
     return await consumeScan(scan, {
@@ -2746,7 +2855,7 @@ async function scrapeWithPlaywright({ handle, maxPages, maxTimeMs, browserExecut
 // Everything the scan does once the search has been submitted. Split out so it can be exercised
 // against a page whose provider responses are controlled, which is the only way to test the
 // readiness gate and the section loop together without a live provider.
-async function scanReadyProfilePage(page, { handle, maxPages, maxTimeMs, categories = DEFAULT_CATEGORIES, mediaTypes = DEFAULT_MEDIA_TYPES, started = Date.now(), continuationMonitor = null, resumeTargets = null, onDiscoveryBatch = null, slicePages = 12, sliceTimeMs = 180000, maxObservedMedia = 100000, targetAliases = {}, requireTerminal = false, stopWhenTargetsObserved = false, targetPosts = [] }) {
+async function scanReadyProfilePage(page, { handle, maxPages, maxTimeMs, categories = DEFAULT_CATEGORIES, mediaTypes = DEFAULT_MEDIA_TYPES, started = Date.now(), continuationMonitor = null, resumeTargets = null, onDiscoveryBatch = null, slicePages = 12, sliceTimeMs = 180000, maxObservedMedia = 100000, targetAliases = {}, requireTerminal = false, stopWhenTargetsObserved = false, targetPosts = [], resumeBySlot = false }) {
   {
     const readiness = await waitForProfileReady(page, handle, { started, maxTimeMs, continuationMonitor });
     // Fail closed. Until the provider has rendered the profile for the handle actually requested,
@@ -2812,7 +2921,7 @@ async function scanReadyProfilePage(page, { handle, maxPages, maxTimeMs, categor
       }
       await discovery.resetCapture(page, category);
       if (category === 'highlights') sections.push(await scrapeHighlightsSection(page, { mediaTypes, started, maxTimeMs, onDiscoveryBatch, continuationMonitor }));
-      else sections.push(await scrapeCardSection(page, { category, mediaTypes, reportedTotal: category === 'posts' ? profile.reportedPostCount : null, started, maxTimeMs, maxPages: remainingPages, continuationMonitor, resumeTargets, onDiscoveryBatch, slicePages, sliceTimeMs, maxObservedMedia, targetAliases, requireTerminal, stopWhenTargetsObserved, targetPosts }));
+      else sections.push(await scrapeCardSection(page, { category, mediaTypes, reportedTotal: category === 'posts' ? profile.reportedPostCount : null, started, maxTimeMs, maxPages: remainingPages, continuationMonitor, resumeTargets, onDiscoveryBatch, slicePages, sliceTimeMs, maxObservedMedia, targetAliases, requireTerminal, stopWhenTargetsObserved, targetPosts, resumeBySlot }));
       remainingPages -= sections.at(-1)?.evidence?.pages || 0;
       // The provider has refused. Switching tabs would trigger straight back into a provider that
       // has already denied us, so the remaining sections are recorded as not attempted instead.
@@ -2882,7 +2991,46 @@ async function archiveProfile(opts = {}) {
     const conflicts = { ...(prior.conflicts || {}) };
     // What this run is still missing, and therefore what discovery must actually cover. Signed URLs
     // are never persisted, so an outstanding id can only be retried once a scan surfaces it again.
-    const resumeTargets = new Set([...Object.keys(carriedFailed), ...Object.keys(carriedPending), ...effective.targetIds]);
+    // Under --resume-by-slot a carried id was minted from a fingerprint the provider has since rotated, so it can never be
+    // rediscovered; treating it as a listing target keeps the scan walking until a ceiling instead of letting it finish.
+    const resumeTargets = new Set(effective.resumeBySlot ? [...effective.targetIds] : [...Object.keys(carriedFailed), ...Object.keys(carriedPending), ...effective.targetIds]);
+
+    // Opt-in (--resume-by-slot). The provider rotates a media item's fingerprint between search sessions, so a
+    // stableId minted from the fingerprint never matches a prior receipt and every pass restarts from the newest
+    // posts. A slot is (category, shortcode, carouselIndex); it is only trusted when the receipt and the observed
+    // item agree on media type AND slide count, and the stored bytes still verify. Observed 2026-10-16: 103 of 315
+    // receipts were byte-identical re-downloads of the same slot under different fingerprints.
+    const slotKeyOf = (category, shortcode, index) => (category || 'posts') + '|' + shortcode + '|' + (Number.isInteger(index) ? index : 0);
+    const slotReceipts = new Map();
+    const slotVerified = new Map();
+    const slotCovers = async (category, shortcode, index, mediaType, slideCount) => {
+      const key = slotKeyOf(category, shortcode, index);
+      const receipt = slotReceipts.get(key);
+      if (!receipt) return false;
+      if (normalizeMediaType(receipt.mediaType) !== normalizeMediaType(mediaType)) return false;
+      if (Number.isInteger(slideCount) && Number.isInteger(receipt.slideCount) && slideCount !== receipt.slideCount) return false;
+      if (!slotVerified.has(key)) slotVerified.set(key, await verifyReceipt(paths, receipt));
+      return slotVerified.get(key);
+    };
+    if (effective.resumeBySlot) {
+      for (const receipt of Object.values(completed)) {
+        const shortcode = receiptShortcode(receipt);
+        if (!shortcode) continue;
+        const key = slotKeyOf(receiptCategory(receipt), shortcode, receipt.carouselIndex);
+        const existing = slotReceipts.get(key);
+        if (!existing || (Number.isInteger(receipt.slideCount) && Number.isInteger(existing.slideCount) && receipt.slideCount < existing.slideCount)) {
+          slotReceipts.set(key, receipt);
+        }
+      }
+      // Carried owed entries whose slot is already proved by a verified receipt are not owed.
+      const slotResolved = [];
+      for (const store of [carriedPending, carriedFailed]) {
+        for (const [id, entry] of Object.entries(store)) {
+          if (!entry.shortcode) continue;
+          if (await slotCovers(entry.category, entry.shortcode, entry.carouselIndex, entry.mediaType, entry.slideCount)) { delete store[id]; slotResolved.push(id); }
+        }
+      }
+    }
 
     const audit = [...(prior.audit || [])];
     const auditEntry = {};
@@ -2934,7 +3082,8 @@ async function archiveProfile(opts = {}) {
       await writeOwner('discovery-finished', { status: result.status, terminal: true });
       return writeStatus(paths, result);
     }
-    const discoveryDenied = scan.sections.some(s => s.evidence?.blocked || s.status === 'BLOCKED');
+    const ownCap = b => !!effective.resumeBySlot && b?.kind === 'request-limit' && !b.status;
+    const discoveryDenied = scan.sections.some(s => (s.evidence?.blocked && !ownCap(s.evidence.blocked)) || s.status === 'BLOCKED');
     const acquisitionBudgetMs = discoveryDenied ? 0 : Math.min(effective.acquisitionMaxTimeMs, Math.max(0, maxTimeMs - elapsedSince(started)));
     const acquisitionDeadline = performance.now() + acquisitionBudgetMs;
     const acquisitionRemaining = () => Math.min(acquisitionDeadline - performance.now(), maxTimeMs - elapsedSince(started));
@@ -3209,6 +3358,18 @@ async function archiveProfile(opts = {}) {
         if (processed % checkpointEveryItems === 0) await checkpoint(plannedSections.map(planned => planned.section), 'acquiring');
         continue;
       }
+      if (effective.resumeBySlot && item.shortcode && !priorReceipt && await slotCovers(item.category, item.shortcode, item.carouselIndex, item.mediaType, item.slideCount)) {
+        reused++;
+        section.reusedCount++;
+        delete failed[failureKey];
+        delete pending[failureKey];
+        if (item.stableId) { delete failed[item.stableId]; delete pending[item.stableId]; }
+        acquiredKeys.add(failureKey);
+        if (item.stableId) acquiredKeys.add(item.stableId);
+        processed++;
+        if (processed % checkpointEveryItems === 0) await checkpoint(plannedSections.map(planned => planned.section), 'acquiring');
+        continue;
+      }
       // Out of acquisition budget is work not attempted. It is pending, never a download failure.
       if (acquisitionRemaining() <= 0 || acquisitionAttempts >= effective.maxAcquireItems || acquiredBytes >= effective.maxAcquireBytes) {
         runPending.add(failureKey);
@@ -3231,7 +3392,7 @@ async function archiveProfile(opts = {}) {
         locatorReplayAttempted = true;
         const needed = new Set(workQueue.filter(e => !acquiredKeys.has(e.key)).map(e => e.item.discoveryId || e.item.stableId).filter(Boolean));
         const refreshed = await session.refresh(needed, Math.max(1, Math.floor(acquisitionRemaining())));
-        if (refreshed.blocked) throw new ArchiveError('DENIED', refreshed.blocked.reason);
+        if (refreshed.blocked && !ownCap(refreshed.blocked)) throw new ArchiveError('DENIED', refreshed.blocked.reason);
         const latest = new Map(refreshed.items.map(i => [i.stableId, i]));
         for (const queued of workQueue) {
           const fresh = latest.get(queued.item.discoveryId || queued.item.stableId);
@@ -3248,6 +3409,10 @@ async function archiveProfile(opts = {}) {
         const result = await downloadOne(item, paths, { stopOnDenial: true, fetchImpl: opts.fetchImpl, maxBytes: Math.min(effective.maxBytes, effective.maxAcquireBytes - acquiredBytes), runId, remainingMs: Math.max(1, acquisitionRemaining()), dnsLookup: opts.dnsLookup, timeoutMs: Math.min(opts.networkTimeoutMs || DEFAULT_NETWORK_TIMEOUT_MS, Math.max(1, acquisitionRemaining())), completedMap: completed, handle });
         if (!result.fetchedButReused) acquiredBytes += result.receipt.bytes;
         completed[result.receipt.stableId] = result.receipt;
+        if (effective.resumeBySlot && item.shortcode) {
+          const sk = slotKeyOf(item.category, item.shortcode, item.carouselIndex);
+          if (!slotReceipts.has(sk)) { slotReceipts.set(sk, result.receipt); slotVerified.set(sk, true); }
+        }
         delete failed[failureKey];
         delete failed[result.receipt.stableId];
         delete pending[failureKey];
@@ -3287,6 +3452,23 @@ async function archiveProfile(opts = {}) {
         if (effective.stopOnItemFailure) {
           await checkpoint(plannedSections.map(planned => planned.section), 'acquiring');
           break;
+        }
+      }
+    }
+    if (effective.resumeBySlot) {
+      // A carried owed entry carries a fingerprint-minted id that rotation made unreachable. If its slot now has a
+      // verified receipt (from this run or earlier), it is done; leaving it would report PARTIAL forever.
+      slotReceipts.clear(); slotVerified.clear();
+      for (const receipt of Object.values(completed)) {
+        const shortcode = receiptShortcode(receipt);
+        if (!shortcode) continue;
+        const key = slotKeyOf(receiptCategory(receipt), shortcode, receipt.carouselIndex);
+        if (!slotReceipts.has(key)) slotReceipts.set(key, receipt);
+      }
+      for (const store of [carriedPending, carriedFailed]) {
+        for (const [id, entry] of Object.entries(store)) {
+          if (freshKeys.has(id) || !entry.shortcode) continue;
+          if (await slotCovers(entry.category, entry.shortcode, entry.carouselIndex, entry.mediaType, entry.slideCount)) delete store[id];
         }
       }
     }
@@ -3385,7 +3567,7 @@ async function archiveProfile(opts = {}) {
       }
       if (opts.sections) scan = { profile: opts.profile || null, sections: normalizeProvidedSections(opts.sections, mediaTypes) };
       else if (opts.items) scan = legacyScanFromItems({ ...opts, category: categories[0] || 'posts', mediaTypes });
-      else return await scrapeWithPlaywright({ consumeScan, stopWhenTargetsObserved: effective.discoveryOnly && !!(effective.targetIds.length || effective.targetPosts.length), targetPosts: effective.targetPosts, handle, maxPages: effective.maxPages, maxTimeMs: discoveryBudgetMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp, categories, mediaTypes, resumeTargets, targetAliases, slicePages: effective.slicePages, sliceTimeMs: effective.sliceTimeMs, maxObservedMedia: effective.maxObservedMedia, requireTerminal: mode === 'full',
+      else return await scrapeWithPlaywright({ consumeScan, resumeBySlot: !!effective.resumeBySlot, stopWhenTargetsObserved: effective.discoveryOnly && !!(effective.targetIds.length || effective.targetPosts.length), targetPosts: effective.targetPosts, handle, maxPages: effective.maxPages, maxTimeMs: discoveryBudgetMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp, categories, mediaTypes, resumeTargets, targetAliases, slicePages: effective.slicePages, sliceTimeMs: effective.sliceTimeMs, maxObservedMedia: effective.maxObservedMedia, requireTerminal: mode === 'full',
         onDiscoveryBatch: async batch => { await ledger.checkpoint(batch); await writeOwner('discovery'); } });
       return await consumeScan(scan);
     } catch (err) {
@@ -3607,6 +3789,7 @@ module.exports = {
   isPrivateHostLiteral,
   fetchWithValidatedRedirects,
   streamResponseToPart,
+  sanitizeSignatureDiagnostics,
   verifyReceipt,
   // The downloader's own identity gate, shared so that every reuse path (including
   // the incremental sync window) is at least as strict as downloadOne's.

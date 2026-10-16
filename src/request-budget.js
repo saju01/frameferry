@@ -187,11 +187,11 @@ function openBudget(file, runId, limit, interval) {
     // deadline, a transport failure, an exhausted allowance) would therefore
     // downgrade PROVIDER_DENIED for the rest of the session, so it cannot replace
     // one — and a denial carried in from an earlier session outranks it too.
-    const fail=(code,message)=>{
+    const fail=(code,message,details)=>{
       if(stopped?.code!=='PROVIDER_DENIED'){
         stopped=code!=='PROVIDER_DENIED'&&d?.denial
           ?new ArchiveError('PROVIDER_DENIED','recorded provider denial '+d.denial.id+' remains in force')
-          :new ArchiveError(code,message);
+          :new ArchiveError(code,message,details&&typeof details==='object'?details:undefined);
       }
       stopController.abort(stopped);return stopped;
     };
