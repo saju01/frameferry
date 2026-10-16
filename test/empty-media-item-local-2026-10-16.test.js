@@ -6,8 +6,8 @@ const {openBudget}=require('../src/request-budget.js');
 let sharedBrowserPromise;
 function getSharedBrowser(){
  if(!sharedBrowserPromise){
-  const {chromium}=require('playwright'),exe=process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||(require('node:fs').existsSync('/usr/bin/chromium')?'/usr/bin/chromium':undefined);
-  sharedBrowserPromise=chromium.launch({headless:true,...(exe?{executablePath:exe}:{})});
+  const {chromium}=require('playwright'),exe=process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||chromium.executablePath();
+  sharedBrowserPromise=chromium.launch({headless:true,executablePath:exe});
  }
  return sharedBrowserPromise;
 }
