@@ -4,7 +4,7 @@ const F=require('../src/index.js'),W=require('../src/sync-window.js');
 const {rec,posts,document_,RENDERER}=require('./fixtures/listing-page.js');
 const {openBudget}=require('../src/request-budget.js');
 async function fixture(t,mode){
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-local-policy-')),browser=await require('playwright').chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-local-policy-')),browser=await require('playwright').chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||require('node:fs').existsSync('/usr/bin/chromium')?'/usr/bin/chromium':undefined});
  t.after(async()=>{await browser.close();await fs.rm(root,{recursive:true,force:true});});
  const calls=[],downloads=[];let middlePage;
  const script=RENDERER+';function show(){var h=document.getElementById("search-input").value;'
