@@ -3,9 +3,18 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const F=require('../src/index.js'),W=require('../src/sync-window.js');
 const {rec,posts,document_,RENDERER}=require('./fixtures/listing-page.js');
 const {openBudget}=require('../src/request-budget.js');
+let sharedBrowserPromise;
+function getSharedBrowser(){
+ if(!sharedBrowserPromise){
+  const {chromium}=require('playwright'),exe=process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||(require('node:fs').existsSync('/usr/bin/chromium')?'/usr/bin/chromium':undefined);
+  sharedBrowserPromise=chromium.launch({headless:true,...(exe?{executablePath:exe}:{})});
+ }
+ return sharedBrowserPromise;
+}
+test.after(async()=>{if(sharedBrowserPromise)await(await sharedBrowserPromise).close();});
 async function fixture(t,mode){
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-local-policy-')),browser=await require('playwright').chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||require('node:fs').existsSync('/usr/bin/chromium')?'/usr/bin/chromium':undefined});
- t.after(async()=>{await browser.close();await fs.rm(root,{recursive:true,force:true});});
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-local-policy-')),browser=await getSharedBrowser();
+ t.after(async()=>{await fs.rm(root,{recursive:true,force:true});});
  const calls=[],downloads=[];let middlePage;
  const script=RENDERER+';function show(){var h=document.getElementById("search-input").value;'
   +(mode==='notfound-unattributed'?'if(h==="middle"){document.getElementById("profile-section").innerHTML=\'<span class="username-text">@middle</span> 1 posts\';document.getElementById("post-container").innerHTML=\'<div id="error-not-found">Not found</div>\';return;}':'')
