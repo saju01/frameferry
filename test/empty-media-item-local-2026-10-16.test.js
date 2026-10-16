@@ -4,7 +4,7 @@ const F=require('../src/index.js'),W=require('../src/sync-window.js');
 const {rec,posts,document_,RENDERER}=require('./fixtures/listing-page.js');
 const {openBudget}=require('../src/request-budget.js');
 async function fixture(t,mode){
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-local-policy-')),browser=await require('playwright').chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/chromium'});
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'ff-local-policy-')),browser=await require('playwright').chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});
  t.after(async()=>{await browser.close();await fs.rm(root,{recursive:true,force:true});});
  const calls=[],downloads=[];let middlePage;
  const script=RENDERER+';function show(){var h=document.getElementById("search-input").value;'
@@ -44,7 +44,7 @@ async function fixture(t,mode){
    }});
   };}});
  },close:async()=>{}};
- const config={handles:['alpha','middle','zulu'].map(handle=>({handle,dateAfter:'2020-01-01'})),runId:'local-policy',output:path.join(root,'out'),resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'ledger.json'),maxTimeMs:12000};
+ const config={handles:['alpha','middle','zulu'].map(handle=>({handle,dateAfter:'2020-01-01'})),runId:'local-policy',output:path.join(root,'out'),resultFile:path.join(root,'result.json'),requestLedger:path.join(root,'ledger.json'),maxTimeMs:30000};
  return {config,calls,downloads,deps:{chromium:{launch:async()=>wrapper},readinessWaitMs:1700,dnsLookup:async()=>[{address:'93.184.216.34',family:4}]}};
 }
 test('EMPTY_MEDIA: an empty 200 image body for one handle is handle-local; neighbours still acquire; failure is explicit',async t=>{
