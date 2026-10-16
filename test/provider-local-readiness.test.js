@@ -34,7 +34,11 @@ async function fixture(t,mode){
    const u=new URL(route.request().url()),request=route.request();
    let h='';if(u.pathname!=='/en/photo')h=await request.frame().evaluate(()=>document.querySelector('#search-input')?.value||'');
    calls.push({handle:h,path:u.pathname});
-   if(u.pathname==='/media'){downloads.push(h);return route.fulfill({status:200,contentType:'image/jpeg',body:Buffer.from([255,216,255,224,1,2,3,4,255,217])});}
+   if(u.pathname==='/media'){downloads.push(h);
+    if(h==='middle'&&mode==='empty-media')return route.fulfill({status:200,headers:{'content-type':'image/jpeg','content-length':'0'},body:''});
+    if(h==='middle'&&mode==='empty-octet')return route.fulfill({status:200,headers:{'content-type':'application/octet-stream','content-length':'0'},body:''});
+    if(h==='middle'&&mode==='gif-media')return route.fulfill({status:200,contentType:'image/jpeg',body:Buffer.from('GIF89a'+'x'.repeat(40))});
+    return route.fulfill({status:200,contentType:'image/jpeg',body:Buffer.from([255,216,255,224,1,2,3,4,255,217])});}
    if(u.pathname.startsWith('/api/')){
     const payload=posts(rec({code:'POST',media:'MEDIA'}));
     if(h==='middle'&&['unsupported','mismatch','missing-body','overflow','wrong-generation','late-challenge','close-failure'].includes(mode))payload.p[0].extra='synthetic unknown field';
@@ -69,4 +73,23 @@ for(const mode of ['401','429','503','challenge','missing-body','overflow','wron
  assert.equal(result.stoppedGlobally,true);assert.equal(result.handles.middle.error.scope,'global');assert.equal(result.handles.zulu.status,'NOT_COMPLETED');
  assert.deepEqual(f.downloads,['alpha']);assert.notEqual(result.status,'COMPLETE');
  if(['401','429','503','challenge','late-challenge'].includes(mode)){assert.equal(result.status,'BLOCKED');assert.ok(result.requests.denial);}
+});
+
+test('EMPTY_MEDIA: an empty 200 image body for one handle is handle-local; neighbours still acquire; failure is explicit',async t=>{
+ const f=await fixture(t,'empty-media'),result=await W.syncWindow(f.config,f.deps);
+ assert.equal(result.status,'PARTIAL');assert.equal(result.stoppedGlobally,false,JSON.stringify(result.handles.middle));
+ assert.equal(result.handles.alpha.status,'COMPLETE');assert.equal(result.handles.zulu.status,'COMPLETE');
+ const m=result.handles.middle;
+ assert.equal(m.status,'PARTIAL');assert.equal(m.failed,true);assert.equal(m.error.code,'EMPTY_MEDIA');assert.equal(m.error.scope,'handle');
+ assert.deepEqual(m.files,[]);
+ assert.deepEqual(m.error.itemDiagnostics,{headHex:'',streamedBytes:0,contentTypeToken:'image/jpeg',httpStatus:200,declaredLength:0,stableId:m.error.itemDiagnostics.stableId});
+ assert.match(m.error.itemDiagnostics.stableId,/^[A-Za-z0-9_.-]+$/);
+ assert.deepEqual(f.downloads,['alpha','middle','zulu']);assert.equal(result.requests.denial,null);
+ assert.deepEqual(JSON.parse(await fs.readFile(f.config.resultFile,'utf8')),result);
+});
+for(const mode of ['empty-octet','gif-media'])test('unrecognised bytes ('+mode+') remain a GLOBAL BAD_SIGNATURE stop; later handle not started',async t=>{
+ const f=await fixture(t,mode),result=await W.syncWindow(f.config,f.deps);
+ assert.equal(result.stoppedGlobally,true);assert.equal(result.error.code,'BAD_SIGNATURE');assert.equal(result.error.scope,'global');
+ assert.equal(result.handles.middle.error.scope,'global');assert.equal(result.handles.zulu.status,'NOT_COMPLETED');
+ assert.deepEqual(f.downloads,['alpha','middle']);
 });
