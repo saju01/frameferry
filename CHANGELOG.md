@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0 - 2026-10-17
+
+### Added
+
+- Opt-in `--source instagram-web` attached-browser "sip-sip" discovery mode (`src/sip-budget.js`)
+  for `--attach-cdp`: reads an already-open local browser context without handling credentials,
+  cookies, or mobile APIs, skips shortcodes already covered by verified receipts, and enforces the
+  `authenticated-sip-v1` rolling velocity budget (`maxPostsPerSip: 4`, `maxFilesPerSip: 20`,
+  `maxRequestsPerHour: 18`, `maxFilesPerHour: 20`, `maxFilesPerDay: 80`, `maxSipsPerDay: 4`,
+  `3h + 0..90m` between-sip cooldown, `8..18s` post-open jitter, and instant challenge/login
+  circuit breaker).
+
+### Fixed
+
+- Raised the `MutationObserver` DOM card buffer ceiling in `src/discovery.js` from `4,096` to
+  `65,536` cards while preserving the 64-generation queue cap, preventing false
+  `generation-buffer-overflow` stops on deep multi-slide carousel profiles.
+- Under `--resume-by-slot`, `scrapeCardSection` in `src/index.js` now halts pagination after 2
+  consecutive steps where duplicate DOM cards yield zero new media identities (`stopCause: 'no-trigger'`)
+  and paces pagination triggers by up to `2,500 ms`, avoiding wasted `/api/posts` requests during
+  provider cache-wrap loops.
+
 ## 0.3.4 - 2026-10-16
 
 ### Added

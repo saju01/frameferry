@@ -75,7 +75,7 @@ async function installCapture(page) {
     };
     const enqueue = cards => {
       if (!cards.length || state.gap) return;
-      if (state.queue.length >= 64 || state.cards + cards.length > 4096) { state.gap = 'generation-buffer-overflow'; return; }
+      if (state.queue.length >= 64 || state.cards + cards.length > 65536) { state.gap = 'generation-buffer-overflow'; return; }
       state.queue.push({ generation: ++state.generation, category: state.category, observedAt: new Date().toISOString(), cards: cards.map(extract) });
       state.cards += cards.length;
     };
