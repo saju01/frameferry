@@ -10,7 +10,7 @@ const { performance } = require('node:perf_hooks');
 const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 const discovery = require('./discovery.js');
 
-const VERSION = '0.3.3';
+const VERSION = '0.4.0';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -2684,6 +2684,7 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
   };
   try {
     await retainVisibleBatch();
+    let stagnantMediaSteps = 0;
     while (steps < maxPages) {
       blocked = await detectContinuationDenial(page, continuationMonitor);
       if (blocked) { stopCause = blocked.kind || (blocked.status ? 'denied' : 'challenged'); break; }
@@ -2708,6 +2709,7 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
       }
       const helperBudget = Math.min(maxTimeMs, elapsedSince(started) + Math.max(1, sliceTimeMs - (Date.now() - sliceStarted)));
       activeStep = !pending;
+      const mediaBeforeStep = discoveredIds.size;
       const after = await scrollLastCardCenterAndWaitForGrowth(page, before, { started, maxTimeMs: helperBudget, continuationMonitor, maxRecenters: 1, onBatchObserved: retainVisibleBatch });
       finalState = after;
       await retainVisibleBatch();
@@ -2719,6 +2721,16 @@ async function scrapeCardSection(page, { category, mediaTypes, reportedTotal, st
       if (stopCause === 'awaiting-response' || (stopCause === 'deadline' && elapsedSince(started) < maxTimeMs)) { await checkpoint(); continue; }
       activeStep = false; steps++; sliceStep++;
       await checkpoint();
+      if (resumeBySlot) {
+        if (discoveredIds.size === mediaBeforeStep) {
+          if (++stagnantMediaSteps >= 2) { stopCause = 'no-trigger'; break; }
+        } else {
+          stagnantMediaSteps = 0;
+        }
+        if (steps < maxPages && elapsedSince(started) < maxTimeMs) {
+          await page.waitForTimeout(Math.min(2500, Math.max(1, remainingTimeout(started, maxTimeMs))));
+        }
+      }
       if (!after.grew) {
         // An answered request may commit DOM later. Observe without scrolling for the rest
         // of the slice. Never infer exhaustion from a silent/unchanged response.
@@ -3567,6 +3579,32 @@ async function archiveProfile(opts = {}) {
       }
       if (opts.sections) scan = { profile: opts.profile || null, sections: normalizeProvidedSections(opts.sections, mediaTypes) };
       else if (opts.items) scan = legacyScanFromItems({ ...opts, category: categories[0] || 'posts', mediaTypes });
+      else if (opts.source === 'instagram-web') {
+        if (!opts.attachCdp) throw new ArchiveError('BAD_ARGS', '--source instagram-web requires --attach-cdp');
+        const sipMod = require('./sip-budget.js');
+        const sipLedgerFile = path.join(paths.stateDir, 'sip-budget.json');
+        const sipOverrides = {};
+        if (opts.sipMaxPosts != null) sipOverrides.maxPostsPerSip = opts.sipMaxPosts;
+        if (opts.sipMaxFiles != null) sipOverrides.maxFilesPerSip = opts.sipMaxFiles;
+        const sipBudget = sipMod.openSipBudget(sipLedgerFile, runId, sipOverrides, { ArchiveError });
+        const coveredShortcodes = new Set(Object.values(completed).map(r => r && r.shortcode).filter(Boolean));
+        if (opts.sipPage) {
+          const sipScan = await sipMod.sipInstagramWebProfile(opts.sipPage, { handle, categories, mediaTypes, coveredShortcodes, sipBudget, maxPages: effective.maxPages });
+          scan = { profile: sipScan.profile, sections: normalizeProvidedSections(sipScan.sections, mediaTypes) };
+        } else {
+          const { chromium } = require('playwright');
+          const browser = await chromium.connectOverCDP(opts.attachCdp);
+          const ctx = browser.contexts()[0] || await browser.newContext();
+          const page = await ctx.newPage();
+          try {
+            const sipScan = await sipMod.sipInstagramWebProfile(page, { handle, categories, mediaTypes, coveredShortcodes, sipBudget, maxPages: effective.maxPages });
+            scan = { profile: sipScan.profile, sections: normalizeProvidedSections(sipScan.sections, mediaTypes) };
+          } finally {
+            await page.close().catch(() => {});
+            await browser.close().catch(() => {});
+          }
+        }
+      }
       else return await scrapeWithPlaywright({ consumeScan, resumeBySlot: !!effective.resumeBySlot, stopWhenTargetsObserved: effective.discoveryOnly && !!(effective.targetIds.length || effective.targetPosts.length), targetPosts: effective.targetPosts, handle, maxPages: effective.maxPages, maxTimeMs: discoveryBudgetMs, browserExecutable: opts.browserExecutable, browserChannel: opts.browserChannel, attachCdp: opts.attachCdp, categories, mediaTypes, resumeTargets, targetAliases, slicePages: effective.slicePages, sliceTimeMs: effective.sliceTimeMs, maxObservedMedia: effective.maxObservedMedia, requireTerminal: mode === 'full',
         onDiscoveryBatch: async batch => { await ledger.checkpoint(batch); await writeOwner('discovery'); } });
       return await consumeScan(scan);
@@ -3825,5 +3863,6 @@ module.exports = {
   discoveryCoverageSatisfied,
   parseCategories,
   parseMediaTypes, elapsedSince, providerMediaFingerprint, providerMediaIdentity, switchToCategoryTab, waitForSectionReady, extractSectionError, discovery,
+  sipBudget: require('./sip-budget.js'),
   sanitizeFailedItem,
 };

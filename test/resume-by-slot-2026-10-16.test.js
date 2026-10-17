@@ -153,3 +153,42 @@ test('retainVisibleBatch assigns batch-local carouselIndex and slideCount across
   assert.deepEqual(p1.map(i => i.slideCount), [2, 2]);
   assert.ok(p1.every(i => i.href.endsWith('_v2')), 'keeps freshest locator per slot');
 });
+
+test('scrapeCardSection under resumeBySlot stops pagination when duplicate DOM growth yields no new media identities for 2 consecutive steps', async () => {
+  const c = (post, slide, ver) => ({
+    shortcode: post, mediaType: 'image',
+    href: `https://instacognito.com/media?id=${post}_${slide}_${ver}`,
+    dateRaw: '1 January 2026', captionTruncated: 'cap'
+  });
+  let raw = [c('P1', 0, 'v1'), c('P1', 1, 'v1')];
+  let scrollTriggers = 0;
+  const page = {
+    locator(sel) {
+      return {
+        evaluateAll: async fn => sel.includes('iframe') ? false
+          : String(fn).includes('count: cards.length')
+            ? { count: raw.length, ids: [...new Set(raw.map(x => x.shortcode))] }
+            : raw.map(x => ({ ...x })),
+        count: async () => 0
+      };
+    },
+    evaluate: async (_fn, arg) => {
+      if (Array.isArray(arg)) {
+        if (arg[1]) {
+          scrollTriggers++;
+          // Simulate provider appending duplicate cards with already-seen fingerprints on every scroll trigger
+          raw = [...raw, c('P1', 0, 'v1'), c('P1', 1, 'v1')];
+        }
+        return { sentinelIndex: 0, sentinelId: raw[0]?.shortcode, sentinelSource: 'observed' };
+      }
+      return true;
+    },
+    waitForTimeout: async () => {}
+  };
+  const s = await lib.scrapeCardSection(page, {
+    category: 'posts', mediaTypes: ['image'], reportedTotal: 99,
+    started: Date.now(), maxTimeMs: 30000, maxPages: 20, resumeBySlot: true
+  });
+  assert.equal(s.evidence.pages, 2, 'stops after 2 consecutive stagnant media steps instead of burning all 20 pages');
+  assert.equal(s.evidence.stopCause, 'no-trigger');
+});
