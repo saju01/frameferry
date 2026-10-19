@@ -10,7 +10,7 @@ const { performance } = require('node:perf_hooks');
 const { ZipWriter, ZIP32_MAX } = require('./zip.js');
 const discovery = require('./discovery.js');
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const PROVIDER_ORIGIN = 'https://instacognito.com';
 const PROVIDER_PHOTO_URL = PROVIDER_ORIGIN + '/en/photo';
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -1778,7 +1778,7 @@ function decodeListingResponse(text, limits = {}) {
   let root;
   try { root = JSON.parse(text); } catch { return fail('unparseable-listing-body'); }
   if (!root || typeof root !== 'object' || Array.isArray(root)) return fail('unknown-listing-representation');
-  for (const key of Object.keys(root)) if (!LISTING_ROOT_KEYS.has(key)) { probeFields = { where: 'root', keys: keyInfo(root) }; return fail('unknown-listing-field'); }
+  for (const key of Object.keys(root)) if (!LISTING_ROOT_KEYS.has(key)) { probeFields = { where: 'root', keys: keyInfo(root), bad: key }; return fail('unknown-listing-field'); }
   if (!Array.isArray(root.p)) return fail('unknown-listing-representation');
   // `pc` is the opaque continuation cursor. It is not listing data and never becomes a tuple.
   if (Object.prototype.hasOwnProperty.call(root, 'pc') && typeof root.pc !== 'string') return fail('unknown-listing-field');
@@ -1790,7 +1790,7 @@ function decodeListingResponse(text, limits = {}) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return 'unknown-listing-representation';
     for (const key of Object.keys(item)) {
       if (LISTING_ITEM_REQUIRED.includes(key) || LISTING_ITEM_OPTIONAL.has(key)) continue;
-      probeFields = { where: isChild ? 'child' : 'item', keys: keyInfo(item) };
+      probeFields = { where: isChild ? 'child' : 'item', keys: keyInfo(item), bad: key };
       return 'unknown-listing-field';
     }
     for (const key of LISTING_ITEM_REQUIRED) {

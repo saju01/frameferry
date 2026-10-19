@@ -32,6 +32,7 @@ test('unknown child key is refused and reported by NAME and TYPE only, never val
   assert.equal(r.supported, false);
   assert.equal(r.reason, 'unknown-listing-field');
   assert.equal(r.fields.where, 'child');
+  assert.equal(r.fields.bad, 'zz');
   assert.ok(r.fields.keys.includes('zz:string'));
   assert.ok(!JSON.stringify(r).includes('SECRET-VALUE'));
 });
@@ -39,6 +40,7 @@ test('unknown root key reported by name/type', () => {
   const r = decodeListingResponse(body({ p: [], pc: 'x', meta: { a: 1 } }));
   assert.equal(r.supported, false);
   assert.equal(r.fields.where, 'root');
+  assert.equal(r.fields.bad, 'meta');
   assert.ok(r.fields.keys.includes('meta:object'));
 });
 test('wrong-typed required field names the offending key', () => {

@@ -361,7 +361,7 @@ function bindingRecord(binding,probe){
   ...(LISTING_DIAGNOSTIC_DETAILS.has(binding.detail)?{detail:binding.detail}:{}),
   ...(binding.fields&&typeof binding.fields==='object'?{fields:{where:['root','item','child'].includes(binding.fields.where)?binding.fields.where:'unknown',
     keys:(Array.isArray(binding.fields.keys)?binding.fields.keys:[]).filter(k=>typeof k==='string'&&/^[A-Za-z0-9_]{1,16}:(string|number|boolean|object|array|null|undefined)$/.test(k)).slice(0,8),
-    ...(typeof binding.fields.bad==='string'&&/^[a-z]{1,4}$/.test(binding.fields.bad)?{bad:binding.fields.bad}:{})}}:{}),
+    ...(typeof binding.fields.bad==='string'&&/^[A-Za-z0-9_]{1,16}$/.test(binding.fields.bad)?{bad:binding.fields.bad}:{})}}:{}),
   schema:binding.schema?{version:binding.schema.version,records:binding.schema.records,children:binding.schema.children,cards:binding.schema.cards}:null,
   unmatched:binding.unmatched?{missing:binding.unmatched.missing,extra:binding.unmatched.extra,mismatched:binding.unmatched.mismatched}:null,
   commitGen:probe?probe.commitGen:null,identityGen:probe?probe.identityGen:null};

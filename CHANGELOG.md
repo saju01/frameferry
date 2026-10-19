@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.1 - 2026-10-19
+
+### Fixed
+
+- Listing response contract (`decodeListingResponse` in `src/index.js`):
+  - Accept optional `vc` (video view-count string) on `/api/posts` root and carousel child items,
+    enforcing bounded string validation when present.
+  - Allow engagement count fields (`lc` likes count, `cc` comments count) to be omitted when hidden
+    by the creator, while still validating them as bounded strings when present.
+  - Allow carousel child items (`om[]`) to omit `co` (shortcode) and inherit the parent post's `co`
+    value so decoded response tuples match InstaCognito's DOM card renderer (`app.33.js`), while
+    root items still strictly require `co`.
+  - Include `bad: <key>` in `probeFields` (`src/index.js` and `src/sync-window.js`) when an
+    unrecognized root or item key is encountered so keys beyond the 8-key `keyInfo` preview slice
+    are still explicitly identified by name.
+
 ## 0.4.0 - 2026-10-17
 
 ### Added
