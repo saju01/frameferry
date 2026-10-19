@@ -1759,7 +1759,7 @@ async function observeWindowSnapshot(page, { handle, selector = CHALLENGE_SELECT
 const LISTING_SCHEMA_VERSION = 1;
 const LISTING_ROOT_KEYS = new Set(['p', 'pc']);
 const LISTING_ITEM_REQUIRED = ['iu', 'hu', 'lc', 'cc', 'pd', 'c', 'id', 'co'];
-const LISTING_ITEM_OPTIONAL = new Set(['vu', 'vhu', 'om']);
+const LISTING_ITEM_OPTIONAL = new Set(['vu', 'vhu', 'vc', 'om']);
 const LISTING_DECODER_LIMITS = { maxRecords: 512, maxChildren: 64, maxTuples: 4096, maxStringLength: 8192, maxTextLength: 4194304 };
 // Code-point reversal, so a locator is reversed exactly as the page's own renderer reverses it.
 function reverseLocator(value) { return [...value].reverse().join(''); }
@@ -1786,7 +1786,7 @@ function decodeListingResponse(text, limits = {}) {
   const tuples = [];
   let children = 0;
   // Returns a typed reason, or null once the record has been turned into exactly one tuple.
-  const readItem = (item, isChild) => {
+  const readItem = (item, isChild, parentCo = null) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return 'unknown-listing-representation';
     for (const key of Object.keys(item)) {
       if (LISTING_ITEM_REQUIRED.includes(key) || LISTING_ITEM_OPTIONAL.has(key)) continue;
@@ -1794,16 +1794,21 @@ function decodeListingResponse(text, limits = {}) {
       return 'unknown-listing-field';
     }
     for (const key of LISTING_ITEM_REQUIRED) {
-      // Captured roots and children can omit captions. A present caption is still a bounded
-      // string; absence of any identity/date/media field remains unsupported.
-      if (key === 'c' && !Object.prototype.hasOwnProperty.call(item, key)) continue;
+      // Captured roots and children can omit captions or engagement counts (e.g. hidden likes `lc` or
+      // comments `cc`). A present field is still a bounded string; absence of any identity/date/media
+      // field remains unsupported.
+      if ((key === 'c' || key === 'lc' || key === 'cc') && !Object.prototype.hasOwnProperty.call(item, key)) continue;
       // 2026-10-16: the provider's live /api/posts carousel children no longer carry `id` (roots still
       // do). `id` is never read into a tuple, so a child without it loses no identity/date/media
       // evidence. A PRESENT child `id` must still be a bounded string; roots still require it.
-      if (key === 'id' && isChild && !Object.prototype.hasOwnProperty.call(item, key)) continue;
+      if ((key === 'id' || key === 'co') && isChild && !Object.prototype.hasOwnProperty.call(item, key)) continue;
       const value = item[key];
       if (typeof value !== 'string') { probeFields = { where: isChild ? 'child' : 'item', keys: keyInfo(item), bad: key }; return 'unknown-listing-field'; }
       if (value.length > bound.maxStringLength) return 'listing-exceeds-decoder-bound';
+    }
+    if (Object.prototype.hasOwnProperty.call(item, 'vc')) {
+      if (typeof item.vc !== 'string') { probeFields = { where: isChild ? 'child' : 'item', keys: keyInfo(item), bad: 'vc' }; return 'unknown-listing-field'; }
+      if (item.vc.length > bound.maxStringLength) return 'listing-exceeds-decoder-bound';
     }
     const hasVu = Object.prototype.hasOwnProperty.call(item, 'vu');
     const hasVhu = Object.prototype.hasOwnProperty.call(item, 'vhu');
@@ -1825,7 +1830,7 @@ function decodeListingResponse(text, limits = {}) {
     const identity = providerMediaIdentity(PROVIDER_ORIGIN + '/media?id=' + encodeURIComponent(reverseLocator(locator)));
     if (!identity) return 'unsupported-listing-variant';
     if (tuples.length >= bound.maxTuples) return 'listing-exceeds-decoder-bound';
-    tuples.push({ shortcode: item.co, mediaIdentity: identity, mediaType: hasVu ? 'video' : 'image', dateRaw: item.pd });
+    tuples.push({ shortcode: isChild && !Object.prototype.hasOwnProperty.call(item, 'co') ? parentCo : item.co, mediaIdentity: identity, mediaType: hasVu ? 'video' : 'image', dateRaw: item.pd });
     return null;
   };
   for (const item of root.p) {
@@ -1837,7 +1842,7 @@ function decodeListingResponse(text, limits = {}) {
     // Flatten order is primary THEN its children, exactly as the capture rendered them.
     for (const child of item.om) {
       children++;
-      const badChild = readItem(child, true);
+      const badChild = readItem(child, true, item.co);
       if (badChild) return fail(badChild);
     }
   }
